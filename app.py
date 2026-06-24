@@ -19,8 +19,13 @@ POINTS = {
     "有利脚質": 8,
 }
 
-race_table = st.text_area("netkeibaの出走表を丸ごと貼ってください", height=430)
+IGNORE_WORDS = [
+    "馬メモ", "レース別馬メモ", "全角100文字以内で入力してください",
+    "削除保存", "閉じる", "編集", "次走買い", "次走消し",
+    "不利", "馬場向かず", "ペース合わず", "ハイレベル戦", "好ラップ"
+]
 
+race_table = st.text_area("netkeibaの出走表を丸ごと貼ってください", height=430)
 analysis = st.text_area("netkeibaのデータ分析を貼ってください", height=330)
 
 st.write("### 脚質入力")
@@ -37,8 +42,25 @@ running_style_text = st.text_area(
 5 追込"""
 )
 
-def parse_race_table(text):
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
+def clean_lines(text):
+    lines = []
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+
+        if line in IGNORE_WORDS:
+            continue
+
+        if re.match(r"^\d+/100$", line):
+            continue
+
+        lines.append(line)
+
+    return lines
+
+def parse_pc_style(lines):
     horses = []
     i = 0
 
@@ -60,16 +82,17 @@ def parse_race_table(text):
         info_line = lines[i + 3]
 
         popularity = None
-        if i + 4 < len(lines) and lines[i + 4].isdigit():
-            popularity = int(lines[i + 4])
+        if i + 4 < len(lines):
+            pop_match = re.search(r"(\d+)", lines[i + 4])
+            if pop_match:
+                popularity = int(pop_match.group(1))
 
         odds = None
-        odds_match = re.search(r"(\d+\.\d+)$", info_line)
+        odds_match = re.search(r"(\d+\.\d+)", info_line)
         if odds_match:
             odds = float(odds_match.group(1))
 
-        # タブ区切りから騎手・調教師を取得
-        parts = re.split(r"\t+", info_line)
+        parts = re.split(r"\t+|\s{2,}", info_line)
         jockey = ""
         trainer = ""
 
@@ -94,6 +117,81 @@ def parse_race_table(text):
 
         i += 5
 
+    return horses
+
+def parse_smartphone_style(lines):
+    horses = []
+
+    for i in range(len(lines)):
+        # スマホ版でよくある形：
+        # 1
+        # シャマル
+        # 牡8 57.0 川須栄彦 栗東 松下武士 501(+1) 10.8
+        # 5人気
+        if not lines[i].isdigit():
+            continue
+
+        horse_no = int(lines[i])
+
+        if i + 3 >= len(lines):
+            continue
+
+        horse_name = lines[i + 1]
+        info_line = lines[i + 2]
+        pop_line = lines[i + 3]
+
+        if not re.search(r"[牡牝セ]\d+", info_line):
+            continue
+
+        popularity = None
+        pop_match = re.search(r"(\d+)\s*人気?", pop_line)
+        if pop_match:
+            popularity = int(pop_match.group(1))
+        elif pop_line.isdigit():
+            popularity = int(pop_line)
+
+        odds = None
+        odds_match = re.search(r"(\d+\.\d+)", info_line)
+        if odds_match:
+            odds = float(odds_match.group(1))
+
+        jockey = ""
+        trainer = ""
+
+        tokens = re.split(r"\s+|\t+", info_line)
+
+        # 例: 牡8 57.0 川須栄彦 栗東 松下武士 501(+1) 10.8
+        if len(tokens) >= 3:
+            jockey = tokens[2]
+
+        if len(tokens) >= 5:
+            trainer = tokens[3] + " " + tokens[4]
+
+        frame_no = (horse_no + 1) // 2
+
+        horses.append({
+            "枠番": frame_no,
+            "馬番": horse_no,
+            "馬名": horse_name,
+            "人気": popularity,
+            "オッズ": odds,
+            "騎手": jockey,
+            "調教師": trainer,
+            "脚質": "",
+            "点数": 0,
+            "加点理由": []
+        })
+
+    return horses
+
+def parse_race_table(text):
+    lines = clean_lines(text)
+
+    horses = parse_pc_style(lines)
+
+    if not horses:
+        horses = parse_smartphone_style(lines)
+
     unique = {}
     for h in horses:
         unique[h["馬番"]] = h
@@ -110,9 +208,7 @@ def parse_running_style(text):
 
         match = re.match(r"^(\d+)\s+(.+)$", line)
         if match:
-            horse_no = int(match.group(1))
-            style = match.group(2).strip()
-            styles[horse_no] = style
+            styles[int(match.group(1))] = match.group(2).strip()
 
     return styles
 
@@ -139,7 +235,6 @@ def add_points(horses, analysis_text, running_style_text):
     horse_map = {h["馬番"]: h for h in horses}
     sections = get_section_items(analysis_text)
 
-    # 通常の馬番加点
     for section, lines in sections.items():
         if section not in POINTS:
             continue
@@ -153,7 +248,6 @@ def add_points(horses, analysis_text, running_style_text):
                     horse_map[horse_no]["点数"] += point
                     horse_map[horse_no]["加点理由"].append(f"{section} +{point}")
 
-    # 有利枠順の自動加点
     good_frames = []
     for line in sections.get("このコースで有利な枠順", []) + sections.get("好調枠順", []):
         nums = re.findall(r"\d+", line)
@@ -166,9 +260,7 @@ def add_points(horses, analysis_text, running_style_text):
             h["点数"] += point
             h["加点理由"].append(f"有利枠順({h['枠番']}枠) +{point}")
 
-    # 得意騎手の自動加点
-    good_jockey_lines = sections.get("このコースが得意な騎手", [])
-    good_jockey_text = " ".join(good_jockey_lines)
+    good_jockey_text = " ".join(sections.get("このコースが得意な騎手", []))
 
     for h in horses:
         if h["騎手"] and h["騎手"] in good_jockey_text:
@@ -176,27 +268,24 @@ def add_points(horses, analysis_text, running_style_text):
             h["点数"] += point
             h["加点理由"].append(f"得意騎手({h['騎手']}) +{point}")
 
-    # 得意調教師の自動加点
-    good_trainer_lines = sections.get("このコースが得意な調教師", [])
-    good_trainer_text = " ".join(good_trainer_lines)
+    good_trainer_text = " ".join(sections.get("このコースが得意な調教師", []))
 
     for h in horses:
-        if h["調教師"]:
-            trainer_name = h["調教師"].replace("栗東 ", "").replace("美浦 ", "").replace("大井 ", "").replace("浦和 ", "").replace("北海道 ", "").replace("兵庫 ", "")
-            if trainer_name in good_trainer_text or h["調教師"] in good_trainer_text:
-                point = POINTS["このコースが得意な調教師"]
-                h["点数"] += point
-                h["加点理由"].append(f"得意調教師({h['調教師']}) +{point}")
+        trainer_name = h["調教師"]
+        for area in ["栗東 ", "美浦 ", "大井 ", "浦和 ", "北海道 ", "兵庫 ", "船橋 ", "川崎 "]:
+            trainer_name = trainer_name.replace(area, "")
 
-    # 脚質入力を反映
+        if trainer_name and trainer_name in good_trainer_text:
+            point = POINTS["このコースが得意な調教師"]
+            h["点数"] += point
+            h["加点理由"].append(f"得意調教師({h['調教師']}) +{point}")
+
     styles = parse_running_style(running_style_text)
     for h in horses:
         if h["馬番"] in styles:
             h["脚質"] = styles[h["馬番"]]
 
-    # 有利脚質の自動加点
-    good_style_lines = sections.get("このコースで有利な脚質", [])
-    good_style_text = " ".join(good_style_lines)
+    good_style_text = " ".join(sections.get("このコースで有利な脚質", []))
 
     for h in horses:
         if h["脚質"] and h["脚質"] in good_style_text:
@@ -270,7 +359,7 @@ if st.button("予想開始"):
     horses = parse_race_table(race_table)
 
     if not horses:
-        st.error("出走表を読み取れませんでした。")
+        st.error("出走表を読み取れませんでした。PC版・スマホ版どちらでも、出走表部分を少し広めにコピーして貼ってください。")
     else:
         horses = add_points(horses, analysis, running_style_text)
         axis, second_round, third_round, cut_horses = make_prediction(horses)
