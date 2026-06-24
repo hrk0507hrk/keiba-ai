@@ -32,15 +32,16 @@ st.write("### 脚質入力")
 st.caption("例：7 先行 のように1行ずつ入力してください。空欄でもOK。")
 
 running_style_text = st.text_area(
-   style_graph_text = st.text_area(
-    "脚質グラフを貼り付け（任意）",
-    height=200,
+    "各馬の脚質",
+    height=180,
     placeholder="""例
-1 差 ...
-2 差 ...
-3 先 ...
-11 逃 ..."""
+1 先行
+2 差し
+3 逃げ
+4 先行
+5 追込"""
 )
+
 style_graph_text = st.text_area(
     "脚質グラフを貼り付け（任意）",
     height=200,
