@@ -308,7 +308,7 @@ def add_points(horses, analysis_text, running_style_text, style_graph_text):
             h["点数"] += point
             h["加点理由"].append(f"得意調教師({h['調教師']}) +{point}")
 
-       styles = parse_running_style(running_style_text)
+    styles = parse_running_style(running_style_text)
 
     graph_styles = parse_style_graph(style_graph_text)
 
