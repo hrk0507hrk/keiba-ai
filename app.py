@@ -12,7 +12,6 @@ POINTS = {
     "この競馬場が得意な馬": 12,
     "今回の馬場状態が得意な馬": 10,
     "今回のレース間隔で実績がある馬": 10,
-    "今回の馬場状態が得意な馬": 10,
     "このコースが得意な騎手": 8,
     "このコースが得意な調教師": 8,
     "このコースに実績がある種牡馬": 5,
@@ -188,7 +187,6 @@ def parse_smartphone_style(lines):
 
 def parse_race_table(text):
     lines = clean_lines(text)
-
     horses = parse_pc_style(lines)
 
     if not horses:
@@ -258,7 +256,6 @@ def parse_style_graph(text):
     while i < len(lines):
         line = lines[i]
 
-        # パターン1：馬番だけの行 → 次の行に脚質データ
         if re.match(r"^\d+$", line) and i + 1 < len(lines):
             horse_no = int(line)
             data_line = lines[i + 1]
@@ -281,7 +278,6 @@ def parse_style_graph(text):
                 i += 2
                 continue
 
-        # パターン2：1行に「馬番 脚質 データ」が入っている
         match = re.match(r"^(\d+)\s+(逃|先|差|追)\s+(.+)", line)
         if match:
             horse_no = int(match.group(1))
@@ -449,16 +445,6 @@ def make_prediction(horses):
     return axis, second_round, third_round, cut_horses
 
 def make_tickets(axis, second_round, third_round):
-def make_wide_tickets(second_round):
-    wide_tickets = []
-
-    if len(second_round) < 2:
-        return wide_tickets
-
-    for a, b in combinations(second_round, 2):
-        wide_tickets.append((a, b))
-
-    return wide_tickets
     tickets = []
 
     if axis is None:
@@ -470,6 +456,17 @@ def make_wide_tickets(second_round):
 
     return tickets
 
+def make_wide_tickets(second_round):
+    wide_tickets = []
+
+    if len(second_round) < 2:
+        return wide_tickets
+
+    for a, b in combinations(second_round, 2):
+        wide_tickets.append((a, b))
+
+    return wide_tickets
+
 if st.button("予想開始"):
     horses = parse_race_table(race_table)
 
@@ -480,6 +477,7 @@ if st.button("予想開始"):
         axis, second_round, third_round, cut_horses = make_prediction(horses)
         tickets = make_tickets(axis, second_round, third_round)
         wide_tickets = make_wide_tickets(second_round)
+
         st.success(f"{len(horses)}頭を読み取りました。")
 
         st.subheader("馬ごとの評価点")
@@ -515,19 +513,19 @@ if st.button("予想開始"):
             third_nums = ",".join(str(h["馬番"]) for h in third_round)
             st.code(f"{axis['馬番']} → {second_nums} → {third_nums}")
 
-        st.write(f"点数：{len(tickets)}点")
+        st.write(f"3連単点数：{len(tickets)}点")
+
         st.subheader("ワイド（2巡目BOX）")
 
         if wide_tickets:
-        wide_text = []
+            wide_text = []
 
-        for t in wide_tickets:
-        wide_text.append(
-            f"{t[0]['馬番']}-{t[1]['馬番']}"
-        )
+            for t in wide_tickets:
+                wide_text.append(f"{t[0]['馬番']}-{t[1]['馬番']}")
 
-        st.code(" / ".join(wide_text))
-        st.write(f"ワイド点数：{len(wide_tickets)}点")
-        with st.expander("買い目一覧"):
+            st.code(" / ".join(wide_text))
+            st.write(f"ワイド点数：{len(wide_tickets)}点")
+
+        with st.expander("3連単買い目一覧"):
             for t in tickets:
                 st.write(f"{t[0]['馬番']} → {t[1]['馬番']} → {t[2]['馬番']}")
