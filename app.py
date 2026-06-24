@@ -409,10 +409,10 @@ def set_category(horses):
         if h["人気"] is None:
             h["カテゴリ"] = "人気不明"
             big_hole.append(h)
-        elif h["人気"] <= 4:
+        elif h["人気"] <= 3:
             h["カテゴリ"] = "人気馬"
             popular.append(h)
-        elif h["人気"] <= 9:
+        elif h["人気"] <= 8:
             h["カテゴリ"] = "穴馬"
             hole.append(h)
         else:
