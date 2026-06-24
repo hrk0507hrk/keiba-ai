@@ -1,6 +1,6 @@
 import streamlit as st
 import re
-from itertools import product
+from itertools import product, combinations
 
 st.title("競馬予想AI")
 st.write("出走表とnetkeibaデータ分析を貼ると、軸・2巡目・3巡目・買い目を自動作成します。")
@@ -449,6 +449,16 @@ def make_prediction(horses):
     return axis, second_round, third_round, cut_horses
 
 def make_tickets(axis, second_round, third_round):
+def make_wide_tickets(second_round):
+    wide_tickets = []
+
+    if len(second_round) < 2:
+        return wide_tickets
+
+    for a, b in combinations(second_round, 2):
+        wide_tickets.append((a, b))
+
+    return wide_tickets
     tickets = []
 
     if axis is None:
@@ -469,7 +479,7 @@ if st.button("予想開始"):
         horses = add_points(horses, analysis, running_style_text, style_graph_text)
         axis, second_round, third_round, cut_horses = make_prediction(horses)
         tickets = make_tickets(axis, second_round, third_round)
-
+        wide_tickets = make_wide_tickets(second_round)
         st.success(f"{len(horses)}頭を読み取りました。")
 
         st.subheader("馬ごとの評価点")
@@ -506,7 +516,18 @@ if st.button("予想開始"):
             st.code(f"{axis['馬番']} → {second_nums} → {third_nums}")
 
         st.write(f"点数：{len(tickets)}点")
+        st.subheader("ワイド（2巡目BOX）")
 
+        if wide_tickets:
+        wide_text = []
+
+        for t in wide_tickets:
+        wide_text.append(
+            f"{t[0]['馬番']}-{t[1]['馬番']}"
+        )
+
+        st.code(" / ".join(wide_text))
+        st.write(f"ワイド点数：{len(wide_tickets)}点")
         with st.expander("買い目一覧"):
             for t in tickets:
                 st.write(f"{t[0]['馬番']} → {t[1]['馬番']} → {t[2]['馬番']}")
