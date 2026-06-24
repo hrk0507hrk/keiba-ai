@@ -4,7 +4,11 @@ from itertools import product, combinations
 
 st.title("競馬予想AI")
 st.write("出走表とnetkeibaデータ分析を貼ると、軸・2巡目・3巡目・買い目を自動作成します。")
+if "clear_count" not in st.session_state:
+    st.session_state.clear_count = 0
 
+if st.button("🗑️ 入力内容をクリア"):
+    st.session_state.clear_count += 1
 POINTS = {
     "データ上位馬3頭": 30,
     "このコースが得意な馬": 15,
@@ -26,8 +30,16 @@ IGNORE_WORDS = [
     "全グラフを表示"
 ]
 
-race_table = st.text_area("netkeibaの出走表を丸ごと貼ってください", height=430)
-analysis = st.text_area("netkeibaのデータ分析を貼ってください", height=330)
+race_table = st.text_area(
+    "netkeibaの出走表を丸ごと貼ってください",
+    height=430,
+    key=f"race_{st.session_state.clear_count}"
+)
+analysis = st.text_area(
+    "netkeibaのデータ分析を貼ってください",
+    height=330,
+    key=f"analysis_{st.session_state.clear_count}"
+)
 
 st.write("### 脚質入力")
 st.caption("例：7 先行 のように1行ずつ入力してください。空欄でもOK。")
@@ -38,7 +50,8 @@ running_style_text = st.text_area(
     placeholder="""例
 1 先行
 2 差し
-3 逃げ"""
+3 逃げ""",
+    key=f"style_{st.session_state.clear_count}"
 )
 
 style_graph_text = st.text_area(
@@ -46,11 +59,12 @@ style_graph_text = st.text_area(
     height=220,
     placeholder="""例
 1
-差 119 138 150 1452 1859 6% 13% 21% 55% 61% マジュツシカエル
+差 119 ...
 3
-先 92 90 92 424 698 13% 26% 39% 57% 71% ラブシックボッサ
+先 92 ...
 11
-逃 60 48 28 137 273 21% 39% 49% 59% 71% エスペラード"""
+逃 60 ...""",
+    key=f"graph_{st.session_state.clear_count}"
 )
 
 def clean_lines(text):
