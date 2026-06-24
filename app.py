@@ -32,16 +32,23 @@ st.write("### 脚質入力")
 st.caption("例：7 先行 のように1行ずつ入力してください。空欄でもOK。")
 
 running_style_text = st.text_area(
-    "各馬の脚質",
-    height=180,
+   style_graph_text = st.text_area(
+    "脚質グラフを貼り付け（任意）",
+    height=200,
     placeholder="""例
-1 先行
-2 差し
-3 逃げ
-4 先行
-5 追込"""
+1 差 ...
+2 差 ...
+3 先 ...
+11 逃 ..."""
 )
-
+style_graph_text = st.text_area(
+    "脚質グラフを貼り付け（任意）",
+    height=200,
+    placeholder="""例
+1 差 119 138 150 ... マジュツシカエル
+3 先 92 90 92 ... ラブシックボッサ
+11 逃 60 48 28 ... エスペラード"""
+)
 def clean_lines(text):
     lines = []
 
@@ -210,7 +217,28 @@ def parse_running_style(text):
             styles[int(match.group(1))] = match.group(2).strip()
 
     return styles
+def parse_style_graph(text):
+    styles = {}
 
+    for line in text.splitlines():
+        line = line.strip()
+
+        match = re.match(r"^(\d+)\s+(逃|先|差|追)", line)
+
+        if match:
+            horse_no = int(match.group(1))
+            style = match.group(2)
+
+            convert = {
+                "逃": "逃げ",
+                "先": "先行",
+                "差": "差し",
+                "追": "追込"
+            }
+
+            styles[horse_no] = convert[style]
+
+    return styles
 def get_section_items(text):
     sections = {}
     current_section = None
@@ -230,7 +258,7 @@ def get_section_items(text):
 
     return sections
 
-def add_points(horses, analysis_text, running_style_text):
+def add_points(horses, analysis_text, running_style_text, style_graph_text):
     horse_map = {h["馬番"]: h for h in horses}
     sections = get_section_items(analysis_text)
 
@@ -279,7 +307,12 @@ def add_points(horses, analysis_text, running_style_text):
             h["点数"] += point
             h["加点理由"].append(f"得意調教師({h['調教師']}) +{point}")
 
-    styles = parse_running_style(running_style_text)
+       styles = parse_running_style(running_style_text)
+
+    graph_styles = parse_style_graph(style_graph_text)
+
+    for horse_no, style in graph_styles.items():
+        styles[horse_no] = style
     for h in horses:
         if h["馬番"] in styles:
             h["脚質"] = styles[h["馬番"]]
@@ -360,7 +393,7 @@ if st.button("予想開始"):
     if not horses:
         st.error("出走表を読み取れませんでした。PC版・スマホ版どちらでも、出走表部分を少し広めにコピーして貼ってください。")
     else:
-        horses = add_points(horses, analysis, running_style_text)
+        horses = add_points(horses, analysis, running_style_text, style_graph_text)
         axis, second_round, third_round, cut_horses = make_prediction(horses)
         tickets = make_tickets(axis, second_round, third_round)
 
