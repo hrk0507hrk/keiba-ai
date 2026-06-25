@@ -324,63 +324,66 @@ def parse_style_graph(text):
 def parse_pace(text):
     pace = {}
     current_horse = None
+    wait_after_mae = False
     lines = [line.strip() for line in text.splitlines() if line.strip()]
 
     for line in lines:
-
-        # 馬番行
         if re.fullmatch(r"\d+", line):
             current_horse = int(line)
             pace.setdefault(current_horse, [])
+            wait_after_mae = False
             continue
 
         if current_horse is None:
             continue
 
-        # -779
-        m = re.search(r"-(\d{3,})$", line)
-
-        if not m:
+        if line == "前":
+            wait_after_mae = True
             continue
 
-        nums = m.group(1)
+        if line == "----":
+            continue
 
-        try:
-            if len(nums) == 3:
-                pos = (
-                    int(nums[0]),
-                    int(nums[1]),
-                    int(nums[2])
-                )
+        # 形式1：- 5 5 8
+        m1 = re.search(r"-\s*(\d+)\s+(\d+)\s+(\d+)", line)
+        if m1:
+            pace[current_horse].append((int(m1.group(1)), int(m1.group(2)), int(m1.group(3))))
+            wait_after_mae = False
+            continue
 
-            elif len(nums) == 4:
-                pos = (
-                    int(nums[:2]),
-                    int(nums[2]),
-                    int(nums[3])
-                )
-
-            elif len(nums) == 5:
-                pos = (
-                    int(nums[:2]),
-                    int(nums[2:4]),
-                    int(nums[4])
-                )
-
-            elif len(nums) == 6:
-                pos = (
-                    int(nums[:2]),
-                    int(nums[2:4]),
-                    int(nums[4:6])
-                )
-
-            else:
+        # 形式2：4 3 7 8 / 1 1 1 2 みたいな4つ数字
+        if wait_after_mae:
+            nums = re.findall(r"\d+", line)
+            if len(nums) >= 4:
+                pace[current_horse].append((int(nums[-3]), int(nums[-2]), int(nums[-1])))
+                wait_after_mae = False
                 continue
 
-            pace[current_horse].append(pos)
+            if len(nums) == 3:
+                pace[current_horse].append((int(nums[0]), int(nums[1]), int(nums[2])))
+                wait_after_mae = False
+                continue
 
-        except:
-            pass
+        # 形式3：-779 / -111 / -111110 みたいな詰まった形式
+        m2 = re.search(r"-(\d{3,})$", line)
+        if m2:
+            nums = m2.group(1)
+
+            try:
+                if len(nums) == 3:
+                    pos = (int(nums[0]), int(nums[1]), int(nums[2]))
+                elif len(nums) == 4:
+                    pos = (int(nums[0]), int(nums[1]), int(nums[2:]))
+                elif len(nums) == 5:
+                    pos = (int(nums[0]), int(nums[1:3]), int(nums[3:]))
+                elif len(nums) == 6:
+                    pos = (int(nums[:2]), int(nums[2:4]), int(nums[4:]))
+                else:
+                    continue
+
+                pace[current_horse].append(pos)
+            except:
+                pass
 
     return pace
 
