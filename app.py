@@ -62,11 +62,11 @@ style_graph_text = st.text_area(
     height=220,
     placeholder="""例
 1
-差 119 138 150 1452 1859 6% 13% 21% 55% 61% マジュツシカエル
-3
-先 92 90 92 424 698 13% 26% 39% 57% 71% ラブシックボッサ
-11
-逃 60 48 28 137 273 21% 39% 49% 59% 71% エスペラード""",
+--
+差 600 694 733 5341 7368 8% 17% 27% 58% 63% ブラックアピス
+2
+--
+先 100 120 130 800 1000 10% 22% 35% 60% 70% サンプル""",
     key=f"graph_{st.session_state.clear_count}"
 )
 
@@ -77,13 +77,7 @@ def clean_lines(text):
         if not line:
             continue
 
-        skip = False
-        for word in IGNORE_WORDS:
-            if word in line:
-                skip = True
-                break
-
-        if skip:
+        if any(word in line for word in IGNORE_WORDS):
             continue
 
         if re.match(r"^\d+/100$", line):
@@ -105,6 +99,7 @@ def make_horse(frame_no, horse_no, horse_name, popularity=None, odds=None, jocke
         "脚質": "",
         "脚質勝率": None,
         "脚質複勝率": None,
+        "カテゴリ": "",
         "点数": 0,
         "複勝点": 0,
         "加点理由": []
@@ -145,14 +140,8 @@ def parse_pc_style(lines):
                 odds = float(p)
                 break
 
-        jockey = ""
-        trainer = ""
-
-        if len(parts) >= 3:
-            jockey = parts[2].strip()
-
-        if len(parts) >= 4:
-            trainer = parts[3].strip()
+        jockey = parts[2].strip() if len(parts) >= 3 else ""
+        trainer = parts[3].strip() if len(parts) >= 4 else ""
 
         horses.append(make_horse(frame_no, horse_no, horse_name, popularity, odds, jockey, trainer))
         i += 5
@@ -188,16 +177,12 @@ def parse_smartphone_style(lines):
         if pop_match:
             popularity = int(pop_match.group(1))
 
-        jockey = ""
-        trainer = ""
-
         db_removed = re.sub(r"^[牡牝セ]\d+\s+", "", info_line)
         db_removed = db_removed.replace(f"{horse_name}のデータベース", "").strip()
         db_removed = re.sub(r"\d+\.\d+$", "", db_removed).strip()
 
-        if db_removed:
-            jockey = db_removed.split()[0]
-
+        jockey = db_removed.split()[0] if db_removed else ""
+        trainer = ""
         frame_no = (horse_no + 1) // 2
 
         horses.append(make_horse(frame_no, horse_no, horse_name, popularity, odds, jockey, trainer))
@@ -217,6 +202,19 @@ def parse_race_table(text):
         unique[h["馬番"]] = h
 
     return list(unique.values())
+
+def normalize_style(style):
+    convert = {
+        "逃": "逃げ",
+        "先": "先行",
+        "差": "差し",
+        "追": "追込",
+        "逃げ": "逃げ",
+        "先行": "先行",
+        "差し": "差し",
+        "追込": "追込",
+    }
+    return convert.get(style, style)
 
 def parse_running_style(text):
     styles = {}
@@ -255,19 +253,6 @@ def style_score(win_rate, place_rate):
 
     return score
 
-def normalize_style(style):
-    convert = {
-        "逃": "逃げ",
-        "先": "先行",
-        "差": "差し",
-        "追": "追込",
-        "逃げ": "逃げ",
-        "先行": "先行",
-        "差し": "差し",
-        "追込": "追込",
-    }
-    return convert.get(style, style)
-
 def parse_style_graph(text):
     styles = {}
     lines = [line.strip() for line in text.splitlines() if line.strip()]
@@ -276,6 +261,28 @@ def parse_style_graph(text):
     while i < len(lines):
         line = lines[i]
 
+        # PC版：馬番 → -- → 脚質データ
+        if re.match(r"^\d+$", line) and i + 2 < len(lines) and lines[i + 1] == "--":
+            horse_no = int(line)
+            data_line = lines[i + 2]
+
+            match = re.match(r"^(逃|先|差|追)\s+(.+)", data_line)
+            if match:
+                style = normalize_style(match.group(1))
+                percents = [int(x) for x in re.findall(r"(\d+)%", data_line)]
+                win_rate = percents[0] if len(percents) >= 1 else None
+                place_rate = percents[2] if len(percents) >= 3 else None
+
+                styles[horse_no] = {
+                    "style": style,
+                    "win_rate": win_rate,
+                    "place_rate": place_rate
+                }
+
+                i += 3
+                continue
+
+        # スマホ版：馬番 → 脚質データ
         if re.match(r"^\d+$", line) and i + 1 < len(lines):
             horse_no = int(line)
             data_line = lines[i + 1]
@@ -296,11 +303,11 @@ def parse_style_graph(text):
                 i += 2
                 continue
 
+        # 1行型：1 差 600 ...
         match = re.match(r"^(\d+)\s+(逃|先|差|追)\s+(.+)", line)
         if match:
             horse_no = int(match.group(1))
             style = normalize_style(match.group(2))
-
             percents = [int(x) for x in re.findall(r"(\d+)%", line)]
             win_rate = percents[0] if len(percents) >= 1 else None
             place_rate = percents[2] if len(percents) >= 3 else None
@@ -334,7 +341,33 @@ def get_section_items(text):
 
     return sections
 
+def set_category(horses):
+    popular = []
+    hole = []
+    big_hole = []
+
+    for h in horses:
+        if h["人気"] is None:
+            h["カテゴリ"] = "人気不明"
+            big_hole.append(h)
+        elif h["人気"] <= 3:
+            h["カテゴリ"] = "人気馬"
+            popular.append(h)
+        elif h["人気"] <= 9:
+            h["カテゴリ"] = "穴馬"
+            hole.append(h)
+        else:
+            h["カテゴリ"] = "大穴馬"
+            big_hole.append(h)
+
+    return popular, hole, big_hole
+
+def has_reason(horse, keyword):
+    return any(keyword in reason for reason in horse["加点理由"])
+
 def add_points(horses, analysis_text, running_style_text, style_graph_text):
+    set_category(horses)
+
     horse_map = {h["馬番"]: h for h in horses}
     sections = get_section_items(analysis_text)
 
@@ -410,67 +443,42 @@ def add_points(horses, analysis_text, running_style_text, style_graph_text):
             point = POINTS["有利脚質"]
             h["点数"] += point
             h["加点理由"].append(f"有利脚質({h['脚質']}) +{point}")
-    
+
+    # 複勝点：2着・3着候補用
     for h in horses:
-        score = 0
+        fuku_score = 0
 
-        if "この距離が得意な馬 +12" in h["加点理由"]:
-            score += 12
+        if has_reason(h, "この距離が得意な馬"):
+            fuku_score += 12
 
-        if "この競馬場が得意な馬 +12" in h["加点理由"]:
-            score += 12
+        if has_reason(h, "この競馬場が得意な馬"):
+            fuku_score += 12
 
-        if "今回の馬場状態が得意な馬 +10" in h["加点理由"]:
-            score += 10
+        if has_reason(h, "今回の馬場状態が得意な馬"):
+            fuku_score += 10
 
-        if "今回のレース間隔で実績がある馬 +10" in h["加点理由"]:
-            score += 10
+        if has_reason(h, "今回のレース間隔で実績がある馬"):
+            fuku_score += 10
 
         if h["脚質複勝率"] is not None:
             if h["脚質複勝率"] >= 50:
-                score += 15
+                fuku_score += 15
             elif h["脚質複勝率"] >= 40:
-                score += 10
+                fuku_score += 10
             elif h["脚質複勝率"] >= 30:
-                score += 5
+                fuku_score += 5
 
         if h["カテゴリ"] == "穴馬":
-            score += 5
+            fuku_score += 5
 
-        h["複勝点"] = score
-    
+        h["複勝点"] = fuku_score
+
     return list(horse_map.values())
-
-def set_category(horses):
-    popular = []
-    hole = []
-    big_hole = []
-
-    for h in horses:
-        if h["人気"] is None:
-            h["カテゴリ"] = "人気不明"
-            big_hole.append(h)
-        elif h["人気"] <= 3:
-            h["カテゴリ"] = "人気馬"
-            popular.append(h)
-        elif h["人気"] <= 9:
-            h["カテゴリ"] = "穴馬"
-            hole.append(h)
-        else:
-            h["カテゴリ"] = "大穴馬"
-            big_hole.append(h)
-
-    return popular, hole, big_hole
 
 def make_prediction(horses):
     popular, hole, big_hole = set_category(horses)
 
-    popular_sorted = sorted(
-        popular,
-        key=lambda x: x["点数"],
-        reverse=True
-    )
-
+    popular_sorted = sorted(popular, key=lambda x: x["点数"], reverse=True)
     axis = popular_sorted[0] if popular_sorted else None
 
     axis_no = axis["馬番"] if axis else None
@@ -486,11 +494,7 @@ def make_prediction(horses):
         and h["馬番"] != axis_no
     ]
 
-    fuku_sorted = sorted(
-        usable,
-        key=lambda x: x["複勝点"],
-        reverse=True
-    )
+    fuku_sorted = sorted(usable, key=lambda x: x["複勝点"], reverse=True)
 
     second_round = []
 
@@ -520,8 +524,8 @@ def make_prediction(horses):
 
     cut_horses = [
         h for h in horses
-        if h not in third_round
-        and h != axis
+        if h != axis
+        and h not in third_round
     ]
 
     return axis, second_round, third_round, cut_horses
@@ -548,7 +552,7 @@ def make_wide_tickets(second_round):
         wide_tickets.append((a, b))
 
     return wide_tickets
-    
+
 def judge_confidence(horses, axis, second_round):
     if axis is None:
         return "★☆☆☆☆", "見送り"
@@ -571,6 +575,7 @@ def judge_confidence(horses, axis, second_round):
         return "★★☆☆☆", "見送り寄り"
     else:
         return "★☆☆☆☆", "見送り"
+
 if st.button("予想開始"):
     horses = parse_race_table(race_table)
 
@@ -582,47 +587,48 @@ if st.button("予想開始"):
         tickets = make_tickets(axis, second_round, third_round)
         wide_tickets = make_wide_tickets(second_round)
         confidence, recommendation = judge_confidence(horses, axis, second_round)
+
         st.success(f"{len(horses)}頭を読み取りました。")
 
         st.subheader("馬ごとの評価点")
 
-for h in sorted(horses, key=lambda x: x["点数"], reverse=True):
-    odds_text = f"｜オッズ {h['オッズ']}" if h["オッズ"] is not None else ""
-    style_text = f"｜脚質 {h['脚質']}" if h["脚質"] else ""
+        for h in sorted(horses, key=lambda x: x["点数"], reverse=True):
+            odds_text = f"｜オッズ {h['オッズ']}" if h["オッズ"] is not None else ""
+            style_text = f"｜脚質 {h['脚質']}" if h["脚質"] else ""
 
-    st.write(
-        f"{h['馬番']} {h['馬名']}｜"
-        f"{h['人気']}番人気｜"
-        f"{h['カテゴリ']}｜"
-        f"総合{h['点数']}点｜"
-        f"複勝{h['複勝点']}点"
-        f"{odds_text}{style_text}"
-    )
+            st.write(
+                f"{h['馬番']} {h['馬名']}｜"
+                f"{h['人気']}番人気｜"
+                f"{h['カテゴリ']}｜"
+                f"総合{h['点数']}点｜"
+                f"複勝{h['複勝点']}点"
+                f"{odds_text}{style_text}"
+            )
 
-    if h["加点理由"]:
-        st.caption(" / ".join(h["加点理由"]))
+            if h["加点理由"]:
+                st.caption(" / ".join(h["加点理由"]))
 
         st.subheader("予想結果")
-        
+
         st.info(
             f"信頼度：{confidence}\n\n"
             f"判定：{recommendation}"
         )
 
         if axis:
-            st.success(f"◎ 軸馬：{axis['馬番']} {axis['馬名']}｜{axis['点数']}点")
+            st.success(f"◎ 軸馬：{axis['馬番']} {axis['馬名']}｜総合{axis['点数']}点")
 
         st.write("### 2巡目")
         for h in second_round:
-            st.write(f"{h['馬番']} {h['馬名']}｜{h['点数']}点")
+            st.write(f"{h['馬番']} {h['馬名']}｜総合{h['点数']}点｜複勝{h['複勝点']}点")
 
         st.write("### 3巡目")
         for h in third_round:
-            st.write(f"{h['馬番']} {h['馬名']}｜{h['点数']}点")
+            st.write(f"{h['馬番']} {h['馬名']}｜総合{h['点数']}点｜複勝{h['複勝点']}点")
 
         st.write("### 消し馬")
         for h in cut_horses:
-            st.write(f"{h['馬番']} {h['馬名']}｜{h['人気']}番人気｜{h['点数']}点")
+            st.write(f"{h['馬番']} {h['馬名']}｜{h['人気']}番人気｜{h['カテゴリ']}｜総合{h['点数']}点｜複勝{h['複勝点']}点")
 
         st.subheader("3連単フォーメーション")
 
