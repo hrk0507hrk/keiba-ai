@@ -83,15 +83,11 @@ def clean_lines(text):
         line = line.strip()
         if not line:
             continue
-
         if any(word in line for word in IGNORE_WORDS):
             continue
-
         if re.match(r"^\d+/100$", line):
             continue
-
         lines.append(line)
-
     return lines
 
 def make_horse(frame_no, horse_no, horse_name, popularity=None, odds=None, jockey="", trainer=""):
@@ -118,7 +114,6 @@ def parse_pc_style(lines):
 
     while i < len(lines) - 4:
         match = re.match(r"^(\d+)\s+(\d+)$", lines[i])
-
         if not match:
             i += 1
             continue
@@ -329,17 +324,35 @@ def parse_style_graph(text):
 def parse_pace(text):
     pace = {}
     current_horse = None
+    wait_after_mae = False
     lines = [line.strip() for line in text.splitlines() if line.strip()]
 
     for line in lines:
         if re.match(r"^\d+$", line):
             current_horse = int(line)
-            if current_horse not in pace:
-                pace[current_horse] = []
+            pace.setdefault(current_horse, [])
+            wait_after_mae = False
             continue
 
         if current_horse is None:
             continue
+
+        if line == "前":
+            wait_after_mae = True
+            continue
+
+        if wait_after_mae:
+            if line == "----":
+                continue
+
+            nums = re.findall(r"\d+", line)
+            if len(nums) >= 3 and line.startswith("-"):
+                first = int(nums[0])
+                middle = int(nums[1])
+                last = int(nums[2])
+                pace[current_horse].append((first, middle, last))
+                wait_after_mae = False
+                continue
 
         match = re.search(r"-\s*(\d+)\s+(\d+)\s+(\d+)", line)
         if match:
@@ -347,6 +360,8 @@ def parse_pace(text):
             middle = int(match.group(2))
             last = int(match.group(3))
             pace[current_horse].append((first, middle, last))
+            wait_after_mae = False
+            continue
 
     return pace
 
@@ -473,7 +488,6 @@ def add_points(horses, analysis_text, running_style_text, style_graph_text, pace
             h["加点理由"].append(f"有利脚質({h['脚質']}) +{point}")
 
     pace_data = parse_pace(pace_text)
-    st.write(pace_data)
     escape_candidates = []
 
     for horse_no, runs in pace_data.items():
