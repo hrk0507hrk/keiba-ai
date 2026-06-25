@@ -4,11 +4,13 @@ from itertools import product, combinations
 
 st.title("競馬予想AI")
 st.write("出走表とnetkeibaデータ分析を貼ると、軸・2巡目・3巡目・買い目を自動作成します。")
+
 if "clear_count" not in st.session_state:
     st.session_state.clear_count = 0
 
 if st.button("🗑️ 入力内容をクリア"):
     st.session_state.clear_count += 1
+
 POINTS = {
     "データ上位馬3頭": 30,
     "このコースが得意な馬": 15,
@@ -35,6 +37,7 @@ race_table = st.text_area(
     height=430,
     key=f"race_{st.session_state.clear_count}"
 )
+
 analysis = st.text_area(
     "netkeibaのデータ分析を貼ってください",
     height=330,
@@ -59,17 +62,16 @@ style_graph_text = st.text_area(
     height=220,
     placeholder="""例
 1
-差 119 ...
+差 119 138 150 1452 1859 6% 13% 21% 55% 61% マジュツシカエル
 3
-先 92 ...
+先 92 90 92 424 698 13% 26% 39% 57% 71% ラブシックボッサ
 11
-逃 60 ...""",
+逃 60 48 28 137 273 21% 39% 49% 59% 71% エスペラード""",
     key=f"graph_{st.session_state.clear_count}"
 )
 
 def clean_lines(text):
     lines = []
-
     for line in text.splitlines():
         line = line.strip()
         if not line:
@@ -129,16 +131,19 @@ def parse_pc_style(lines):
         info_line = lines[i + 3]
 
         popularity = None
-        pop_match = re.search(r"(\d+)\s*人気?", lines[i + 4])
+        pop_match = re.search(r"(\d+)", lines[i + 4])
         if pop_match:
             popularity = int(pop_match.group(1))
 
-        odds = None
-        odds_nums = re.findall(r"\d+\.\d+", info_line)
-        if odds_nums:
-            odds = float(odds_nums[-1])
-
         parts = re.split(r"\t+|\s{2,}", info_line)
+
+        odds = None
+        for p in reversed(parts):
+            p = p.strip()
+            if re.fullmatch(r"\d+\.\d+", p):
+                odds = float(p)
+                break
+
         jockey = ""
         trainer = ""
 
@@ -223,7 +228,7 @@ def parse_running_style(text):
         match = re.match(r"^(\d+)\s+(.+)$", line)
         if match:
             styles[int(match.group(1))] = {
-                "style": match.group(2).strip(),
+                "style": normalize_style(match.group(2).strip()),
                 "win_rate": None,
                 "place_rate": None
             }
@@ -276,9 +281,7 @@ def parse_style_graph(text):
 
             match = re.match(r"^(逃|先|差|追)\s+(.+)", data_line)
             if match:
-                raw_style = match.group(1)
-                style = normalize_style(raw_style)
-
+                style = normalize_style(match.group(1))
                 percents = [int(x) for x in re.findall(r"(\d+)%", data_line)]
                 win_rate = percents[0] if len(percents) >= 1 else None
                 place_rate = percents[2] if len(percents) >= 3 else None
@@ -295,8 +298,7 @@ def parse_style_graph(text):
         match = re.match(r"^(\d+)\s+(逃|先|差|追)\s+(.+)", line)
         if match:
             horse_no = int(match.group(1))
-            raw_style = match.group(2)
-            style = normalize_style(raw_style)
+            style = normalize_style(match.group(2))
 
             percents = [int(x) for x in re.findall(r"(\d+)%", line)]
             win_rate = percents[0] if len(percents) >= 1 else None
