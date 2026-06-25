@@ -482,7 +482,29 @@ def make_wide_tickets(second_round):
         wide_tickets.append((a, b))
 
     return wide_tickets
+    
+def judge_confidence(horses, axis, second_round):
+    if axis is None:
+        return "★☆☆☆☆", "見送り"
 
+    sorted_horses = sorted(horses, key=lambda x: x["点数"], reverse=True)
+
+    top_score = sorted_horses[0]["点数"]
+    second_score = sorted_horses[1]["点数"] if len(sorted_horses) >= 2 else top_score
+    gap = top_score - second_score
+
+    hole_count = sum(1 for h in second_round if h["カテゴリ"] == "穴馬")
+
+    if gap >= 20:
+        return "★★★★★", "勝負"
+    elif gap >= 12 and hole_count >= 1:
+        return "★★★★☆", "勝負"
+    elif gap >= 8:
+        return "★★★☆☆", "通常"
+    elif gap >= 4:
+        return "★★☆☆☆", "見送り寄り"
+    else:
+        return "★☆☆☆☆", "見送り"
 if st.button("予想開始"):
     horses = parse_race_table(race_table)
 
@@ -493,7 +515,7 @@ if st.button("予想開始"):
         axis, second_round, third_round, cut_horses = make_prediction(horses)
         tickets = make_tickets(axis, second_round, third_round)
         wide_tickets = make_wide_tickets(second_round)
-
+        confidence, recommendation = judge_confidence(horses, axis, second_round)
         st.success(f"{len(horses)}頭を読み取りました。")
 
         st.subheader("馬ごとの評価点")
@@ -506,6 +528,11 @@ if st.button("予想開始"):
                 st.caption(" / ".join(h["加点理由"]))
 
         st.subheader("予想結果")
+        
+        st.info(
+            f"信頼度：{confidence}\n\n"
+            f"判定：{recommendation}"
+        )
 
         if axis:
             st.success(f"◎ 軸馬：{axis['馬番']} {axis['馬名']}｜{axis['点数']}点")
