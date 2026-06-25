@@ -3,7 +3,7 @@ import re
 from itertools import product, combinations
 
 st.title("競馬予想AI")
-st.write("出走表とnetkeibaデータ分析を貼ると、軸・2巡目・3巡目・買い目を自動作成します。")
+st.write("出走表・データ分析・脚質・過去走データから、軸・2巡目・3巡目・買い目を自動作成します。")
 
 if "clear_count" not in st.session_state:
     st.session_state.clear_count = 0
@@ -68,6 +68,13 @@ style_graph_text = st.text_area(
 --
 先 100 120 130 800 1000 10% 22% 35% 60% 70% サンプル""",
     key=f"graph_{st.session_state.clear_count}"
+)
+
+pace_text = st.text_area(
+    "過去走データを貼り付け（任意）",
+    height=330,
+    placeholder="netkeibaの過去5走データをそのまま貼り付け",
+    key=f"pace_{st.session_state.clear_count}"
 )
 
 def clean_lines(text):
@@ -261,7 +268,6 @@ def parse_style_graph(text):
     while i < len(lines):
         line = lines[i]
 
-        # PC版：馬番 → -- → 脚質データ
         if re.match(r"^\d+$", line) and i + 2 < len(lines) and lines[i + 1] == "--":
             horse_no = int(line)
             data_line = lines[i + 2]
@@ -282,7 +288,6 @@ def parse_style_graph(text):
                 i += 3
                 continue
 
-        # スマホ版：馬番 → 脚質データ
         if re.match(r"^\d+$", line) and i + 1 < len(lines):
             horse_no = int(line)
             data_line = lines[i + 1]
@@ -303,7 +308,6 @@ def parse_style_graph(text):
                 i += 2
                 continue
 
-        # 1行型：1 差 600 ...
         match = re.match(r"^(\d+)\s+(逃|先|差|追)\s+(.+)", line)
         if match:
             horse_no = int(match.group(1))
@@ -321,6 +325,30 @@ def parse_style_graph(text):
         i += 1
 
     return styles
+
+def parse_pace(text):
+    pace = {}
+    current_horse = None
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+
+    for line in lines:
+        if re.match(r"^\d+$", line):
+            current_horse = int(line)
+            if current_horse not in pace:
+                pace[current_horse] = []
+            continue
+
+        if current_horse is None:
+            continue
+
+        match = re.search(r"-\s*(\d+)\s+(\d+)\s+(\d+)", line)
+        if match:
+            first = int(match.group(1))
+            middle = int(match.group(2))
+            last = int(match.group(3))
+            pace[current_horse].append((first, middle, last))
+
+    return pace
 
 def get_section_items(text):
     sections = {}
@@ -365,7 +393,7 @@ def set_category(horses):
 def has_reason(horse, keyword):
     return any(keyword in reason for reason in horse["加点理由"])
 
-def add_points(horses, analysis_text, running_style_text, style_graph_text):
+def add_points(horses, analysis_text, running_style_text, style_graph_text, pace_text):
     set_category(horses)
 
     horse_map = {h["馬番"]: h for h in horses}
@@ -444,7 +472,43 @@ def add_points(horses, analysis_text, running_style_text, style_graph_text):
             h["点数"] += point
             h["加点理由"].append(f"有利脚質({h['脚質']}) +{point}")
 
-    # 複勝点：2着・3着候補用
+    pace_data = parse_pace(pace_text)
+    escape_candidates = []
+
+    for horse_no, runs in pace_data.items():
+        if not runs:
+            continue
+
+        avg_first = sum(r[0] for r in runs) / len(runs)
+        front_count = sum(1 for r in runs if r[0] <= 2)
+
+        if avg_first <= 2.5 or front_count >= 2:
+            escape_candidates.append(horse_no)
+
+    candidate_count = len(escape_candidates)
+
+    for h in horses:
+        if candidate_count == 1:
+            if h["馬番"] in escape_candidates:
+                h["点数"] += 15
+                h["加点理由"].append("展開有利(単騎逃げ) +15")
+
+        elif candidate_count == 2:
+            if h["馬番"] in escape_candidates:
+                h["点数"] += 8
+                h["加点理由"].append("展開有利(逃げ候補) +8")
+            elif h["脚質"] == "先行":
+                h["点数"] += 5
+                h["加点理由"].append("展開有利(先行) +5")
+
+        elif candidate_count >= 3:
+            if h["脚質"] == "差し":
+                h["点数"] += 8
+                h["加点理由"].append("展開有利(差し) +8")
+            elif h["脚質"] == "追込":
+                h["点数"] += 5
+                h["加点理由"].append("展開有利(追込) +5")
+
     for h in horses:
         fuku_score = 0
 
@@ -582,7 +646,7 @@ if st.button("予想開始"):
     if not horses:
         st.error("出走表を読み取れませんでした。PC版・スマホ版どちらでも、出走表部分を少し広めにコピーして貼ってください。")
     else:
-        horses = add_points(horses, analysis, running_style_text, style_graph_text)
+        horses = add_points(horses, analysis, running_style_text, style_graph_text, pace_text)
         axis, second_round, third_round, cut_horses = make_prediction(horses)
         tickets = make_tickets(axis, second_round, third_round)
         wide_tickets = make_wide_tickets(second_round)
