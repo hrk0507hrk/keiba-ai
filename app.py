@@ -412,32 +412,32 @@ def add_points(horses, analysis_text, running_style_text, style_graph_text):
             h["加点理由"].append(f"有利脚質({h['脚質']}) +{point}")
     
     for h in horses:
-    score = 0
+        score = 0
 
-    if "この距離が得意な馬 +12" in h["加点理由"]:
-        score += 12
+        if "この距離が得意な馬 +12" in h["加点理由"]:
+            score += 12
 
-    if "この競馬場が得意な馬 +12" in h["加点理由"]:
-        score += 12
+        if "この競馬場が得意な馬 +12" in h["加点理由"]:
+            score += 12
 
-    if "今回の馬場状態が得意な馬 +10" in h["加点理由"]:
-        score += 10
-
-    if "今回のレース間隔で実績がある馬 +10" in h["加点理由"]:
-        score += 10
-
-    if h["脚質複勝率"] is not None:
-        if h["脚質複勝率"] >= 50:
-            score += 15
-        elif h["脚質複勝率"] >= 40:
+        if "今回の馬場状態が得意な馬 +10" in h["加点理由"]:
             score += 10
-        elif h["脚質複勝率"] >= 30:
+
+        if "今回のレース間隔で実績がある馬 +10" in h["加点理由"]:
+            score += 10
+
+        if h["脚質複勝率"] is not None:
+            if h["脚質複勝率"] >= 50:
+                score += 15
+            elif h["脚質複勝率"] >= 40:
+                score += 10
+            elif h["脚質複勝率"] >= 30:
+                score += 5
+
+        if h["カテゴリ"] == "穴馬":
             score += 5
 
-    if h["カテゴリ"] == "穴馬":
-        score += 5
-
-    h["複勝点"] = score
+        h["複勝点"] = score
     
     return list(horse_map.values())
 
