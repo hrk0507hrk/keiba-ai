@@ -106,6 +106,7 @@ def make_horse(frame_no, horse_no, horse_name, popularity=None, odds=None, jocke
         "脚質勝率": None,
         "脚質複勝率": None,
         "点数": 0,
+        "複勝点": 0,
         "加点理由": []
     }
 
@@ -409,7 +410,35 @@ def add_points(horses, analysis_text, running_style_text, style_graph_text):
             point = POINTS["有利脚質"]
             h["点数"] += point
             h["加点理由"].append(f"有利脚質({h['脚質']}) +{point}")
+    
+    for h in horses:
+    score = 0
 
+    if "この距離が得意な馬 +12" in h["加点理由"]:
+        score += 12
+
+    if "この競馬場が得意な馬 +12" in h["加点理由"]:
+        score += 12
+
+    if "今回の馬場状態が得意な馬 +10" in h["加点理由"]:
+        score += 10
+
+    if "今回のレース間隔で実績がある馬 +10" in h["加点理由"]:
+        score += 10
+
+    if h["脚質複勝率"] is not None:
+        if h["脚質複勝率"] >= 50:
+            score += 15
+        elif h["脚質複勝率"] >= 40:
+            score += 10
+        elif h["脚質複勝率"] >= 30:
+            score += 5
+
+    if h["カテゴリ"] == "穴馬":
+        score += 5
+
+    h["複勝点"] = score
+    
     return list(horse_map.values())
 
 def set_category(horses):
@@ -424,7 +453,7 @@ def set_category(horses):
         elif h["人気"] <= 3:
             h["カテゴリ"] = "人気馬"
             popular.append(h)
-        elif h["人気"] <= 8:
+        elif h["人気"] <= 9:
             h["カテゴリ"] = "穴馬"
             hole.append(h)
         else:
@@ -436,27 +465,64 @@ def set_category(horses):
 def make_prediction(horses):
     popular, hole, big_hole = set_category(horses)
 
-    popular_sorted = sorted(popular, key=lambda x: x["点数"], reverse=True)
-    hole_sorted = sorted(hole, key=lambda x: x["点数"], reverse=True)
+    popular_sorted = sorted(
+        popular,
+        key=lambda x: x["点数"],
+        reverse=True
+    )
 
-    remaining_popular = popular_sorted[:2]
-    cut_popular = popular_sorted[2:]
+    axis = popular_sorted[0] if popular_sorted else None
 
-    axis = remaining_popular[0] if len(remaining_popular) >= 1 else None
-    second_popular = remaining_popular[1] if len(remaining_popular) >= 2 else None
+    axis_no = axis["馬番"] if axis else None
 
-    hole_top2 = hole_sorted[:2]
-    hole_middle2 = hole_sorted[2:4]
-    cut_hole = hole_sorted[4:]
+    remain_popular = [
+        h for h in popular_sorted
+        if h["馬番"] != axis_no
+    ]
+
+    usable = [
+        h for h in horses
+        if h["カテゴリ"] != "大穴馬"
+        and h["馬番"] != axis_no
+    ]
+
+    fuku_sorted = sorted(
+        usable,
+        key=lambda x: x["複勝点"],
+        reverse=True
+    )
 
     second_round = []
-    if second_popular:
-        second_round.append(second_popular)
 
-    second_round += hole_top2
-    third_round = second_round + hole_middle2
+    if remain_popular:
+        second_round.append(remain_popular[0])
 
-    cut_horses = cut_popular + cut_hole + big_hole
+    for h in fuku_sorted:
+        if h not in second_round:
+            second_round.append(h)
+
+        if len(second_round) >= 3:
+            break
+
+    third_round = second_round.copy()
+
+    if len(remain_popular) >= 2:
+        last_popular = remain_popular[1]
+        if last_popular not in third_round:
+            third_round.append(last_popular)
+
+    for h in fuku_sorted:
+        if h not in third_round:
+            third_round.append(h)
+
+        if len(third_round) >= 6:
+            break
+
+    cut_horses = [
+        h for h in horses
+        if h not in third_round
+        and h != axis
+    ]
 
     return axis, second_round, third_round, cut_horses
 
@@ -521,11 +587,20 @@ if st.button("予想開始"):
         st.subheader("馬ごとの評価点")
 
         for h in sorted(horses, key=lambda x: x["点数"], reverse=True):
-            odds_text = f"｜オッズ {h['オッズ']}" if h["オッズ"] is not None else ""
-            style_text = f"｜脚質 {h['脚質']}" if h["脚質"] else ""
-            st.write(f"{h['馬番']} {h['馬名']}｜{h['人気']}番人気｜{h['カテゴリ']}｜{h['点数']}点{odds_text}{style_text}")
-            if h["加点理由"]:
-                st.caption(" / ".join(h["加点理由"]))
+    odds_text = f"｜オッズ {h['オッズ']}" if h["オッズ"] is not None else ""
+    style_text = f"｜脚質 {h['脚質']}" if h["脚質"] else ""
+
+    st.write(
+        f"{h['馬番']} {h['馬名']}｜"
+        f"{h['人気']}番人気｜"
+        f"{h['カテゴリ']}｜"
+        f"総合{h['点数']}点｜"
+        f"複勝{h['複勝点']}点"
+        f"{odds_text}{style_text}"
+    )
+
+    if h["加点理由"]:
+        st.caption(" / ".join(h["加点理由"]))
 
         st.subheader("予想結果")
         
