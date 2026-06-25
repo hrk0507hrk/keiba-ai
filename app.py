@@ -586,7 +586,7 @@ if st.button("予想開始"):
 
         st.subheader("馬ごとの評価点")
 
-        for h in sorted(horses, key=lambda x: x["点数"], reverse=True):
+for h in sorted(horses, key=lambda x: x["点数"], reverse=True):
     odds_text = f"｜オッズ {h['オッズ']}" if h["オッズ"] is not None else ""
     style_text = f"｜脚質 {h['脚質']}" if h["脚質"] else ""
 
