@@ -507,6 +507,7 @@ def add_points(horses, analysis_text, running_style_text, style_graph_text, pace
             h["加点理由"].append(f"有利脚質({h['脚質']}) +{point}")
 
     pace_data = parse_pace(pace_text)
+    st.write(pace_data)
     escape_candidates = []
 
     for horse_no, runs in pace_data.items():
