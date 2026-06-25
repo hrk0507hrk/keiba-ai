@@ -324,44 +324,63 @@ def parse_style_graph(text):
 def parse_pace(text):
     pace = {}
     current_horse = None
-    wait_after_mae = False
     lines = [line.strip() for line in text.splitlines() if line.strip()]
 
     for line in lines:
-        if re.match(r"^\d+$", line):
+
+        # 馬番行
+        if re.fullmatch(r"\d+", line):
             current_horse = int(line)
             pace.setdefault(current_horse, [])
-            wait_after_mae = False
             continue
 
         if current_horse is None:
             continue
 
-        if line == "前":
-            wait_after_mae = True
+        # -779
+        m = re.search(r"-(\d{3,})$", line)
+
+        if not m:
             continue
 
-        if wait_after_mae:
-            if line == "----":
+        nums = m.group(1)
+
+        try:
+            if len(nums) == 3:
+                pos = (
+                    int(nums[0]),
+                    int(nums[1]),
+                    int(nums[2])
+                )
+
+            elif len(nums) == 4:
+                pos = (
+                    int(nums[:2]),
+                    int(nums[2]),
+                    int(nums[3])
+                )
+
+            elif len(nums) == 5:
+                pos = (
+                    int(nums[:2]),
+                    int(nums[2:4]),
+                    int(nums[4])
+                )
+
+            elif len(nums) == 6:
+                pos = (
+                    int(nums[:2]),
+                    int(nums[2:4]),
+                    int(nums[4:6])
+                )
+
+            else:
                 continue
 
-            nums = re.findall(r"\d+", line)
-            if len(nums) >= 3 and line.startswith("-"):
-                first = int(nums[0])
-                middle = int(nums[1])
-                last = int(nums[2])
-                pace[current_horse].append((first, middle, last))
-                wait_after_mae = False
-                continue
+            pace[current_horse].append(pos)
 
-        match = re.search(r"-\s*(\d+)\s+(\d+)\s+(\d+)", line)
-        if match:
-            first = int(match.group(1))
-            middle = int(match.group(2))
-            last = int(match.group(3))
-            pace[current_horse].append((first, middle, last))
-            wait_after_mae = False
-            continue
+        except:
+            pass
 
     return pace
 
