@@ -121,8 +121,28 @@ def parse_jra_style(lines):
             frame_no = int(nums[0])
             horse_no = int(nums[1])
 
-            horse_name = lines[i + 1].strip()
-            info = lines[i + 2].strip()
+            j = i + 1
+
+            # PC版の -- を飛ばす
+            while j < len(lines) and lines[j] == "--":
+                j += 1
+
+            if j >= len(lines):
+                i += 1
+                continue
+
+            horse_name = lines[j].strip()
+
+            # 馬名が変な場合はスキップ
+            if horse_name in ["--", "編集"] or re.fullmatch(r"\d+", horse_name):
+                i += 1
+                continue
+
+            if j + 1 >= len(lines):
+                i += 1
+                continue
+
+            info = lines[j + 1].strip()
             parts = info.split()
 
             popularity = None
@@ -130,6 +150,7 @@ def parse_jra_style(lines):
             jockey = ""
             trainer = ""
 
+            # 例：牡3 55.0 戸崎圭 美浦上原佑 7.7 3
             if len(parts) >= 6:
                 jockey = parts[2]
                 trainer = parts[3]
@@ -138,7 +159,8 @@ def parse_jra_style(lines):
                     odds = float(parts[-2])
                     popularity = int(parts[-1])
                 except:
-                    pass
+                    odds = None
+                    popularity = None
 
             horses.append(
                 make_horse(
@@ -152,52 +174,10 @@ def parse_jra_style(lines):
                 )
             )
 
-            i += 3
+            i = j + 2
             continue
 
         i += 1
-
-    return horses
-
-def parse_pc_style(lines):
-    horses = []
-    i = 0
-
-    while i < len(lines) - 4:
-        match = re.match(r"^(\d+)\s+(\d+)$", lines[i])
-        if not match:
-            i += 1
-            continue
-
-        frame_no = int(match.group(1))
-        horse_no = int(match.group(2))
-
-        if lines[i + 1] != "--":
-            i += 1
-            continue
-
-        horse_name = lines[i + 2].replace("  ", "").strip()
-        info_line = lines[i + 3]
-
-        popularity = None
-        pop_match = re.search(r"(\d+)", lines[i + 4])
-        if pop_match:
-            popularity = int(pop_match.group(1))
-
-        parts = re.split(r"\t+|\s{2,}", info_line)
-
-        odds = None
-        for p in reversed(parts):
-            p = p.strip()
-            if re.fullmatch(r"\d+\.\d+", p):
-                odds = float(p)
-                break
-
-        jockey = parts[2].strip() if len(parts) >= 3 else ""
-        trainer = parts[3].strip() if len(parts) >= 4 else ""
-
-        horses.append(make_horse(frame_no, horse_no, horse_name, popularity, odds, jockey, trainer))
-        i += 5
 
     return horses
 
