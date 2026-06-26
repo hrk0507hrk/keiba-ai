@@ -455,8 +455,9 @@ def add_points(horses, analysis_text, running_style_text, style_graph_text, pace
                 horse_no = int(match.group(1))
                 if horse_no in horse_map:
                     point = POINTS[section]
-                    horse_map[horse_no]["点数"] += point
-                    horse_map[horse_no]["加点理由"].append(f"{section} +{point}")
+                    if point != 0:
+                        horse_map[horse_no]["点数"] += point
+                        horse_map[horse_no]["加点理由"].append(f"{section} +{point}")
 
     good_frames = []
     for line in sections.get("このコースで有利な枠順", []) + sections.get("好調枠順", []):
@@ -582,6 +583,32 @@ def add_points(horses, analysis_text, running_style_text, style_graph_text, pace
             fuku_score += 5
 
         h["複勝点"] = fuku_score
+
+    for h in horses:
+        if h["人気"] == 1:
+            h["点数"] += 8
+            h["加点理由"].append("人気補正(1番人気) +8")
+        elif h["人気"] == 2:
+            h["点数"] += 6
+            h["加点理由"].append("人気補正(2番人気) +6")
+        elif h["人気"] == 3:
+            h["点数"] += 4
+            h["加点理由"].append("人気補正(3番人気) +4")
+        elif h["人気"] is not None and 4 <= h["人気"] <= 6:
+            h["点数"] += 2
+            h["加点理由"].append("人気補正(4〜6番人気) +2")
+
+        if h["カテゴリ"] == "穴馬" and h["複勝点"] >= 20:
+            h["点数"] += 5
+            h["加点理由"].append("妙味補正(穴馬×複勝点20以上) +5")
+
+        if h["カテゴリ"] == "人気馬" and h["複勝点"] < 20:
+            h["点数"] -= 10
+            h["加点理由"].append("危険人気馬減点(複勝点20未満) -10")
+
+        if h["脚質"] in ["差し", "追込"] and h["複勝点"] < 20:
+            h["点数"] -= 5
+            h["加点理由"].append("後方脚質減点(複勝点20未満) -5")
 
     for h in horses:
         h["軸スコア"] = calc_axis_score(h)
