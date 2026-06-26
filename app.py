@@ -723,6 +723,66 @@ def make_wide_tickets(second_round):
 
     return wide_tickets
 
+def make_sanrenpuku_16_tickets(horses):
+    popular = [
+        h for h in horses
+        if h["カテゴリ"] == "人気馬"
+    ]
+
+    holes = [
+        h for h in horses
+        if h["カテゴリ"] == "穴馬"
+    ]
+
+    popular_sorted = sorted(
+        popular,
+        key=lambda x: x["点数"],
+        reverse=True
+    )
+
+    hole_sorted = sorted(
+        holes,
+        key=lambda x: x["点数"],
+        reverse=True
+    )
+
+    if len(popular_sorted) < 2 or len(hole_sorted) < 4:
+        return [], None
+
+    remain_popular = popular_sorted[:2]
+    selected_holes = hole_sorted[:4]
+
+    main_axis = remain_popular[0]
+    sub_axis = remain_popular[1]
+
+    tickets = []
+
+    group1 = [sub_axis] + selected_holes
+
+    for a, b in combinations(group1, 2):
+        ticket = tuple(sorted(
+            [main_axis["馬番"], a["馬番"], b["馬番"]]
+        ))
+        tickets.append(ticket)
+
+    for a, b in combinations(selected_holes, 2):
+        ticket = tuple(sorted(
+            [sub_axis["馬番"], a["馬番"], b["馬番"]]
+        ))
+        tickets.append(ticket)
+
+    tickets = list(dict.fromkeys(tickets))
+
+    info = {
+        "main_axis": main_axis,
+        "sub_axis": sub_axis,
+        "selected_holes": selected_holes,
+        "cut_popular": popular_sorted[2:],
+        "cut_holes": hole_sorted[4:]
+    }
+
+    return tickets, info
+
 def judge_confidence(horses, axis, second_round, axis_mode):
     if axis is None:
         return "★☆☆☆☆", "見送り"
@@ -764,6 +824,7 @@ if st.button("予想開始"):
 
         tickets = make_tickets(axis, second_round, third_round)
         wide_tickets = make_wide_tickets(second_round)
+        sanrenpuku16_tickets, sanrenpuku16_info = make_sanrenpuku_16_tickets(horses)
         confidence, recommendation = judge_confidence(horses, axis, second_round, axis_mode)
 
         st.success(f"{len(horses)}頭を読み取りました。")
@@ -849,6 +910,40 @@ if st.button("予想開始"):
                 f"総合{h['点数']}点｜"
                 f"複勝{h['複勝点']}点"
             )
+
+        st.subheader("3連複16点ルール")
+
+        if sanrenpuku16_info:
+            main_axis = sanrenpuku16_info["main_axis"]
+            sub_axis = sanrenpuku16_info["sub_axis"]
+            selected_holes = sanrenpuku16_info["selected_holes"]
+
+            st.write(
+                f"人気軸A：{main_axis['馬番']} {main_axis['馬名']}｜"
+                f"総合{main_axis['点数']}点｜複勝{main_axis['複勝点']}点"
+            )
+
+            st.write(
+                f"人気軸B：{sub_axis['馬番']} {sub_axis['馬名']}｜"
+                f"総合{sub_axis['点数']}点｜複勝{sub_axis['複勝点']}点"
+            )
+
+            st.write("穴馬採用4頭")
+            st.write(
+                " / ".join(
+                    f"{h['馬番']} {h['馬名']}" for h in selected_holes
+                )
+            )
+
+            st.code(
+                " / ".join(
+                    f"{a}-{b}-{c}" for a, b, c in sanrenpuku16_tickets
+                )
+            )
+
+            st.write(f"3連複点数：{len(sanrenpuku16_tickets)}点")
+        else:
+            st.warning("3連複16点ルールを作成できませんでした。人気馬または穴馬の数が不足しています。")
 
         st.subheader("3連単フォーメーション")
 
