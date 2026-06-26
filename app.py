@@ -87,6 +87,8 @@ def clean_lines(text):
             continue
         if re.match(r"^\d+/100$", line):
             continue
+        if re.match(r"^\d+/500$", line):
+            continue
         lines.append(line)
     return lines
 
@@ -108,6 +110,54 @@ def make_horse(frame_no, horse_no, horse_name, popularity=None, odds=None, jocke
         "軸スコア": 0,
         "加点理由": []
     }
+
+def parse_jra_style(lines):
+    horses = []
+    i = 0
+
+    while i < len(lines) - 2:
+        if re.match(r"^\d+\s+\d+$", lines[i]):
+            nums = lines[i].split()
+            frame_no = int(nums[0])
+            horse_no = int(nums[1])
+
+            horse_name = lines[i + 1].strip()
+            info = lines[i + 2].strip()
+            parts = info.split()
+
+            popularity = None
+            odds = None
+            jockey = ""
+            trainer = ""
+
+            if len(parts) >= 6:
+                jockey = parts[2]
+                trainer = parts[3]
+
+                try:
+                    odds = float(parts[-2])
+                    popularity = int(parts[-1])
+                except:
+                    pass
+
+            horses.append(
+                make_horse(
+                    frame_no,
+                    horse_no,
+                    horse_name,
+                    popularity,
+                    odds,
+                    jockey,
+                    trainer
+                )
+            )
+
+            i += 3
+            continue
+
+        i += 1
+
+    return horses
 
 def parse_pc_style(lines):
     horses = []
@@ -195,7 +245,11 @@ def parse_smartphone_style(lines):
 
 def parse_race_table(text):
     lines = clean_lines(text)
-    horses = parse_pc_style(lines)
+
+    horses = parse_jra_style(lines)
+
+    if not horses:
+        horses = parse_pc_style(lines)
 
     if not horses:
         horses = parse_smartphone_style(lines)
