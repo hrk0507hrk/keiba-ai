@@ -1,26 +1,15 @@
 import streamlit as st
 import re
-import requests
-from bs4 import BeautifulSoup
 from itertools import product, combinations
 
 st.title("競馬予想AI")
-st.write("URL取得・出走表・データ分析・脚質・過去走データから、軸・2巡目・3巡目・買い目を自動作成します。")
+st.write("出走表・データ分析・脚質・過去走データから、軸・2巡目・3巡目・買い目を自動作成します。")
 
 if "clear_count" not in st.session_state:
     st.session_state.clear_count = 0
 
-if "race_table_text" not in st.session_state:
-    st.session_state.race_table_text = ""
-
-if "race_url_text" not in st.session_state:
-    st.session_state.race_url_text = ""
-
 if st.button("🗑️ 入力内容をクリア"):
     st.session_state.clear_count += 1
-    st.session_state.race_table_text = ""
-    st.session_state.race_url_text = ""
-    st.rerun()
 
 POINTS = {
     "データ上位馬3頭": 30,
@@ -43,50 +32,10 @@ IGNORE_WORDS = [
     "全グラフを表示"
 ]
 
-def fetch_netkeiba_race(url):
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0"
-        }
-
-        r = requests.get(
-            url,
-            headers=headers,
-            timeout=10
-        )
-
-        if r.status_code != 200:
-            return ""
-
-        soup = BeautifulSoup(r.text, "lxml")
-        return soup.get_text("\n")
-
-    except:
-        return ""
-
-st.subheader("netkeiba URL自動取得")
-
-race_url = st.text_input(
-    "レースURLを貼り付け",
-    placeholder="https://race.netkeiba.com/race/shutuba.html?race_id=...",
-    key="race_url_text"
-)
-
-if st.button("URLから取得"):
-    if race_url:
-        auto_text = fetch_netkeiba_race(race_url)
-
-        if auto_text:
-            st.session_state.race_table_text = auto_text
-            st.success("取得成功！下の出走表欄に反映しました。")
-            st.rerun()
-        else:
-            st.error("取得できませんでした。今まで通りコピペ欄を使ってください。")
-
 race_table = st.text_area(
     "netkeibaの出走表を丸ごと貼ってください",
     height=430,
-    key="race_table_text"
+    key=f"race_{st.session_state.clear_count}"
 )
 
 analysis = st.text_area(
@@ -156,6 +105,7 @@ def make_horse(frame_no, horse_no, horse_name, popularity=None, odds=None, jocke
         "カテゴリ": "",
         "点数": 0,
         "複勝点": 0,
+        "軸スコア": 0,
         "加点理由": []
     }
 
@@ -395,14 +345,12 @@ def parse_pace(text):
         if line == "----":
             continue
 
-        # 形式1：- 5 5 8
         m1 = re.search(r"-\s*(\d+)\s+(\d+)\s+(\d+)", line)
         if m1:
             pace[current_horse].append((int(m1.group(1)), int(m1.group(2)), int(m1.group(3))))
             wait_after_mae = False
             continue
 
-        # 形式2：4 3 7 8 / 1 1 1 2
         if wait_after_mae:
             nums = re.findall(r"\d+", line)
 
@@ -416,7 +364,6 @@ def parse_pace(text):
                 wait_after_mae = False
                 continue
 
-        # 形式3：-779 / -111 / -111110
         m2 = re.search(r"-(\d{3,})$", line)
         if m2:
             nums = m2.group(1)
@@ -481,6 +428,16 @@ def set_category(horses):
 
 def has_reason(horse, keyword):
     return any(keyword in reason for reason in horse["加点理由"])
+
+def calc_axis_score(horse):
+    style_bonus = {
+        "逃げ": 10,
+        "先行": 7,
+        "差し": -3,
+        "追込": -5
+    }.get(horse["脚質"], 0)
+
+    return horse["点数"] * 0.5 + horse["複勝点"] * 0.7 + style_bonus
 
 def add_points(horses, analysis_text, running_style_text, style_graph_text, pace_text):
     set_category(horses)
@@ -626,15 +583,48 @@ def add_points(horses, analysis_text, running_style_text, style_graph_text, pace
 
         h["複勝点"] = fuku_score
 
+    for h in horses:
+        h["軸スコア"] = calc_axis_score(h)
+
     return list(horse_map.values())
 
 def make_prediction(horses):
     popular, hole, big_hole = set_category(horses)
 
-    popular_sorted = sorted(popular, key=lambda x: x["点数"], reverse=True)
-    axis = popular_sorted[0] if popular_sorted else None
+    axis_mode = "normal"
 
+    popular_candidates = [
+        h for h in popular
+        if h["複勝点"] >= 20
+    ]
+
+    hole_recommendations = []
+
+    if popular_candidates:
+        axis_candidates = popular_candidates
+    else:
+        hole_recommendations = [
+            h for h in hole
+            if h["複勝点"] >= 20
+        ]
+
+        if hole_recommendations:
+            axis_candidates = hole_recommendations
+            axis_mode = "hole"
+        else:
+            axis_candidates = popular
+            axis_mode = "weak"
+
+    axis_candidates_sorted = sorted(
+        axis_candidates,
+        key=lambda x: x["軸スコア"],
+        reverse=True
+    )
+
+    axis = axis_candidates_sorted[0] if axis_candidates_sorted else None
     axis_no = axis["馬番"] if axis else None
+
+    popular_sorted = sorted(popular, key=lambda x: x["点数"], reverse=True)
 
     remain_popular = [
         h for h in popular_sorted
@@ -681,7 +671,7 @@ def make_prediction(horses):
         and h not in third_round
     ]
 
-    return axis, second_round, third_round, cut_horses
+    return axis, second_round, third_round, cut_horses, axis_mode, hole_recommendations
 
 def make_tickets(axis, second_round, third_round):
     tickets = []
@@ -706,9 +696,15 @@ def make_wide_tickets(second_round):
 
     return wide_tickets
 
-def judge_confidence(horses, axis, second_round):
+def judge_confidence(horses, axis, second_round, axis_mode):
     if axis is None:
         return "★☆☆☆☆", "見送り"
+
+    if axis_mode == "hole":
+        return "★★★☆☆", "穴馬推奨"
+
+    if axis_mode == "weak":
+        return "★☆☆☆☆", "軸不安・見送り寄り"
 
     sorted_horses = sorted(horses, key=lambda x: x["点数"], reverse=True)
 
@@ -733,13 +729,15 @@ if st.button("予想開始"):
     horses = parse_race_table(race_table)
 
     if not horses:
-        st.error("出走表を読み取れませんでした。URL取得できない場合は、PC版・スマホ版の出走表を貼ってください。")
+        st.error("出走表を読み取れませんでした。PC版・スマホ版どちらでも、出走表部分を少し広めにコピーして貼ってください。")
     else:
         horses = add_points(horses, analysis, running_style_text, style_graph_text, pace_text)
-        axis, second_round, third_round, cut_horses = make_prediction(horses)
+
+        axis, second_round, third_round, cut_horses, axis_mode, hole_recommendations = make_prediction(horses)
+
         tickets = make_tickets(axis, second_round, third_round)
         wide_tickets = make_wide_tickets(second_round)
-        confidence, recommendation = judge_confidence(horses, axis, second_round)
+        confidence, recommendation = judge_confidence(horses, axis, second_round, axis_mode)
 
         st.success(f"{len(horses)}頭を読み取りました。")
 
@@ -754,7 +752,8 @@ if st.button("予想開始"):
                 f"{h['人気']}番人気｜"
                 f"{h['カテゴリ']}｜"
                 f"総合{h['点数']}点｜"
-                f"複勝{h['複勝点']}点"
+                f"複勝{h['複勝点']}点｜"
+                f"軸{round(h['軸スコア'], 1)}点"
                 f"{odds_text}{style_text}"
             )
 
@@ -768,8 +767,43 @@ if st.button("予想開始"):
             f"判定：{recommendation}"
         )
 
+        if axis_mode == "hole":
+            st.warning(
+                "⚠️ 軸不在レース\n\n"
+                "人気1〜3番人気の複勝点が全て20点未満です。\n"
+                "穴馬中心の3連複・ワイド向きです。"
+            )
+
+            st.write("### 穴推奨馬")
+            for h in sorted(hole_recommendations, key=lambda x: x["複勝点"], reverse=True):
+                st.write(
+                    f"{h['馬番']} {h['馬名']}｜"
+                    f"{h['人気']}番人気｜"
+                    f"総合{h['点数']}点｜"
+                    f"複勝{h['複勝点']}点｜"
+                    f"軸{round(h['軸スコア'], 1)}点"
+                )
+
+        elif axis_mode == "weak":
+            st.warning(
+                "⚠️ 軸不安レース\n\n"
+                "人気馬にも穴馬にも複勝点20以上の馬がいません。\n"
+                "見送り寄りです。"
+            )
+
         if axis:
-            st.success(f"◎ 軸馬：{axis['馬番']} {axis['馬名']}｜総合{axis['点数']}点")
+            axis_label = "◎ 軸馬"
+            if axis_mode == "hole":
+                axis_label = "◎ 穴推奨軸"
+            elif axis_mode == "weak":
+                axis_label = "◎ 暫定軸"
+
+            st.success(
+                f"{axis_label}：{axis['馬番']} {axis['馬名']}｜"
+                f"総合{axis['点数']}点｜"
+                f"複勝{axis['複勝点']}点｜"
+                f"軸{round(axis['軸スコア'], 1)}点"
+            )
 
         st.write("### 2巡目")
         for h in second_round:
@@ -781,7 +815,13 @@ if st.button("予想開始"):
 
         st.write("### 消し馬")
         for h in cut_horses:
-            st.write(f"{h['馬番']} {h['馬名']}｜{h['人気']}番人気｜{h['カテゴリ']}｜総合{h['点数']}点｜複勝{h['複勝点']}点")
+            st.write(
+                f"{h['馬番']} {h['馬名']}｜"
+                f"{h['人気']}番人気｜"
+                f"{h['カテゴリ']}｜"
+                f"総合{h['点数']}点｜"
+                f"複勝{h['複勝点']}点"
+            )
 
         st.subheader("3連単フォーメーション")
 
