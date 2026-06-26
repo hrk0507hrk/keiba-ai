@@ -742,7 +742,7 @@ def make_sanrenpuku_16_tickets(horses):
 
     hole_sorted = sorted(
         holes,
-        key=lambda x: x["点数"],
+        key=lambda x: x["複勝点"],
         reverse=True
     )
 
