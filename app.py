@@ -1,15 +1,21 @@
 import streamlit as st
 import re
+import requests
+from bs4 import BeautifulSoup
 from itertools import product, combinations
 
 st.title("競馬予想AI")
-st.write("出走表・データ分析・脚質・過去走データから、軸・2巡目・3巡目・買い目を自動作成します。")
+st.write("URL取得・出走表・データ分析・脚質・過去走データから、軸・2巡目・3巡目・買い目を自動作成します。")
 
 if "clear_count" not in st.session_state:
     st.session_state.clear_count = 0
 
+if "race_auto" not in st.session_state:
+    st.session_state.race_auto = ""
+
 if st.button("🗑️ 入力内容をクリア"):
     st.session_state.clear_count += 1
+    st.session_state.race_auto = ""
 
 POINTS = {
     "データ上位馬3頭": 30,
@@ -32,8 +38,47 @@ IGNORE_WORDS = [
     "全グラフを表示"
 ]
 
+def fetch_netkeiba_race(url):
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0"
+        }
+
+        r = requests.get(
+            url,
+            headers=headers,
+            timeout=10
+        )
+
+        if r.status_code != 200:
+            return ""
+
+        soup = BeautifulSoup(r.text, "lxml")
+        return soup.get_text("\n")
+
+    except:
+        return ""
+
+st.subheader("netkeiba URL自動取得")
+
+race_url = st.text_input(
+    "レースURLを貼り付け",
+    placeholder="https://race.netkeiba.com/race/shutuba.html?race_id=..."
+)
+
+if st.button("URLから取得"):
+    if race_url:
+        auto_text = fetch_netkeiba_race(race_url)
+
+        if auto_text:
+            st.session_state.race_auto = auto_text
+            st.success("取得成功！下の出走表欄に反映しました。")
+        else:
+            st.error("取得できませんでした。今まで通りコピペ欄を使ってください。")
+
 race_table = st.text_area(
     "netkeibaの出走表を丸ごと貼ってください",
+    value=st.session_state.race_auto,
     height=430,
     key=f"race_{st.session_state.clear_count}"
 )
@@ -344,14 +389,12 @@ def parse_pace(text):
         if line == "----":
             continue
 
-        # 形式1：- 5 5 8
         m1 = re.search(r"-\s*(\d+)\s+(\d+)\s+(\d+)", line)
         if m1:
             pace[current_horse].append((int(m1.group(1)), int(m1.group(2)), int(m1.group(3))))
             wait_after_mae = False
             continue
 
-        # 形式2：4 3 7 8 / 1 1 1 2 みたいな4つ数字
         if wait_after_mae:
             nums = re.findall(r"\d+", line)
             if len(nums) >= 4:
@@ -364,7 +407,6 @@ def parse_pace(text):
                 wait_after_mae = False
                 continue
 
-        # 形式3：-779 / -111 / -111110 みたいな詰まった形式
         m2 = re.search(r"-(\d{3,})$", line)
         if m2:
             nums = m2.group(1)
@@ -681,7 +723,7 @@ if st.button("予想開始"):
     horses = parse_race_table(race_table)
 
     if not horses:
-        st.error("出走表を読み取れませんでした。PC版・スマホ版どちらでも、出走表部分を少し広めにコピーして貼ってください。")
+        st.error("出走表を読み取れませんでした。URL取得できない場合は、PC版・スマホ版の出走表を貼ってください。")
     else:
         horses = add_points(horses, analysis, running_style_text, style_graph_text, pace_text)
         axis, second_round, third_round, cut_horses = make_prediction(horses)
