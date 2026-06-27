@@ -111,73 +111,116 @@ def make_horse(frame_no, horse_no, horse_name, popularity=None, odds=None, jocke
         "加点理由": []
     }
 
-def parse_jra_style(lines):
+def extract_odds_popularity(text):
+    odds = None
+    popularity = None
+
+    pop_match = re.search(r"(\d+)\s*人気", text)
+    if pop_match:
+        popularity = int(pop_match.group(1))
+
+    odds_match = re.search(r"(\d+\.\d+)", text)
+    if odds_match:
+        odds = float(odds_match.group(1))
+
+    if popularity is None:
+        nums = re.findall(r"\b\d+\b", text)
+        decimals = re.findall(r"\d+\.\d+", text)
+
+        if decimals and nums:
+            try:
+                last_num = int(nums[-1])
+                if 1 <= last_num <= 30:
+                    popularity = last_num
+            except:
+                pass
+
+    return odds, popularity
+
+def parse_info_line(info):
+    jockey = ""
+    trainer = ""
+    parts = info.split()
+
+    if len(parts) >= 4 and re.match(r"^[牡牝セ]\d+", parts[0]):
+        jockey = parts[2]
+        trainer = parts[3]
+
+    return jockey, trainer
+
+def parse_pc_style(lines):
     horses = []
     i = 0
 
-    while i < len(lines) - 2:
-        if re.match(r"^\d+\s+\d+$", lines[i]):
-            nums = lines[i].split()
-            frame_no = int(nums[0])
-            horse_no = int(nums[1])
+    while i < len(lines):
+        line = lines[i].strip()
 
-            j = i + 1
-
-            # PC版の -- を飛ばす
-            while j < len(lines) and lines[j] == "--":
-                j += 1
-
-            if j >= len(lines):
-                i += 1
-                continue
-
-            horse_name = lines[j].strip()
-
-            # 馬名が変な場合はスキップ
-            if horse_name in ["--", "編集"] or re.fullmatch(r"\d+", horse_name):
-                i += 1
-                continue
-
-            if j + 1 >= len(lines):
-                i += 1
-                continue
-
-            info = lines[j + 1].strip()
-            parts = info.split()
-
-            popularity = None
-            odds = None
-            jockey = ""
-            trainer = ""
-
-            # 例：牡3 55.0 戸崎圭 美浦上原佑 7.7 3
-            if len(parts) >= 6:
-                jockey = parts[2]
-                trainer = parts[3]
-
-                try:
-                    odds = float(parts[-2])
-                    popularity = int(parts[-1])
-                except:
-                    odds = None
-                    popularity = None
-
-            horses.append(
-                make_horse(
-                    frame_no,
-                    horse_no,
-                    horse_name,
-                    popularity,
-                    odds,
-                    jockey,
-                    trainer
-                )
-            )
-
-            i = j + 2
+        if not re.match(r"^\d+\s+\d+$", line):
+            i += 1
             continue
 
-        i += 1
+        nums = line.split()
+        frame_no = int(nums[0])
+        horse_no = int(nums[1])
+
+        j = i + 1
+
+        while j < len(lines) and lines[j] == "--":
+            j += 1
+
+        if j >= len(lines):
+            i += 1
+            continue
+
+        horse_name = lines[j].strip()
+
+        if (
+            not horse_name
+            or horse_name == "--"
+            or horse_name == "編集"
+            or re.fullmatch(r"\d+", horse_name)
+            or "人気" in horse_name
+            or re.search(r"\d+\.\d+", horse_name)
+        ):
+            i += 1
+            continue
+
+        block = []
+        k = j + 1
+
+        while k < len(lines):
+            if re.match(r"^\d+\s+\d+$", lines[k]):
+                break
+            block.append(lines[k])
+            k += 1
+
+        block_text = " ".join(block)
+
+        odds, popularity = extract_odds_popularity(block_text)
+
+        jockey = ""
+        trainer = ""
+
+        for row in block:
+            row_jockey, row_trainer = parse_info_line(row)
+            if row_jockey:
+                jockey = row_jockey
+            if row_trainer:
+                trainer = row_trainer
+
+        horses.append(
+            make_horse(
+                frame_no,
+                horse_no,
+                horse_name,
+                popularity,
+                odds,
+                jockey,
+                trainer
+            )
+        )
+
+        i = k
 
     return horses
 
@@ -185,60 +228,106 @@ def parse_smartphone_style(lines):
     horses = []
     i = 0
 
-    while i < len(lines) - 4:
-        line = lines[i]
-
-        if not re.match(r"^\d+$", line):
+    while i < len(lines):
+        if not re.fullmatch(r"\d+", lines[i]):
             i += 1
             continue
 
-        horse_no = int(line)
-        horse_name = lines[i + 1].replace("  ", "").strip()
-        info_line = lines[i + 2]
+        horse_no = int(lines[i])
 
-        if "のデータベース" not in info_line:
+        found_db = False
+
+        for j in range(i + 1, min(i + 12, len(lines))):
+            if "のデータベース" in lines[j]:
+                horse_name = lines[j - 1].replace("  ", "").strip()
+                info_line = lines[j]
+                found_db = True
+                break
+
+        if not found_db:
             i += 1
             continue
 
-        odds = None
-        odds_match = re.search(r"(\d+\.\d+)", lines[i + 3])
-        if odds_match:
-            odds = float(odds_match.group(1))
+        if not horse_name or horse_name == "編集" or re.fullmatch(r"\d+", horse_name):
+            i += 1
+            continue
 
-        popularity = None
-        pop_match = re.search(r"(\d+)\s*人気", lines[i + 4])
-        if pop_match:
-            popularity = int(pop_match.group(1))
+        search_block = " ".join(lines[i:min(i + 30, len(lines))])
+        odds, popularity = extract_odds_popularity(search_block)
 
-        db_removed = re.sub(r"^[牡牝セ]\d+\s+", "", info_line)
-        db_removed = db_removed.replace(f"{horse_name}のデータベース", "").strip()
+        db_removed = info_line.replace(f"{horse_name}のデータベース", "").strip()
+        db_removed = re.sub(r"^[牡牝セ]\d+\s+", "", db_removed)
         db_removed = re.sub(r"\d+\.\d+$", "", db_removed).strip()
 
         jockey = db_removed.split()[0] if db_removed else ""
         trainer = ""
         frame_no = (horse_no + 1) // 2
 
-        horses.append(make_horse(frame_no, horse_no, horse_name, popularity, odds, jockey, trainer))
-        i += 5
+        horses.append(
+            make_horse(
+                frame_no,
+                horse_no,
+                horse_name,
+                popularity,
+                odds,
+                jockey,
+                trainer
+            )
+        )
+
+        i += 1
 
     return horses
 
 def parse_race_table(text):
     lines = clean_lines(text)
 
-    horses = parse_jra_style(lines)
+    candidates = []
 
-    if not horses:
-        horses = parse_pc_style(lines)
+    try:
+        if any("のデータベース" in line for line in lines):
+            candidates.append(parse_smartphone_style(lines))
+    except:
+        pass
 
-    if not horses:
-        horses = parse_smartphone_style(lines)
+    try:
+        candidates.append(parse_pc_style(lines))
+    except:
+        pass
+
+    best = []
+
+    for c in candidates:
+        if not c:
+            continue
+
+        valid_name_count = sum(
+            1 for h in c
+            if h["馬名"]
+            and h["馬名"] != "--"
+            and h["馬名"] != "編集"
+            and not re.fullmatch(r"\d+", h["馬名"])
+        )
+
+        pop_count = sum(1 for h in c if h["人気"] is not None)
+        score = valid_name_count * 10 + pop_count
+
+        best_score = -1
+        if best:
+            best_score = (
+                sum(1 for h in best if h["馬名"]) * 10
+                + sum(1 for h in best if h["人気"] is not None)
+            )
+
+        if score > best_score:
+            best = c
 
     unique = {}
-    for h in horses:
-        unique[h["馬番"]] = h
+    for h in best:
+        if h.get("馬番") is not None and h.get("馬名"):
+            unique[h["馬番"]] = h
 
-    return list(unique.values())
+    return sorted(list(unique.values()), key=lambda x: x["馬番"])
 
 def normalize_style(style):
     convert = {
@@ -517,7 +606,7 @@ def add_points(horses, analysis_text, running_style_text, style_graph_text, pace
 
     for h in horses:
         trainer_name = h["調教師"]
-        for area in ["栗東 ", "美浦 ", "大井 ", "浦和 ", "北海道 ", "兵庫 ", "船橋 ", "川崎 "]:
+        for area in ["栗東", "美浦", "大井", "浦和", "北海道", "兵庫", "船橋", "川崎", "笠松"]:
             trainer_name = trainer_name.replace(area, "")
 
         if trainer_name and trainer_name in good_trainer_text:
