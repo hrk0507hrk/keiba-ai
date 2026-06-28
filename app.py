@@ -107,7 +107,12 @@ def make_horse(frame_no, horse_no, horse_name, popularity=None, odds=None, jocke
         "カテゴリ": "",
         "点数": 0,
         "複勝点": 0,
+        "安定指数": 0,
+        "期待値指数": 0,
+        "展開指数": 0,
+        "危険人気補正": 0,
         "軸スコア": 0,
+        "最終軸スコア": 0,
         "穴スコア": 0,
         "馬柱評価": [],
         "加点理由": []
@@ -614,6 +619,7 @@ def parse_form_features(text):
         )
 
         features[horse_no] = {
+            "近走着順": [r["finish"] for r in races if r["finish"] is not None][:5],
             "前走4角3番手以内": front_last,
             "前走0.5秒差以内": close_last,
             "近3走馬券内2回以上": in_money_count >= 2,
@@ -668,6 +674,10 @@ def has_reason(horse, keyword):
     return any(keyword in reason for reason in horse["加点理由"])
 
 def calc_axis_score(horse):
+    """
+    3連複の人気軸2頭を選ぶための軸スコア。
+    強い馬ではなく「3着以内に残りやすい馬」を重視する。
+    """
     style_bonus = {
         "逃げ": 10,
         "先行": 7,
@@ -675,7 +685,156 @@ def calc_axis_score(horse):
         "追込": -5
     }.get(horse["脚質"], 0)
 
-    return horse["点数"] * 0.5 + horse["複勝点"] * 0.7 + style_bonus
+    base_score = (
+        horse["点数"] * 0.35 +
+        horse["複勝点"] * 0.30 +
+        horse["安定指数"] * 0.20 +
+        horse["期待値指数"] * 0.10 +
+        horse["展開指数"] * 0.05 +
+        style_bonus
+    )
+
+    return base_score
+
+
+def calc_stability_score(feature):
+    """
+    過去走から安定指数を作る。
+    3連複向けなので、勝ち切りよりも馬券内・掲示板・大敗少なめを重視。
+    """
+    score = 0
+
+    finishes = feature.get("近走着順", [])
+    if not finishes:
+        # 過去走が読めない場合は0点扱い
+        return 0
+
+    total = len(finishes)
+    in_3 = sum(1 for r in finishes if r is not None and r <= 3)
+    in_5 = sum(1 for r in finishes if r is not None and r <= 5)
+    out_10 = sum(1 for r in finishes if r is not None and r >= 10)
+
+    fukusho_rate = in_3 / total
+    board_rate = in_5 / total
+    bad_rate = out_10 / total
+
+    if fukusho_rate >= 0.6:
+        score += 20
+    elif fukusho_rate >= 0.4:
+        score += 10
+
+    if board_rate >= 0.8:
+        score += 15
+    elif board_rate >= 0.6:
+        score += 8
+
+    if bad_rate >= 0.4:
+        score -= 15
+    elif bad_rate >= 0.2:
+        score -= 8
+
+    latest = finishes[0]
+    if latest is not None:
+        if latest <= 3:
+            score += 10
+        elif latest <= 5:
+            score += 5
+        elif latest >= 10:
+            score -= 10
+
+    if feature.get("前走0.5秒差以内"):
+        score += 5
+
+    if feature.get("前走1秒以上負け"):
+        score -= 5
+
+    if feature.get("半年以上休養"):
+        score -= 5
+
+    return score
+
+
+def calc_value_score(total_rank, popularity_rank):
+    """
+    期待値指数。
+    総合評価順位より人気が低い馬は妙味あり、人気先行馬は減点。
+    例：総合1位なのに5番人気 → +15
+    例：総合8位なのに1番人気 → -25
+    """
+    if popularity_rank is None:
+        return 0
+
+    gap = popularity_rank - total_rank
+
+    if gap >= 5:
+        return 25
+    elif gap >= 3:
+        return 15
+    elif gap >= 1:
+        return 8
+    elif gap <= -5:
+        return -25
+    elif gap <= -3:
+        return -15
+    elif gap <= -1:
+        return -8
+    return 0
+
+
+def add_axis_extra_scores(horses, form_features):
+    """
+    安定指数・期待値指数・危険人気補正・最終軸スコアをまとめて計算。
+    """
+    for h in horses:
+        feature = form_features.get(h["馬番"], {})
+        h["安定指数"] = calc_stability_score(feature)
+
+        if h["安定指数"] > 0:
+            h["加点理由"].append(f"安定指数 +{h['安定指数']}")
+        elif h["安定指数"] < 0:
+            h["加点理由"].append(f"安定指数 {h['安定指数']}")
+
+    # 総合点の順位を作る。点数が高いほど上位。
+    sorted_by_total = sorted(horses, key=lambda x: x["点数"], reverse=True)
+    total_rank_map = {}
+    prev_score = None
+    current_rank = 0
+
+    for idx, h in enumerate(sorted_by_total, start=1):
+        if h["点数"] != prev_score:
+            current_rank = idx
+            prev_score = h["点数"]
+        total_rank_map[h["馬番"]] = current_rank
+
+    for h in horses:
+        total_rank = total_rank_map.get(h["馬番"], 99)
+        h["期待値指数"] = calc_value_score(total_rank, h["人気"])
+
+        if h["期待値指数"] > 0:
+            h["加点理由"].append(f"期待値指数 +{h['期待値指数']}")
+        elif h["期待値指数"] < 0:
+            h["加点理由"].append(f"期待値指数 {h['期待値指数']}")
+
+        danger = 0
+
+        if h["人気"] is not None and h["人気"] <= 3 and h["複勝点"] < 20:
+            danger -= 15
+
+        if h["人気"] == 1 and h["複勝点"] < 20:
+            danger -= 10
+
+        if h["期待値指数"] <= -15:
+            danger -= 10
+
+        h["危険人気補正"] = danger
+
+        if danger < 0:
+            h["加点理由"].append(f"危険人気補正 {danger}")
+
+        h["軸スコア"] = calc_axis_score(h)
+        h["最終軸スコア"] = h["軸スコア"] + h["危険人気補正"]
+
+    return horses
 
 def add_points(horses, analysis_text, running_style_text, style_graph_text, pace_text):
     set_category(horses)
@@ -776,22 +935,27 @@ def add_points(horses, analysis_text, running_style_text, style_graph_text, pace
         if candidate_count == 1:
             if h["馬番"] in escape_candidates:
                 h["点数"] += 15
+                h["展開指数"] += 15
                 h["加点理由"].append("展開有利(単騎逃げ) +15")
 
         elif candidate_count == 2:
             if h["馬番"] in escape_candidates:
                 h["点数"] += 8
+                h["展開指数"] += 8
                 h["加点理由"].append("展開有利(逃げ候補) +8")
             elif h["脚質"] == "先行":
                 h["点数"] += 5
+                h["展開指数"] += 5
                 h["加点理由"].append("展開有利(先行) +5")
 
         elif candidate_count >= 3:
             if h["脚質"] == "差し":
                 h["点数"] += 8
+                h["展開指数"] += 8
                 h["加点理由"].append("展開有利(差し) +8")
             elif h["脚質"] == "追込":
                 h["点数"] += 5
+                h["展開指数"] += 5
                 h["加点理由"].append("展開有利(追込) +5")
 
     for h in horses:
@@ -849,6 +1013,9 @@ def add_points(horses, analysis_text, running_style_text, style_graph_text, pace
             h["加点理由"].append("後方脚質減点(複勝点20未満) -5")
 
     form_features = parse_form_features(pace_text)
+
+    # 安定指数・期待値指数・危険人気補正・最終軸スコアを追加
+    horses = add_axis_extra_scores(horses, form_features)
 
     for h in horses:
         hole_score = h["複勝点"]
@@ -915,9 +1082,6 @@ def add_points(horses, analysis_text, running_style_text, style_graph_text, pace
         h["穴スコア"] = hole_score
         h["馬柱評価"] = hole_reasons
 
-    for h in horses:
-        h["軸スコア"] = calc_axis_score(h)
-
     return list(horse_map.values())
 
 def make_prediction(horses):
@@ -949,7 +1113,7 @@ def make_prediction(horses):
 
     axis_candidates_sorted = sorted(
         axis_candidates,
-        key=lambda x: x["軸スコア"],
+        key=lambda x: x.get("最終軸スコア", x["軸スコア"]),
         reverse=True
     )
 
@@ -1039,9 +1203,10 @@ def make_sanrenpuku_16_tickets(horses):
         if h["カテゴリ"] == "穴馬"
     ]
 
+    # 人気軸2頭は、総合点だけでなく安定指数・期待値指数・危険人気補正込みの最終軸スコアで選ぶ
     popular_sorted = sorted(
         popular,
-        key=lambda x: x["点数"],
+        key=lambda x: x.get("最終軸スコア", x["軸スコア"]),
         reverse=True
     )
 
@@ -1147,7 +1312,10 @@ if st.button("予想開始"):
                 f"総合{h['点数']}点｜"
                 f"複勝{h['複勝点']}点｜"
                 f"穴{h['穴スコア']}点｜"
-                f"軸{round(h['軸スコア'], 1)}点"
+                f"安定{h['安定指数']}点｜"
+                f"期待値{h['期待値指数']}点｜"
+                f"軸{round(h['軸スコア'], 1)}点｜"
+                f"最終軸{round(h['最終軸スコア'], 1)}点"
                 f"{odds_text}{style_text}"
             )
 
@@ -1179,7 +1347,9 @@ if st.button("予想開始"):
                     f"総合{h['点数']}点｜"
                     f"複勝{h['複勝点']}点｜"
                     f"穴{h['穴スコア']}点｜"
-                    f"軸{round(h['軸スコア'], 1)}点"
+                    f"安定{h['安定指数']}点｜"
+                    f"期待値{h['期待値指数']}点｜"
+                    f"最終軸{round(h['最終軸スコア'], 1)}点"
                 )
 
         elif axis_mode == "weak":
@@ -1200,7 +1370,9 @@ if st.button("予想開始"):
                 f"{axis_label}：{axis['馬番']} {axis['馬名']}｜"
                 f"総合{axis['点数']}点｜"
                 f"複勝{axis['複勝点']}点｜"
-                f"軸{round(axis['軸スコア'], 1)}点"
+                f"安定{axis['安定指数']}点｜"
+                f"期待値{axis['期待値指数']}点｜"
+                f"最終軸{round(axis['最終軸スコア'], 1)}点"
             )
 
         st.write("### 2巡目")
@@ -1230,12 +1402,12 @@ if st.button("予想開始"):
 
             st.write(
                 f"人気軸A：{main_axis['馬番']} {main_axis['馬名']}｜"
-                f"総合{main_axis['点数']}点｜複勝{main_axis['複勝点']}点"
+                f"総合{main_axis['点数']}点｜複勝{main_axis['複勝点']}点｜最終軸{round(main_axis['最終軸スコア'], 1)}点"
             )
 
             st.write(
                 f"人気軸B：{sub_axis['馬番']} {sub_axis['馬名']}｜"
-                f"総合{sub_axis['点数']}点｜複勝{sub_axis['複勝点']}点"
+                f"総合{sub_axis['点数']}点｜複勝{sub_axis['複勝点']}点｜最終軸{round(sub_axis['最終軸スコア'], 1)}点"
             )
 
             st.write("穴馬採用4頭")
