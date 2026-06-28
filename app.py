@@ -520,22 +520,33 @@ def parse_form_features(text):
     features = {}
     lines = [line.strip() for line in text.splitlines() if line.strip()]
 
-    current_horse = None
     horse_blocks = {}
+    current_horse = None
 
-    for line in lines:
-        m = re.match(r"^\d+\s+(\d+)\s*$", line)
-        if m:
-            current_horse = int(m.group(1))
+    def is_pc_horse_start(idx):
+        return bool(re.match(r"^\d+\s+\d+\s*$", lines[idx]))
+
+    def is_smartphone_horse_start(idx):
+        if not re.fullmatch(r"\d+", lines[idx]):
+            return False
+
+        # スマホ版は「馬番 → 馬名 → -- → 馬名のデータベース」になりやすい
+        lookahead = lines[idx + 1:idx + 8]
+        return any("のデータベース" in x for x in lookahead)
+
+    for i, line in enumerate(lines):
+        pc_match = re.match(r"^\d+\s+(\d+)\s*$", line)
+
+        if pc_match:
+            horse_no = int(pc_match.group(1))
+            current_horse = horse_no
             horse_blocks[current_horse] = []
             continue
 
-        # スマホ版などで馬番だけの行も拾う
-        if re.fullmatch(r"\d+", line):
-            num = int(line)
-            # 直後に馬名/データベースがありそうな時だけ馬番扱い
-            current_horse = num
-            horse_blocks.setdefault(current_horse, [])
+        if is_smartphone_horse_start(i):
+            horse_no = int(line)
+            current_horse = horse_no
+            horse_blocks[current_horse] = []
             continue
 
         if current_horse is not None:
@@ -543,10 +554,9 @@ def parse_form_features(text):
 
     for horse_no, block in horse_blocks.items():
         races = []
-        long_rest = False
         block_text = " ".join(block)
 
-        # 休養判定
+        long_rest = False
         if "半年休養" in block_text or "6ヵ月休養" in block_text or "6ヶ月休養" in block_text:
             long_rest = True
 
@@ -554,33 +564,70 @@ def parse_form_features(text):
         if rest_match and int(rest_match.group(1)) >= 6:
             long_rest = True
 
-        # レース行の例：2026.06.07 東京5 / 2026.04.04 中山8
         for i, line in enumerate(block):
-            date_match = re.match(r"^\d{4}\.\d{2}\.\d{2}\s+.+?(\d+|中)$", line)
-            if not date_match:
+            # 地方スマホ例：
+            # 06/02  船橋 1R
+            # 次の数行後に着順だけの行が来る
+            local_date = re.match(r"^\d{2}/\d{2}\s+", line)
+
+            # 中央PC例：
+            # 2026.06.07 東京5
+            jra_date = re.match(r"^\d{4}\.\d{2}\.\d{2}\s+.+?(\d+|中)$", line)
+
+            if not local_date and not jra_date:
                 continue
 
-            finish_raw = date_match.group(1)
-            finish = int(finish_raw) if finish_raw.isdigit() else None
+            race_lines = block[i:i + 16]
+            race_text = " ".join(race_lines)
 
-            race_lines = block[i:i + 8]
+            finish = None
+
+            if jra_date:
+                finish_raw = jra_date.group(1)
+                if finish_raw.isdigit():
+                    finish = int(finish_raw)
+
+            if local_date:
+                # 日付行の後、最初に出てくる単独数字を着順扱い
+                for r in race_lines[1:8]:
+                    if re.fullmatch(r"\d+", r):
+                        finish = int(r)
+                        break
 
             position_nums = []
+
+            for r in race_lines:
+                # 地方例：- 1 1 1
+                m_local = re.search(r"-\s*(\d+)\s+(\d+)\s+(\d+)", r)
+                if m_local:
+                    position_nums = [
+                        int(m_local.group(1)),
+                        int(m_local.group(2)),
+                        int(m_local.group(3)),
+                    ]
+                    break
+
+                # 中央例：4-5 (39.0)、3-3-4-3 (39.0)
+                m_jra = re.search(r"(\d+(?:-\d+)+)\s+\(", r)
+                if m_jra:
+                    position_nums = [int(x) for x in m_jra.group(1).split("-")]
+                    break
+
+                # 中央芝1000など：1 (34.2)
+                m_single = re.search(r"^\s*(\d+)\s+\(", r)
+                if m_single:
+                    position_nums = [int(m_single.group(1))]
+                    break
+
             margin = None
 
             for r in race_lines:
-                # 例：4-5 (39.0) / 3-3-4-3 (39.0) / 1 (34.2)
-                pos_match = re.search(r"(\d+(?:-\d+)+)\s+\(", r)
-                if pos_match:
-                    position_nums = [int(x) for x in pos_match.group(1).split("-")]
+                # 相手名(0.3) のような着差
+                if "kg" in r or "頭" in r:
+                    continue
 
-                pos_match2 = re.search(r"^\s*(\d+)\s+\(", r)
-                if not position_nums and pos_match2:
-                    position_nums = [int(pos_match2.group(1))]
-
-                # 例：カンレイスター(2.4) / ヨドノティアラ(0.5)
                 margin_match = re.search(r"\((\d+\.\d+)\)\s*$", r)
-                if margin_match and "kg" not in r and "頭" not in r:
+                if margin_match:
                     margin = float(margin_match.group(1))
 
             races.append({
@@ -598,7 +645,6 @@ def parse_form_features(text):
 
         if first_race:
             if first_race["positions"]:
-                # 最後の通過順＝4角または直線位置
                 if first_race["positions"][-1] <= 3:
                     front_last = True
 
