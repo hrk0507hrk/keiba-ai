@@ -109,6 +109,7 @@ def make_horse(frame_no, horse_no, horse_name, popularity=None, odds=None, jocke
         "複勝点": 0,
         "軸スコア": 0,
         "穴スコア": 0,
+        "馬柱評価": [],
         "加点理由": []
     }
 
@@ -510,6 +511,119 @@ def parse_pace(text):
 
     return pace
 
+def parse_form_features(text):
+    features = {}
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+
+    current_horse = None
+    horse_blocks = {}
+
+    for line in lines:
+        m = re.match(r"^\d+\s+(\d+)\s*$", line)
+        if m:
+            current_horse = int(m.group(1))
+            horse_blocks[current_horse] = []
+            continue
+
+        # スマホ版などで馬番だけの行も拾う
+        if re.fullmatch(r"\d+", line):
+            num = int(line)
+            # 直後に馬名/データベースがありそうな時だけ馬番扱い
+            current_horse = num
+            horse_blocks.setdefault(current_horse, [])
+            continue
+
+        if current_horse is not None:
+            horse_blocks[current_horse].append(line)
+
+    for horse_no, block in horse_blocks.items():
+        races = []
+        long_rest = False
+        block_text = " ".join(block)
+
+        # 休養判定
+        if "半年休養" in block_text or "6ヵ月休養" in block_text or "6ヶ月休養" in block_text:
+            long_rest = True
+
+        rest_match = re.search(r"(\d+)ヵ月", block_text)
+        if rest_match and int(rest_match.group(1)) >= 6:
+            long_rest = True
+
+        # レース行の例：2026.06.07 東京5 / 2026.04.04 中山8
+        for i, line in enumerate(block):
+            date_match = re.match(r"^\d{4}\.\d{2}\.\d{2}\s+.+?(\d+|中)$", line)
+            if not date_match:
+                continue
+
+            finish_raw = date_match.group(1)
+            finish = int(finish_raw) if finish_raw.isdigit() else None
+
+            race_lines = block[i:i + 8]
+
+            position_nums = []
+            margin = None
+
+            for r in race_lines:
+                # 例：4-5 (39.0) / 3-3-4-3 (39.0) / 1 (34.2)
+                pos_match = re.search(r"(\d+(?:-\d+)+)\s+\(", r)
+                if pos_match:
+                    position_nums = [int(x) for x in pos_match.group(1).split("-")]
+
+                pos_match2 = re.search(r"^\s*(\d+)\s+\(", r)
+                if not position_nums and pos_match2:
+                    position_nums = [int(pos_match2.group(1))]
+
+                # 例：カンレイスター(2.4) / ヨドノティアラ(0.5)
+                margin_match = re.search(r"\((\d+\.\d+)\)\s*$", r)
+                if margin_match and "kg" not in r and "頭" not in r:
+                    margin = float(margin_match.group(1))
+
+            races.append({
+                "finish": finish,
+                "positions": position_nums,
+                "margin": margin
+            })
+
+        recent3 = races[:3]
+        first_race = races[0] if races else None
+
+        front_last = False
+        close_last = False
+        big_loss_last = False
+
+        if first_race:
+            if first_race["positions"]:
+                # 最後の通過順＝4角または直線位置
+                if first_race["positions"][-1] <= 3:
+                    front_last = True
+
+            if first_race["margin"] is not None:
+                if first_race["margin"] <= 0.5:
+                    close_last = True
+                if first_race["margin"] >= 1.0:
+                    big_loss_last = True
+
+        in_money_count = sum(
+            1 for r in recent3
+            if r["finish"] is not None and r["finish"] <= 3
+        )
+
+        double_digit_count = sum(
+            1 for r in recent3
+            if r["finish"] is not None and r["finish"] >= 10
+        )
+
+        features[horse_no] = {
+            "前走4角3番手以内": front_last,
+            "前走0.5秒差以内": close_last,
+            "近3走馬券内2回以上": in_money_count >= 2,
+            "半年以上休養": long_rest,
+            "前走1秒以上負け": big_loss_last,
+            "近3走二桁着順2回以上": double_digit_count >= 2,
+        }
+
+    return features
+
 def get_section_items(text):
     sections = {}
     current_section = None
@@ -734,36 +848,72 @@ def add_points(horses, analysis_text, running_style_text, style_graph_text, pace
             h["点数"] -= 5
             h["加点理由"].append("後方脚質減点(複勝点20未満) -5")
 
+    form_features = parse_form_features(pace_text)
+
     for h in horses:
         hole_score = h["複勝点"]
+        hole_reasons = []
 
         if h["カテゴリ"] == "穴馬":
 
             # 逃げ・先行は3着内に残りやすい
             if h["脚質"] in ["逃げ", "先行"]:
                 hole_score += 8
+                hole_reasons.append("逃げ/先行穴 +8")
 
             # 展開有利がある穴馬を強化
             if has_reason(h, "展開有利"):
                 hole_score += 6
+                hole_reasons.append("展開有利 +6")
 
             # 7〜9番人気は妙味あり
             if h["人気"] is not None and 7 <= h["人気"] <= 9:
                 hole_score += 3
+                hole_reasons.append("7〜9番人気 +3")
 
             # 複勝点が高い穴馬をさらに評価
             if h["複勝点"] >= 25:
                 hole_score += 5
+                hole_reasons.append("複勝点25以上 +5")
+
+            feature = form_features.get(h["馬番"], {})
+
+            if feature.get("前走4角3番手以内"):
+                hole_score += 5
+                hole_reasons.append("前走4角3番手以内 +5")
+
+            if feature.get("前走0.5秒差以内"):
+                hole_score += 5
+                hole_reasons.append("前走0.5秒差以内 +5")
+
+            if feature.get("近3走馬券内2回以上"):
+                hole_score += 5
+                hole_reasons.append("近3走馬券内2回以上 +5")
 
             # 追込は届かないリスクを減点
             if h["脚質"] == "追込":
                 hole_score -= 5
+                hole_reasons.append("追込 -5")
 
             # 複勝点が低い穴馬は基本的に危険
             if h["複勝点"] < 15:
                 hole_score -= 10
+                hole_reasons.append("複勝点15未満 -10")
+
+            if feature.get("半年以上休養"):
+                hole_score -= 5
+                hole_reasons.append("半年以上休養 -5")
+
+            if feature.get("前走1秒以上負け"):
+                hole_score -= 5
+                hole_reasons.append("前走1秒以上負け -5")
+
+            if feature.get("近3走二桁着順2回以上"):
+                hole_score -= 5
+                hole_reasons.append("近3走二桁着順2回以上 -5")
 
         h["穴スコア"] = hole_score
+        h["馬柱評価"] = hole_reasons
 
     for h in horses:
         h["軸スコア"] = calc_axis_score(h)
@@ -1003,6 +1153,9 @@ if st.button("予想開始"):
 
             if h["加点理由"]:
                 st.caption(" / ".join(h["加点理由"]))
+
+            if h.get("馬柱評価"):
+                st.caption("穴評価: " + " / ".join(h["馬柱評価"]))
 
         st.subheader("予想結果")
 
