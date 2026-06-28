@@ -654,6 +654,12 @@ def set_category(horses):
     hole = []
     big_hole = []
 
+    # 中央の多頭数想定：15頭以上なら10番人気まで穴馬扱い
+    if len(horses) >= 15:
+        hole_max_popularity = 10
+    else:
+        hole_max_popularity = 9
+
     for h in horses:
         if h["人気"] is None:
             h["カテゴリ"] = "人気不明"
@@ -661,7 +667,7 @@ def set_category(horses):
         elif h["人気"] <= 3:
             h["カテゴリ"] = "人気馬"
             popular.append(h)
-        elif h["人気"] <= 9:
+        elif h["人気"] <= hole_max_popularity:
             h["カテゴリ"] = "穴馬"
             hole.append(h)
         else:
