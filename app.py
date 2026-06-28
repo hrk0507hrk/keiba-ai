@@ -706,13 +706,12 @@ def calc_axis_score(horse):
 def calc_stability_score(feature):
     """
     過去走から安定指数を作る。
-    3連複向けなので、勝ち切りよりも馬券内・掲示板・大敗少なめを重視。
+    減点過多で好走馬を消さないよう、マイナスは最大-15までに制限。
     """
     score = 0
 
     finishes = feature.get("近走着順", [])
     if not finishes:
-        # 過去走が読めない場合は0点扱い
         return 0
 
     total = len(finishes)
@@ -734,10 +733,11 @@ def calc_stability_score(feature):
     elif board_rate >= 0.6:
         score += 8
 
+    # 大敗率の減点は軽め
     if bad_rate >= 0.4:
-        score -= 15
+        score -= 10
     elif bad_rate >= 0.2:
-        score -= 8
+        score -= 5
 
     latest = finishes[0]
     if latest is not None:
@@ -746,16 +746,20 @@ def calc_stability_score(feature):
         elif latest <= 5:
             score += 5
         elif latest >= 10:
-            score -= 10
+            score -= 5
 
     if feature.get("前走0.5秒差以内"):
         score += 5
 
     if feature.get("前走1秒以上負け"):
-        score -= 5
+        score -= 3
 
     if feature.get("半年以上休養"):
-        score -= 5
+        score -= 3
+
+    # 最終的に減点過多を防ぐ
+    if score < -15:
+        score = -15
 
     return score
 
@@ -763,9 +767,8 @@ def calc_stability_score(feature):
 def calc_value_score(total_rank, popularity_rank):
     """
     期待値指数。
-    総合評価順位より人気が低い馬は妙味あり、人気先行馬は減点。
-    例：総合1位なのに5番人気 → +15
-    例：総合8位なのに1番人気 → -25
+    総合評価順位より人気が低い馬は妙味あり、人気先行馬は軽く減点。
+    ※減点過多で好走馬を消さないよう、マイナス側は最大-10に抑える。
     """
     if popularity_rank is None:
         return 0
@@ -779,11 +782,11 @@ def calc_value_score(total_rank, popularity_rank):
     elif gap >= 1:
         return 8
     elif gap <= -5:
-        return -25
+        return -10
     elif gap <= -3:
-        return -15
+        return -5
     elif gap <= -1:
-        return -8
+        return -3
     return 0
 
 
@@ -823,14 +826,25 @@ def add_axis_extra_scores(horses, form_features):
 
         danger = 0
 
-        if h["人気"] is not None and h["人気"] <= 3 and h["複勝点"] < 20:
-            danger -= 15
+        # 危険人気補正は軽めにする。
+        # 以前のように-25以上沈めると、好走できる人気馬まで消えやすい。
+        if h["人気"] is not None and h["人気"] <= 3:
+            if h["複勝点"] < 10:
+                danger -= 15
+            elif h["複勝点"] < 15:
+                danger -= 10
+            elif h["複勝点"] < 20:
+                danger -= 5
 
-        if h["人気"] == 1 and h["複勝点"] < 20:
-            danger -= 10
+        if h["人気"] == 1 and h["複勝点"] < 10:
+            danger -= 5
 
-        if h["期待値指数"] <= -15:
-            danger -= 10
+        if h["期待値指数"] <= -10:
+            danger -= 5
+
+        # 最大減点は-15まで
+        if danger < -15:
+            danger = -15
 
         h["危険人気補正"] = danger
 
@@ -1010,9 +1024,13 @@ def add_points(horses, analysis_text, running_style_text, style_graph_text, pace
             h["点数"] += 5
             h["加点理由"].append("妙味補正(穴馬×複勝点20以上) +5")
 
-        if h["カテゴリ"] == "人気馬" and h["複勝点"] < 20:
-            h["点数"] -= 10
-            h["加点理由"].append("危険人気馬減点(複勝点20未満) -10")
+        if h["カテゴリ"] == "人気馬":
+            if h["複勝点"] < 10:
+                h["点数"] -= 10
+                h["加点理由"].append("危険人気馬減点(複勝点10未満) -10")
+            elif h["複勝点"] < 15:
+                h["点数"] -= 5
+                h["加点理由"].append("危険人気馬減点(複勝点15未満) -5")
 
         if h["脚質"] in ["差し", "追込"] and h["複勝点"] < 20:
             h["点数"] -= 5
