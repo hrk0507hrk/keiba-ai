@@ -108,6 +108,7 @@ def make_horse(frame_no, horse_no, horse_name, popularity=None, odds=None, jocke
         "点数": 0,
         "複勝点": 0,
         "軸スコア": 0,
+        "穴スコア": 0,
         "加点理由": []
     }
 
@@ -734,6 +735,37 @@ def add_points(horses, analysis_text, running_style_text, style_graph_text, pace
             h["加点理由"].append("後方脚質減点(複勝点20未満) -5")
 
     for h in horses:
+        hole_score = h["複勝点"]
+
+        if h["カテゴリ"] == "穴馬":
+
+            # 逃げ・先行は3着内に残りやすい
+            if h["脚質"] in ["逃げ", "先行"]:
+                hole_score += 8
+
+            # 展開有利がある穴馬を強化
+            if has_reason(h, "展開有利"):
+                hole_score += 6
+
+            # 7〜9番人気は妙味あり
+            if h["人気"] is not None and 7 <= h["人気"] <= 9:
+                hole_score += 3
+
+            # 複勝点が高い穴馬をさらに評価
+            if h["複勝点"] >= 25:
+                hole_score += 5
+
+            # 追込は届かないリスクを減点
+            if h["脚質"] == "追込":
+                hole_score -= 5
+
+            # 複勝点が低い穴馬は基本的に危険
+            if h["複勝点"] < 15:
+                hole_score -= 10
+
+        h["穴スコア"] = hole_score
+
+    for h in horses:
         h["軸スコア"] = calc_axis_score(h)
 
     return list(horse_map.values())
@@ -865,7 +897,7 @@ def make_sanrenpuku_16_tickets(horses):
 
     hole_sorted = sorted(
         holes,
-        key=lambda x: x["複勝点"],
+        key=lambda x: x["穴スコア"],
         reverse=True
     )
 
@@ -964,6 +996,7 @@ if st.button("予想開始"):
                 f"{h['カテゴリ']}｜"
                 f"総合{h['点数']}点｜"
                 f"複勝{h['複勝点']}点｜"
+                f"穴{h['穴スコア']}点｜"
                 f"軸{round(h['軸スコア'], 1)}点"
                 f"{odds_text}{style_text}"
             )
@@ -992,6 +1025,7 @@ if st.button("予想開始"):
                     f"{h['人気']}番人気｜"
                     f"総合{h['点数']}点｜"
                     f"複勝{h['複勝点']}点｜"
+                    f"穴{h['穴スコア']}点｜"
                     f"軸{round(h['軸スコア'], 1)}点"
                 )
 
@@ -1054,7 +1088,7 @@ if st.button("予想開始"):
             st.write("穴馬採用4頭")
             st.write(
                 " / ".join(
-                    f"{h['馬番']} {h['馬名']}" for h in selected_holes
+                    f"{h['馬番']} {h['馬名']} (穴{h['穴スコア']})" for h in selected_holes
                 )
             )
 
