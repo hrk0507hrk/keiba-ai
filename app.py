@@ -1323,6 +1323,43 @@ def make_sanrenpuku_16_tickets(horses):
 
     return tickets, info
 
+
+def make_sanrenpuku_select_tickets(sanrenpuku16_info):
+    """
+    16点ルールの人気軸A・人気軸B・穴馬4頭を使って、
+    別枠で厳選3点・厳選5点を作る。
+    16点ルールはそのまま残す。
+    """
+    if not sanrenpuku16_info:
+        return [], []
+
+    main_axis = sanrenpuku16_info["main_axis"]
+    sub_axis = sanrenpuku16_info["sub_axis"]
+    holes = sanrenpuku16_info["selected_holes"]
+
+    if len(holes) < 3:
+        return [], []
+
+    h1 = holes[0]
+    h2 = holes[1]
+    h3 = holes[2]
+
+    select3 = [
+        tuple(sorted([main_axis["馬番"], sub_axis["馬番"], h1["馬番"]])),
+        tuple(sorted([main_axis["馬番"], sub_axis["馬番"], h2["馬番"]])),
+        tuple(sorted([main_axis["馬番"], h1["馬番"], h2["馬番"]])),
+    ]
+
+    select5 = select3 + [
+        tuple(sorted([sub_axis["馬番"], h1["馬番"], h2["馬番"]])),
+        tuple(sorted([main_axis["馬番"], h1["馬番"], h3["馬番"]])),
+    ]
+
+    select3 = list(dict.fromkeys(select3))
+    select5 = list(dict.fromkeys(select5))
+
+    return select3, select5
+
 def judge_confidence(horses, axis, second_round, axis_mode):
     if axis is None:
         return "★☆☆☆☆", "見送り"
@@ -1365,6 +1402,7 @@ if st.button("予想開始"):
         tickets = make_tickets(axis, second_round, third_round)
         wide_tickets = make_wide_tickets(second_round)
         sanrenpuku16_tickets, sanrenpuku16_info = make_sanrenpuku_16_tickets(horses)
+        select3_tickets, select5_tickets = make_sanrenpuku_select_tickets(sanrenpuku16_info)
         confidence, recommendation = judge_confidence(horses, axis, second_round, axis_mode)
 
         st.success(f"{len(horses)}頭を読み取りました。")
@@ -1494,6 +1532,26 @@ if st.button("予想開始"):
             )
 
             st.write(f"3連複点数：{len(sanrenpuku16_tickets)}点")
+
+            st.subheader("3連複 厳選3点・5点")
+
+            if select3_tickets:
+                st.write("### 厳選3点")
+                st.code(
+                    " / ".join(
+                        f"{a}-{b}-{c}" for a, b, c in select3_tickets
+                    )
+                )
+                st.write(f"厳選3点：{len(select3_tickets)}点")
+
+            if select5_tickets:
+                st.write("### 厳選5点")
+                st.code(
+                    " / ".join(
+                        f"{a}-{b}-{c}" for a, b, c in select5_tickets
+                    )
+                )
+                st.write(f"厳選5点：{len(select5_tickets)}点")
         else:
             st.warning("3連複16点ルールを作成できませんでした。人気馬または穴馬の数が不足しています。")
 
