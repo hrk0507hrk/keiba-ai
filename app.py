@@ -77,6 +77,12 @@ pace_text = st.text_area(
     key=f"pace_{st.session_state.clear_count}"
 )
 
+track_condition = st.selectbox(
+    "馬場状態",
+    ["良", "稍重", "重", "不良"],
+    index=0
+)
+
 def clean_lines(text):
     lines = []
     for line in text.splitlines():
@@ -902,7 +908,7 @@ def add_axis_extra_scores(horses, form_features):
 
     return horses
 
-def add_points(horses, analysis_text, running_style_text, style_graph_text, pace_text):
+def add_points(horses, analysis_text, running_style_text, style_graph_text, pace_text, track_condition):
     set_category(horses)
 
     horse_map = {h["馬番"]: h for h in horses}
@@ -1081,6 +1087,36 @@ def add_points(horses, analysis_text, running_style_text, style_graph_text, pace
         if h["脚質"] in ["差し", "追込"] and h["複勝点"] < 20:
             h["点数"] -= 5
             h["加点理由"].append("後方脚質減点(複勝点20未満) -5")
+
+    # 馬場状態による脚質補正
+    # 良・稍重は基本ロジックそのまま。
+    # 重は逃げ先行を軽く強化。不良は人気縛り解除モードに合わせて前残りを強く見る。
+    for h in horses:
+        if track_condition == "不良":
+            if h["脚質"] == "逃げ":
+                h["点数"] += 10
+                h["展開指数"] += 10
+                h["加点理由"].append("不良馬場補正(逃げ) +10")
+            elif h["脚質"] == "先行":
+                h["点数"] += 7
+                h["展開指数"] += 7
+                h["加点理由"].append("不良馬場補正(先行) +7")
+            elif h["脚質"] == "差し":
+                h["点数"] -= 3
+                h["加点理由"].append("不良馬場補正(差し) -3")
+            elif h["脚質"] == "追込":
+                h["点数"] -= 8
+                h["加点理由"].append("不良馬場補正(追込) -8")
+
+        elif track_condition == "重":
+            if h["脚質"] == "逃げ":
+                h["点数"] += 6
+                h["展開指数"] += 6
+                h["加点理由"].append("重馬場補正(逃げ) +6")
+            elif h["脚質"] == "先行":
+                h["点数"] += 4
+                h["展開指数"] += 4
+                h["加点理由"].append("重馬場補正(先行) +4")
 
     form_features = parse_form_features(pace_text)
 
@@ -1262,16 +1298,31 @@ def make_wide_tickets(second_round):
 
     return wide_tickets
 
-def make_sanrenpuku_16_tickets(horses):
-    popular = [
-        h for h in horses
-        if h["カテゴリ"] == "人気馬"
-    ]
+def make_sanrenpuku_16_tickets(horses, track_condition):
+    # 通常馬場：従来どおり「人気馬1〜3番人気」＋「穴馬」
+    # 不良馬場：人気縛りを外し、最終軸スコア上位＋穴スコア上位から選ぶ
+    if track_condition == "不良":
+        popular = sorted(
+            horses,
+            key=lambda x: x.get("最終軸スコア", x["軸スコア"]),
+            reverse=True
+        )[:6]
 
-    holes = [
-        h for h in horses
-        if h["カテゴリ"] == "穴馬"
-    ]
+        holes = sorted(
+            horses,
+            key=lambda x: x["穴スコア"],
+            reverse=True
+        )
+    else:
+        popular = [
+            h for h in horses
+            if h["カテゴリ"] == "人気馬"
+        ]
+
+        holes = [
+            h for h in horses
+            if h["カテゴリ"] == "穴馬"
+        ]
 
     # 人気軸2頭は、総合点だけでなく安定指数・期待値指数・危険人気補正込みの最終軸スコアで選ぶ
     popular_sorted = sorted(
@@ -1290,7 +1341,10 @@ def make_sanrenpuku_16_tickets(horses):
         return [], None
 
     remain_popular = popular_sorted[:2]
-    selected_holes = hole_sorted[:4]
+    selected_holes = [
+        h for h in hole_sorted
+        if h not in remain_popular
+    ][:4]
 
     main_axis = remain_popular[0]
     sub_axis = remain_popular[1]
@@ -1401,11 +1455,15 @@ if st.button("予想開始"):
 
         tickets = make_tickets(axis, second_round, third_round)
         wide_tickets = make_wide_tickets(second_round)
-        sanrenpuku16_tickets, sanrenpuku16_info = make_sanrenpuku_16_tickets(horses)
+        sanrenpuku16_tickets, sanrenpuku16_info = make_sanrenpuku_16_tickets(
+            horses,
+            track_condition
+        )
         select3_tickets, select5_tickets = make_sanrenpuku_select_tickets(sanrenpuku16_info)
         confidence, recommendation = judge_confidence(horses, axis, second_round, axis_mode)
 
         st.success(f"{len(horses)}頭を読み取りました。")
+        st.info(f"馬場状態：{track_condition}")
 
         st.subheader("馬ごとの評価点")
 
@@ -1502,6 +1560,9 @@ if st.button("予想開始"):
             )
 
         st.subheader("3連複16点ルール")
+
+        if track_condition == "不良":
+            st.warning("不良馬場モード：人気縛り解除で、最終軸スコア・穴スコア重視で選出しています。")
 
         if sanrenpuku16_info:
             main_axis = sanrenpuku16_info["main_axis"]
