@@ -1449,7 +1449,7 @@ if st.button("予想開始"):
     if not horses:
         st.error("出走表を読み取れませんでした。PC版・スマホ版どちらでも、出走表部分を少し広めにコピーして貼ってください。")
     else:
-        horses = add_points(horses, analysis, running_style_text, style_graph_text, pace_text)
+        horses = add_points(horses, analysis, running_style_text, style_graph_text, pace_text,track_condition)
 
         axis, second_round, third_round, cut_horses, axis_mode, hole_recommendations = make_prediction(horses)
 
