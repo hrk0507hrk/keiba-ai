@@ -1342,7 +1342,6 @@ def make_sanrenpuku_16_tickets(horses, track_condition):
             h for h in horses
             if h["人気"] is not None
             and h["人気"] <= 5
-            and h["複勝点"] >= 10
             and h.get("最終軸スコア", h["軸スコア"]) >= 0
         ]
 
@@ -1352,7 +1351,6 @@ def make_sanrenpuku_16_tickets(horses, track_condition):
             h for h in horses
             if h["人気"] is not None
             and 6 <= h["人気"] <= 12
-            and h["複勝点"] >= 10
         ]
 
     else:
