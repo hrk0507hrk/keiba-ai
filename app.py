@@ -1330,22 +1330,33 @@ def make_wide_tickets(second_round):
     return wide_tickets
 
 def make_sanrenpuku_16_tickets(horses, track_condition):
+    """
+    3連複16点ルール。
+    良・稍重・重は通常ルール。
+    不良だけ人気範囲を少し広げる。
+    """
     if track_condition == "不良":
-        # 不良馬場は人気縛りを解除。最終軸スコア上位から軸候補を作る。
-        popular = sorted(
-            horses,
-            key=lambda x: x.get("最終軸スコア", x["軸スコア"]),
-            reverse=True
-        )[:6]
+        # 不良馬場は人気縛りを少し緩める。
+        # 軸候補：1〜5番人気。ただし消し馬級は復活させない。
+        popular = [
+            h for h in horses
+            if h["人気"] is not None
+            and h["人気"] <= 5
+            and h["複勝点"] >= 10
+            and h.get("最終軸スコア", h["軸スコア"]) >= 0
+        ]
 
-        # 相手も人気カテゴリではなく穴スコア順。
-        # データ点が低くても前残り要素がある馬を拾う。
-        holes = sorted(
-            horses,
-            key=lambda x: x["穴スコア"],
-            reverse=True
-        )
+        # 穴候補：6〜12番人気。
+        # 複勝点10未満は不良でも復活させない。
+        holes = [
+            h for h in horses
+            if h["人気"] is not None
+            and 6 <= h["人気"] <= 12
+            and h["複勝点"] >= 10
+        ]
+
     else:
+        # 通常馬場は今まで通り
         popular = [
             h for h in horses
             if h["カテゴリ"] == "人気馬"
@@ -1363,6 +1374,7 @@ def make_sanrenpuku_16_tickets(horses, track_condition):
         reverse=True
     )
 
+    # 穴馬4頭は穴スコア順
     hole_sorted = sorted(
         holes,
         key=lambda x: x["穴スコア"],
@@ -1373,6 +1385,7 @@ def make_sanrenpuku_16_tickets(horses, track_condition):
         return [], None
 
     remain_popular = popular_sorted[:2]
+
     selected_holes = [
         h for h in hole_sorted
         if h not in remain_popular
@@ -1408,7 +1421,6 @@ def make_sanrenpuku_16_tickets(horses, track_condition):
     }
 
     return tickets, info
-
 
 def make_sanrenpuku_select_tickets(sanrenpuku16_info):
     """
