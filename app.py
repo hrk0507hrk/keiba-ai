@@ -13,7 +13,7 @@ if st.button("🗑️ 入力内容をクリア"):
 
 POINTS = {
     "データ上位馬3頭": 0,
-    "このコースが得意な馬": 15,
+    "このコースが得意な馬": 12,
     "この距離が得意な馬": 12,
     "この競馬場が得意な馬": 12,
     "今回の馬場状態が得意な馬": 10,
@@ -764,7 +764,7 @@ def calc_axis_score(horse):
 def calc_stability_score(feature):
     """
     過去走から安定指数を作る。
-    減点過多で好走馬を消さないよう、マイナスは最大-15までに制限。
+    加点式に統一するため、悪い材料は減点せず「加点なし」にする。
     """
     score = 0
 
@@ -775,11 +775,9 @@ def calc_stability_score(feature):
     total = len(finishes)
     in_3 = sum(1 for r in finishes if r is not None and r <= 3)
     in_5 = sum(1 for r in finishes if r is not None and r <= 5)
-    out_10 = sum(1 for r in finishes if r is not None and r >= 10)
 
     fukusho_rate = in_3 / total
     board_rate = in_5 / total
-    bad_rate = out_10 / total
 
     if fukusho_rate >= 0.6:
         score += 20
@@ -791,42 +789,23 @@ def calc_stability_score(feature):
     elif board_rate >= 0.6:
         score += 8
 
-    # 大敗率の減点は軽め
-    if bad_rate >= 0.4:
-        score -= 10
-    elif bad_rate >= 0.2:
-        score -= 5
-
     latest = finishes[0]
     if latest is not None:
         if latest <= 3:
             score += 10
         elif latest <= 5:
             score += 5
-        elif latest >= 10:
-            score -= 5
 
     if feature.get("前走0.5秒差以内"):
         score += 5
 
-    if feature.get("前走1秒以上負け"):
-        score -= 3
-
-    if feature.get("半年以上休養"):
-        score -= 3
-
-    # 最終的に減点過多を防ぐ
-    if score < -15:
-        score = -15
-
     return score
-
 
 def calc_value_score(total_rank, popularity_rank):
     """
     期待値指数。
-    総合評価順位より人気が低い馬は妙味あり、人気先行馬は軽く減点。
-    ※減点過多で好走馬を消さないよう、マイナス側は最大-10に抑える。
+    総合評価順位より人気が低い馬だけ加点する。
+    人気先行馬は減点せず、加点なしにする。
     """
     if popularity_rank is None:
         return 0
@@ -839,18 +818,12 @@ def calc_value_score(total_rank, popularity_rank):
         return 15
     elif gap >= 1:
         return 8
-    elif gap <= -5:
-        return -10
-    elif gap <= -3:
-        return -5
-    elif gap <= -1:
-        return -3
     return 0
-
 
 def add_axis_extra_scores(horses, form_features):
     """
     安定指数・期待値指数・危険人気補正・最終軸スコアをまとめて計算。
+    加点式に統一するため、危険人気補正は減点せず注意表示だけにする。
     """
     for h in horses:
         feature = form_features.get(h["馬番"], {})
@@ -858,10 +831,7 @@ def add_axis_extra_scores(horses, form_features):
 
         if h["安定指数"] > 0:
             h["加点理由"].append(f"安定指数 +{h['安定指数']}")
-        elif h["安定指数"] < 0:
-            h["加点理由"].append(f"安定指数 {h['安定指数']}")
 
-    # 総合点の順位を作る。点数が高いほど上位。
     sorted_by_total = sorted(horses, key=lambda x: x["点数"], reverse=True)
     total_rank_map = {}
     prev_score = None
@@ -879,38 +849,16 @@ def add_axis_extra_scores(horses, form_features):
 
         if h["期待値指数"] > 0:
             h["加点理由"].append(f"期待値指数 +{h['期待値指数']}")
-        elif h["期待値指数"] < 0:
-            h["加点理由"].append(f"期待値指数 {h['期待値指数']}")
 
-        danger = 0
+        h["危険人気補正"] = 0
 
-        # 危険人気補正は軽めにする。
-        # 以前のように-25以上沈めると、好走できる人気馬まで消えやすい。
-        if h["人気"] is not None and h["人気"] <= 3:
-            if h["複勝点"] < 10:
-                danger -= 15
-            elif h["複勝点"] < 15:
-                danger -= 10
-            elif h["複勝点"] < 20:
-                danger -= 5
-
-        if h["人気"] == 1 and h["複勝点"] < 10:
-            danger -= 5
-
-        if h["期待値指数"] <= -10:
-            danger -= 5
-
-        # 最大減点は-15まで
-        if danger < -15:
-            danger = -15
-
-        h["危険人気補正"] = danger
-
-        if danger < 0:
-            h["加点理由"].append(f"危険人気補正 {danger}")
+        if h["人気"] is not None and h["人気"] <= 3 and h["複勝点"] < 15:
+            h["加点理由"].append("注意: 人気馬だが複勝点15未満")
+        elif h["人気"] is not None and h["人気"] <= 3 and h["複勝点"] < 20:
+            h["加点理由"].append("注意: 人気馬だが複勝点20未満")
 
         h["軸スコア"] = calc_axis_score(h)
-        h["最終軸スコア"] = h["軸スコア"] + h["危険人気補正"]
+        h["最終軸スコア"] = h["軸スコア"]
 
     return horses
 
@@ -1005,11 +953,9 @@ def add_points(horses, analysis_text, running_style_text, style_graph_text, pace
                 h["展開指数"] += 7
                 h["加点理由"].append("不良馬場補正(先行) +7")
             elif h["脚質"] == "差し":
-                h["点数"] -= 3
-                h["加点理由"].append("不良馬場補正(差し) -3")
+                h["加点理由"].append("注意: 不良馬場で差し")
             elif h["脚質"] == "追込":
-                h["点数"] -= 8
-                h["加点理由"].append("不良馬場補正(追込) -8")
+                h["加点理由"].append("注意: 不良馬場で追込")
 
         elif track_condition == "重":
             if h["脚質"] == "逃げ":
@@ -1111,15 +1057,12 @@ def add_points(horses, analysis_text, running_style_text, style_graph_text, pace
 
         if h["カテゴリ"] == "人気馬":
             if h["複勝点"] < 10:
-                h["点数"] -= 10
-                h["加点理由"].append("危険人気馬減点(複勝点10未満) -10")
+                h["加点理由"].append("注意: 人気馬だが複勝点10未満")
             elif h["複勝点"] < 15:
-                h["点数"] -= 5
-                h["加点理由"].append("危険人気馬減点(複勝点15未満) -5")
+                h["加点理由"].append("注意: 人気馬だが複勝点15未満")
 
         if h["脚質"] in ["差し", "追込"] and h["複勝点"] < 20:
-            h["点数"] -= 5
-            h["加点理由"].append("後方脚質減点(複勝点20未満) -5")
+            h["加点理由"].append("注意: 後方脚質かつ複勝点20未満")
 
     form_features = parse_form_features(pace_text)
 
@@ -1165,27 +1108,21 @@ def add_points(horses, analysis_text, running_style_text, style_graph_text, pace
                 hole_score += 5
                 hole_reasons.append("近3走馬券内2回以上 +5")
 
-            # 追込は届かないリスクを減点
+            # リスク要素は減点せず注意表示のみ
             if h["脚質"] == "追込":
-                hole_score -= 5
-                hole_reasons.append("追込 -5")
+                hole_reasons.append("注意: 追込")
 
-            # 複勝点が低い穴馬は基本的に危険
             if h["複勝点"] < 15:
-                hole_score -= 10
-                hole_reasons.append("複勝点15未満 -10")
+                hole_reasons.append("注意: 複勝点15未満")
 
             if feature.get("半年以上休養"):
-                hole_score -= 5
-                hole_reasons.append("半年以上休養 -5")
+                hole_reasons.append("注意: 半年以上休養")
 
             if feature.get("前走1秒以上負け"):
-                hole_score -= 5
-                hole_reasons.append("前走1秒以上負け -5")
+                hole_reasons.append("注意: 前走1秒以上負け")
 
             if feature.get("近3走二桁着順2回以上"):
-                hole_score -= 5
-                hole_reasons.append("近3走二桁着順2回以上 -5")
+                hole_reasons.append("注意: 近3走二桁着順2回以上")
 
         # 不良馬場だけ、データ分析で点が付かない馬も前残り要素で拾い上げる
         if track_condition == "不良":
@@ -1209,12 +1146,10 @@ def add_points(horses, analysis_text, running_style_text, style_graph_text, pace
                 hole_reasons.append("不良サバイバル(前走0.5秒差以内) +8")
 
             if h["脚質"] == "追込":
-                hole_score -= 10
-                hole_reasons.append("不良サバイバル(追込) -10")
+                hole_reasons.append("注意: 不良サバイバルで追込")
 
             if feature.get("半年以上休養"):
-                hole_score -= 5
-                hole_reasons.append("不良サバイバル(半年以上休養) -5")
+                hole_reasons.append("注意: 不良サバイバルで半年以上休養")
 
         h["穴スコア"] = hole_score
         h["馬柱評価"] = hole_reasons
@@ -1330,31 +1265,22 @@ def make_wide_tickets(second_round):
     return wide_tickets
 
 def make_sanrenpuku_16_tickets(horses, track_condition):
-    """
-    3連複16点ルール。
-    良・稍重・重は通常ルール。
-    不良だけ人気範囲を少し広げる。
-    """
     if track_condition == "不良":
-        # 不良馬場は人気縛りを少し緩める。
-        # 軸候補：1〜5番人気。ただし消し馬級は復活させない。
-        popular = [
-            h for h in horses
-            if h["人気"] is not None
-            and h["人気"] <= 5
-            and h.get("最終軸スコア", h["軸スコア"]) >= 0
-        ]
+        # 不良馬場は人気縛りを解除。最終軸スコア上位から軸候補を作る。
+        popular = sorted(
+            horses,
+            key=lambda x: x.get("最終軸スコア", x["軸スコア"]),
+            reverse=True
+        )[:6]
 
-        # 穴候補：6〜12番人気。
-        # 複勝点10未満は不良でも復活させない。
-        holes = [
-            h for h in horses
-            if h["人気"] is not None
-            and 6 <= h["人気"] <= 12
-        ]
-
+        # 相手も人気カテゴリではなく穴スコア順。
+        # データ点が低くても前残り要素がある馬を拾う。
+        holes = sorted(
+            horses,
+            key=lambda x: x["穴スコア"],
+            reverse=True
+        )
     else:
-        # 通常馬場は今まで通り
         popular = [
             h for h in horses
             if h["カテゴリ"] == "人気馬"
@@ -1372,7 +1298,6 @@ def make_sanrenpuku_16_tickets(horses, track_condition):
         reverse=True
     )
 
-    # 穴馬4頭は穴スコア順
     hole_sorted = sorted(
         holes,
         key=lambda x: x["穴スコア"],
@@ -1383,7 +1308,6 @@ def make_sanrenpuku_16_tickets(horses, track_condition):
         return [], None
 
     remain_popular = popular_sorted[:2]
-
     selected_holes = [
         h for h in hole_sorted
         if h not in remain_popular
@@ -1419,6 +1343,7 @@ def make_sanrenpuku_16_tickets(horses, track_condition):
     }
 
     return tickets, info
+
 
 def make_sanrenpuku_select_tickets(sanrenpuku16_info):
     """
