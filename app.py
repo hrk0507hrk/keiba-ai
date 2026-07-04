@@ -882,9 +882,9 @@ def apply_form_scores(horses, form_features):
 
         # 軸向け
         if f.get("前走0.5秒差以内"):
-            h["軸スコア"] += 10
-            h["点数"] += 10
-            h["加点理由"].append("軸:前走0.5秒差以内 +10")
+            h["軸スコア"] += 5
+            h["点数"] += 5
+            h["加点理由"].append("軸:前走0.5秒差以内 +5")
 
         if f.get("前走4角3番手以内"):
             h["軸スコア"] += 8
@@ -893,8 +893,8 @@ def apply_form_scores(horses, form_features):
 
         # 穴向け
         if f.get("前走0.5秒差以内"):
-            h["穴スコア"] += 20
-            h["馬柱評価"].append("穴:前走0.5秒差以内 +20")
+            h["穴スコア"] += 8
+            h["馬柱評価"].append("穴:前走0.5秒差以内 +8")
 
         if f.get("前走4角3番手以内"):
             h["穴スコア"] += 15
@@ -926,19 +926,11 @@ def apply_popularity_scores(horses, track_condition):
         if pop is None:
             continue
 
-        # 軸は上位人気を軽く評価。強すぎないよう控えめ。
-        if pop == 1:
-            h["軸スコア"] += 8
-            h["点数"] += 8
-            h["加点理由"].append("軸:人気補正(1番人気) +8")
-        elif pop == 2:
-            h["軸スコア"] += 6
-            h["点数"] += 6
-            h["加点理由"].append("軸:人気補正(2番人気) +6")
-        elif pop == 3:
-            h["軸スコア"] += 4
-            h["点数"] += 4
-            h["加点理由"].append("軸:人気補正(3番人気) +4")
+        # 軸は上位人気を一律評価。1〜3番人気の差をつけすぎない。
+        if 1 <= pop <= 3:
+            h["軸スコア"] += 5
+            h["点数"] += 5
+            h["加点理由"].append(f"軸:人気補正({pop}番人気) +5")
 
         # 穴は人気以上に走りそうなゾーンを評価
         if 4 <= pop <= 6:
@@ -1135,15 +1127,17 @@ def make_sanrenpuku_16_tickets(horses, track_condition):
     hole_candidates = hole_candidates_by_track(horses, track_condition, [main_axis, sub_axis])
     hole_sorted = sorted(hole_candidates, key=lambda x: x["穴スコア"], reverse=True)
 
-    if len(hole_sorted) < 4:
+    hole_count = 5 if len(horses) >= 16 else 4
+
+    if len(hole_sorted) < hole_count:
         # 足りない時は人気不明や大穴も、穴スコア順で補充する
         extra = [h for h in horses if h["馬番"] not in {main_axis["馬番"], sub_axis["馬番"]} and h not in hole_sorted]
         hole_sorted += sorted(extra, key=lambda x: x["穴スコア"], reverse=True)
 
-    if len(hole_sorted) < 4:
+    if len(hole_sorted) < hole_count:
         return [], None
 
-    selected_holes = hole_sorted[:4]
+    selected_holes = hole_sorted[:hole_count]
 
     tickets = []
     group1 = [sub_axis] + selected_holes
@@ -1274,7 +1268,7 @@ if st.button("予想開始"):
                 f"軸{h['軸スコア']}点｜穴{h['穴スコア']}点"
             )
 
-        st.subheader("3連複16点ルール")
+        st.subheader("3連複標準ルール")
 
         if sanrenpuku16_info:
             main_axis = sanrenpuku16_info["main_axis"]
