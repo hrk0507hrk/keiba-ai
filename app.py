@@ -676,10 +676,11 @@ def evaluate_horse(horse: Horse, good_frames: list[int], good_track_horses: list
     elif in3 >= 2:
         score += 5
     if in5 >= 6:
+        score += 15
+        reasons.append("掲示板安定◎")
+    elif in5 >= 4:
         score += 8
         reasons.append("掲示板安定")
-    elif in5 >= 4:
-        score += 4
 
     # 着差
     margin_score = 0
