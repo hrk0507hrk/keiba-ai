@@ -122,19 +122,88 @@ def extract_odds_popularity(text: str):
     odds = None
     popularity = 99
 
-    m = re.search(r"(\d+\.\d+)\s*\((\d+)人気\)", text)
+    # 1) 一番よくある形式：11.9 (4人気)
+    m = re.search(r"(\d+\.\d+)\s*\((\d+)\s*人気\)", text)
     if m:
         return float(m.group(1)), int(m.group(2))
 
-    m = re.search(r"(\d+)人気", text)
+    # 2) 「4人気」だけ拾う
+    m = re.search(r"(\d+)\s*人気", text)
     if m:
         popularity = int(m.group(1))
 
-    m = re.search(r"\b(\d+\.\d+)\b", text)
-    if m:
-        odds = float(m.group(1))
+    # 3) オッズ候補を拾う
+    # 斤量 56.0 や馬体重 472kg を拾わないように、45.0〜65.0は基本除外
+    decimals = []
+    for x in re.findall(r"\b(\d+\.\d+)\b", text):
+        try:
+            v = float(x)
+            if 1.0 <= v <= 999.9 and not (45.0 <= v <= 65.0):
+                decimals.append(v)
+        except:
+            pass
+
+    if decimals:
+        odds = decimals[0]
 
     return odds, popularity
+
+
+def infer_popularity_from_rows(rows: list[str], start: int, end: int, odds):
+    """PC版でオッズと人気が別行・人気だけ数字行の場合に拾う"""
+    pop = 99
+
+    # まず「〇人気」を探す
+    for row in rows[start:end]:
+        m = re.search(r"(\d+)\s*人気", row)
+        if m:
+            return int(m.group(1))
+
+    # オッズ行の直後に「人気数字だけ」が来る地方PC版に対応
+    # 例：
+    # 490(-3)    37.8
+    # 9
+    if odds is not None:
+        odds_str = str(odds)
+        for idx in range(start, end):
+            row = rows[idx]
+            if odds_str in row:
+                for j in range(idx + 1, min(idx + 6, end)):
+                    candidate = rows[j].strip()
+                    if re.fullmatch(r"\d+", candidate):
+                        v = int(candidate)
+                        if 1 <= v <= 30:
+                            return v
+
+    # オッズと人気が同じブロック内で「小数行→整数行」になっている場合
+    for idx in range(start, min(end - 1, len(rows) - 1)):
+        row = rows[idx].strip()
+        nxt = rows[idx + 1].strip()
+
+        # 37.8 のようなオッズ行
+        if re.fullmatch(r"\d+\.\d+", row) and re.fullmatch(r"\d+", nxt):
+            v = int(nxt)
+            if 1 <= v <= 30:
+                return v
+
+        # 490(-3) 37.8 のような馬体重＋オッズ行
+        if re.search(r"\d{3}\([+-]?\d+\)\s+\d+\.\d+", row) and re.fullmatch(r"\d+", nxt):
+            v = int(nxt)
+            if 1 <= v <= 30:
+                return v
+
+    # 最後の保険：馬体重形式の次以降に出る単独数字を人気候補にする
+    body_seen = False
+    for row in rows[start:end]:
+        if re.search(r"\d{3}\([+-]?\d+\)", row) or re.search(r"\d{3}kg", row):
+            body_seen = True
+            continue
+        if body_seen and re.fullmatch(r"\d+", row):
+            v = int(row)
+            if 1 <= v <= 30:
+                return v
+
+    return pop
 
 
 def parse_racecard_pc(lines: list[str]) -> list[Horse]:
@@ -210,6 +279,10 @@ def parse_racecard_pc(lines: list[str]) -> list[Horse]:
                 if m_odds:
                     odds = float(m_odds.group(1))
 
+        # 人気だけ別行/数字行で残っている場合の最終補正
+        if pop == 99:
+            pop = infer_popularity_from_rows(lines, i, min(k + 10, len(lines)), odds)
+
         jockey = ""
         weight = 0.0
         bodyweight = 0
@@ -228,6 +301,10 @@ def parse_racecard_pc(lines: list[str]) -> list[Horse]:
             bw = re.search(r"(\d{3})kg", row)
             if bw:
                 bodyweight = int(bw.group(1))
+            else:
+                bw2 = re.search(r"\b(\d{3})\([+-]?\d+\)", row)
+                if bw2:
+                    bodyweight = int(bw2.group(1))
 
             parts = row.split()
             if len(parts) >= 2:
@@ -756,6 +833,12 @@ if st.button("AI予想開始"):
 
     st.success(f"{len(horses)}頭を読み取りました。")
     st.info(f"レース判定：{race_type(horses)}")
+
+    with st.expander("読み取り確認（馬番・馬名・人気・オッズ）"):
+        for h in horses:
+            pop_text = "未取得" if h.popularity == 99 else f"{h.popularity}人気"
+            odds_text = "-" if h.odds is None else str(h.odds)
+            st.write(f"{h.number} {h.name}｜{pop_text}｜オッズ {odds_text}")
 
     st.header("AI印")
 
