@@ -171,8 +171,44 @@ def parse_racecard_pc(lines: list[str]) -> list[Horse]:
             block.append(lines[k])
             k += 1
 
-        block_text = " ".join(block)
-        odds, pop = extract_odds_popularity(block_text)
+        # PC版は人気・オッズが馬名行からかなり下に出ることがあるので広めに見る
+        search_text = " ".join(lines[i:k])
+        odds, pop = extract_odds_popularity(search_text)
+
+        # 「12.3 (4人気)」形式
+        m_pair = re.search(r"(\d+\.\d+)\s*\((\d+)\s*人気\)", search_text)
+        if m_pair:
+            odds = float(m_pair.group(1))
+            pop = int(m_pair.group(2))
+
+        # 「12.3」「4人気」が別行の場合
+        if pop == 99:
+            for row in lines[i:k]:
+                m_pop = re.search(r"(\d+)\s*人気", row)
+                if m_pop:
+                    pop = int(m_pop.group(1))
+                    break
+
+        if odds is None:
+            for row in lines[i:k]:
+                m_odds = re.search(r"\b(\d+\.\d+)\b", row)
+                if m_odds:
+                    odds = float(m_odds.group(1))
+                    break
+
+        # さらに保険：出走表で「オッズ」「人気」が近くにない場合、次の馬までではなく最大35行だけ見る
+        if pop == 99 or odds is None:
+            wider_text = " ".join(lines[i:min(i + 35, len(lines))])
+
+            if pop == 99:
+                m_pop = re.search(r"(\d+)\s*人気", wider_text)
+                if m_pop:
+                    pop = int(m_pop.group(1))
+
+            if odds is None:
+                m_odds = re.search(r"\b(\d+\.\d+)\b", wider_text)
+                if m_odds:
+                    odds = float(m_odds.group(1))
 
         jockey = ""
         weight = 0.0
@@ -193,11 +229,10 @@ def parse_racecard_pc(lines: list[str]) -> list[Horse]:
             if bw:
                 bodyweight = int(bw.group(1))
 
-            # よくある「牡4 58.0 騎手 厩舎」系
             parts = row.split()
-            if len(parts) >= 3:
+            if len(parts) >= 2:
                 for p in parts:
-                    if re.match(r"^[ァ-ヴ一-龥]{2,5}$", p) and p not in ["栗東", "美浦", "船橋", "川崎", "大井", "浦和"]:
+                    if re.match(r"^[ァ-ヴ一-龥]{2,6}$", p) and p not in ["栗東", "美浦", "船橋", "川崎", "大井", "浦和", "牡", "牝", "セ"]:
                         jockey = p
                         break
 
