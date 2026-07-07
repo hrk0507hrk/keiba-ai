@@ -1,18 +1,60 @@
+import streamlit as st
 import re
 from dataclasses import dataclass, field
 from itertools import permutations
-from typing import List, Dict, Tuple, Optional
-
-import streamlit as st
 
 st.set_page_config(page_title="競馬AI2.0", layout="wide")
+st.title("競馬AI2.0｜馬柱重視版")
+st.caption("出走表＋馬柱から、1〜3番人気の軸・相手ランキング・馬連/ワイド/3連単を作成します。")
 
-# ==============================
-# データ定義
-# ==============================
+if "clear_count" not in st.session_state:
+    st.session_state.clear_count = 0
+
+if st.button("🗑️ 入力内容をクリア"):
+    st.session_state.clear_count += 1
+
+col1, col2 = st.columns(2)
+
+with col1:
+    racecard_text = st.text_area(
+        "① 出走表を貼ってください（PC/スマホ想定）",
+        height=430,
+        key=f"racecard_{st.session_state.clear_count}",
+    )
+
+with col2:
+    past_text = st.text_area(
+        "② 馬柱を貼ってください（できれば9走分）",
+        height=430,
+        key=f"past_{st.session_state.clear_count}",
+    )
+
+col3, col4 = st.columns(2)
+
+with col3:
+    good_frame_text = st.text_input(
+        "③ 有利枠（例：1,3,8）",
+        key=f"frames_{st.session_state.clear_count}",
+    )
+
+with col4:
+    good_track_text = st.text_input(
+        "④ 今回の馬場状態が得意な馬番（例：2,7,11）",
+        key=f"track_horses_{st.session_state.clear_count}",
+    )
+
+track_condition = st.selectbox(
+    "馬場状態",
+    ["良", "稍重", "重", "不良"],
+    index=0,
+    key=f"condition_{st.session_state.clear_count}",
+)
+
+st.divider()
+
 
 @dataclass
-class PastRace:
+class RaceRecord:
     date: str = ""
     place: str = ""
     surface: str = ""
@@ -25,7 +67,7 @@ class PastRace:
     jockey: str = ""
     weight: float = 0.0
     bodyweight: int = 0
-    body_diff: int = 0
+    field_size: int = 0
     raw: str = ""
 
 
@@ -35,42 +77,34 @@ class Horse:
     number: int = 0
     name: str = ""
     popularity: int = 99
-    odds: Optional[float] = None
+    odds: float | None = None
     jockey: str = ""
     weight: float = 0.0
     bodyweight: int = 0
-    body_diff: int = 0
-    races: List[PastRace] = field(default_factory=list)
+    races: list[RaceRecord] = field(default_factory=list)
 
     recent_score: int = 0
-    aptitude_score: int = 0
+    distance_score: int = 0
+    track_score: int = 0
+    course_score: int = 0
     pace_score: int = 0
-    bonus_score: int = 0
+    value_score: int = 0
+    manual_score: int = 0
     total: int = 0
-    style: str = "不明"
-    mark: str = ""
-    reasons: List[str] = field(default_factory=list)
-    cautions: List[str] = field(default_factory=list)
+    style: str = ""
+    reasons: list[str] = field(default_factory=list)
+    cautions: list[str] = field(default_factory=list)
 
-
-# ==============================
-# 共通ユーティリティ
-# ==============================
-
-PLACES = [
-    "札幌", "函館", "福島", "新潟", "東京", "中山", "中京", "京都", "阪神", "小倉",
-    "門別", "盛岡", "水沢", "浦和", "船橋", "大井", "川崎", "金沢", "笠松", "名古屋",
-    "園田", "姫路", "高知", "佐賀", "帯広"
-]
 
 IGNORE_WORDS = [
-    "馬メモ", "レース別馬メモ", "全角100文字以内", "削除保存", "閉じる", "編集",
-    "次走買い", "次走消し", "不利", "馬場向かず", "ペース合わず", "ハイレベル戦",
-    "好ラップ", "映像を見る"
+    "馬メモ", "レース別馬メモ", "全角100文字以内で入力してください",
+    "削除保存", "閉じる", "編集", "次走買い", "次走消し",
+    "不利", "馬場向かず", "ペース合わず", "ハイレベル戦", "好ラップ",
+    "映像を見る",
 ]
 
 
-def clean_lines(text: str) -> List[str]:
+def clean_lines(text: str) -> list[str]:
     lines = []
     for line in text.splitlines():
         line = line.strip()
@@ -84,92 +118,29 @@ def clean_lines(text: str) -> List[str]:
     return lines
 
 
-def to_int(value, default=99):
-    try:
-        return int(value)
-    except Exception:
-        return default
-
-
-def parse_number_list(text: str) -> List[int]:
-    return [int(x) for x in re.findall(r"\d+", text or "")]
-
-
-# ==============================
-# 出走表パーサー
-# ==============================
-
-def extract_odds_popularity(block: str) -> Tuple[Optional[float], int]:
+def extract_odds_popularity(text: str):
     odds = None
     popularity = 99
 
-    pop = re.search(r"(\d+)\s*人気", block)
-    if pop:
-        popularity = int(pop.group(1))
+    m = re.search(r"(\d+\.\d+)\s*\((\d+)人気\)", text)
+    if m:
+        return float(m.group(1)), int(m.group(2))
 
-    odd = re.search(r"(\d+\.\d+)", block)
-    if odd:
-        try:
-            odds = float(odd.group(1))
-        except Exception:
-            odds = None
+    m = re.search(r"(\d+)人気", text)
+    if m:
+        popularity = int(m.group(1))
+
+    m = re.search(r"\b(\d+\.\d+)\b", text)
+    if m:
+        odds = float(m.group(1))
 
     return odds, popularity
 
 
-def parse_weight_body(block: str) -> Tuple[float, int, int]:
-    weight = 0.0
-    body = 0
-    diff = 0
-
-    # 斤量 56.0 / 斤量だけ独立して出るケースにも対応
-    w = re.search(r"(?:^|\s)(\d{2}(?:\.\d)?)(?:\s|$)", block)
-    if w:
-        try:
-            val = float(w.group(1))
-            if 48 <= val <= 65:
-                weight = val
-        except Exception:
-            pass
-
-    b = re.search(r"(\d{3})kg\s*\(([+-]?\d+)\)", block)
-    if b:
-        body = int(b.group(1))
-        diff = int(b.group(2))
-    else:
-        b2 = re.search(r"(\d{3})kg", block)
-        if b2:
-            body = int(b2.group(1))
-
-    return weight, body, diff
-
-
-def make_horse(frame, number, name, block="") -> Horse:
-    odds, pop = extract_odds_popularity(block)
-    weight, body, diff = parse_weight_body(block)
-
-    jockey = ""
-    # 騎手は厳密に取りすぎると馬名を拾うので、ここでは空でもOKにする
-    jockey_candidates = re.findall(r"(?:替)?([一-龥ァ-ヴー]{2,5})\s*(?:\d{2}(?:\.\d)?)", block)
-    if jockey_candidates:
-        jockey = jockey_candidates[-1]
-
-    return Horse(
-        frame=frame,
-        number=number,
-        name=name.strip(),
-        popularity=pop,
-        odds=odds,
-        jockey=jockey,
-        weight=weight,
-        bodyweight=body,
-        body_diff=diff,
-    )
-
-
-def parse_pc_racecard(lines: List[str]) -> List[Horse]:
+def parse_racecard_pc(lines: list[str]) -> list[Horse]:
     horses = []
     i = 0
+
     while i < len(lines):
         m = re.match(r"^(\d+)\s+(\d+)$", lines[i])
         if not m:
@@ -178,620 +149,631 @@ def parse_pc_racecard(lines: List[str]) -> List[Horse]:
 
         frame = int(m.group(1))
         number = int(m.group(2))
+
         j = i + 1
         while j < len(lines) and lines[j] == "--":
             j += 1
+
         if j >= len(lines):
             i += 1
             continue
-        name = lines[j]
-        if re.fullmatch(r"\d+", name) or "人気" in name or re.search(r"\d+\.\d+", name):
+
+        name = lines[j].strip()
+        if not name or name == "--" or re.fullmatch(r"\d+", name) or "人気" in name:
             i += 1
             continue
 
-        k = j + 1
         block = []
+        k = j + 1
         while k < len(lines):
             if re.match(r"^\d+\s+\d+$", lines[k]):
                 break
             block.append(lines[k])
             k += 1
-        horses.append(make_horse(frame, number, name, " ".join(block)))
+
+        block_text = " ".join(block)
+        odds, pop = extract_odds_popularity(block_text)
+
+        jockey = ""
+        weight = 0.0
+        bodyweight = 0
+
+        # 出走表内の騎手/斤量らしきものをゆるく取得
+        for row in block:
+            wm = re.search(r"(\d{2}(?:\.\d)?)", row)
+            if wm and weight == 0:
+                try:
+                    w = float(wm.group(1))
+                    if 45 <= w <= 65:
+                        weight = w
+                except:
+                    pass
+
+            bw = re.search(r"(\d{3})kg", row)
+            if bw:
+                bodyweight = int(bw.group(1))
+
+            # よくある「牡4 58.0 騎手 厩舎」系
+            parts = row.split()
+            if len(parts) >= 3:
+                for p in parts:
+                    if re.match(r"^[ァ-ヴ一-龥]{2,5}$", p) and p not in ["栗東", "美浦", "船橋", "川崎", "大井", "浦和"]:
+                        jockey = p
+                        break
+
+        horses.append(Horse(frame, number, name, pop, odds, jockey, weight, bodyweight))
         i = k
+
     return horses
 
 
-def parse_smartphone_racecard(lines: List[str]) -> List[Horse]:
+def parse_racecard_smartphone(lines: list[str]) -> list[Horse]:
     horses = []
     i = 0
+
     while i < len(lines):
         if not re.fullmatch(r"\d+", lines[i]):
             i += 1
             continue
+
         number = int(lines[i])
         found = False
         name = ""
-        db_idx = -1
+
         for j in range(i + 1, min(i + 12, len(lines))):
             if "のデータベース" in lines[j]:
-                db_idx = j
-                name = lines[j - 1].replace("  ", "").strip()
+                name = lines[j - 1].strip()
                 found = True
                 break
+
         if not found or not name or re.fullmatch(r"\d+", name):
             i += 1
             continue
-        frame = (number + 1) // 2
+
         block = " ".join(lines[i:min(i + 45, len(lines))])
-        horses.append(make_horse(frame, number, name, block))
-        i = db_idx + 1
+        odds, pop = extract_odds_popularity(block)
+
+        jockey = ""
+        weight = 0.0
+        bodyweight = 0
+
+        wm = re.search(r"\b(\d{2}(?:\.\d)?)\b", block)
+        if wm:
+            try:
+                w = float(wm.group(1))
+                if 45 <= w <= 65:
+                    weight = w
+            except:
+                pass
+
+        bw = re.search(r"(\d{3})kg", block)
+        if bw:
+            bodyweight = int(bw.group(1))
+
+        # データベース行から騎手を拾う
+        for j in range(i + 1, min(i + 15, len(lines))):
+            if "のデータベース" in lines[j]:
+                tail = lines[j].replace(f"{name}のデータベース", "").strip()
+                tail = re.sub(r"^[牡牝セ]\d+\s*", "", tail)
+                tail = re.sub(r"\d{2}(?:\.\d)?", "", tail).strip()
+                if tail:
+                    jockey = tail.split()[0]
+                break
+
+        frame = (number + 1) // 2
+        horses.append(Horse(frame, number, name, pop, odds, jockey, weight, bodyweight))
+        i += 1
+
     return horses
 
 
-def parse_racecard(text: str) -> List[Horse]:
+def parse_racecard(text: str) -> list[Horse]:
     lines = clean_lines(text)
+
     candidates = []
-    if any("のデータベース" in l for l in lines):
-        candidates.append(parse_smartphone_racecard(lines))
-    candidates.append(parse_pc_racecard(lines))
+    if any("のデータベース" in line for line in lines):
+        candidates.append(parse_racecard_smartphone(lines))
+    candidates.append(parse_racecard_pc(lines))
 
     best = []
     best_score = -1
     for c in candidates:
-        if not c:
-            continue
+        unique = {}
+        for h in c:
+            if h.number and h.name:
+                unique[h.number] = h
+        c = list(unique.values())
         score = len(c) * 10 + sum(1 for h in c if h.popularity != 99)
         if score > best_score:
             best = c
             best_score = score
 
-    unique = {h.number: h for h in best if h.name}
-    return sorted(unique.values(), key=lambda h: h.number)
+    return sorted(best, key=lambda h: h.number)
 
 
-# ==============================
-# 現在条件の取得
-# ==============================
-
-def parse_current_condition(text: str) -> Dict[str, object]:
-    result = {"place": "", "surface": "", "distance": 0}
-    for line in text.splitlines():
-        for p in PLACES:
-            if p in line:
-                result["place"] = p
-                break
-        m = re.search(r"(芝|ダ|ダート)\s*(\d{3,4})", line)
-        if m:
-            result["surface"] = "ダ" if m.group(1) in ["ダ", "ダート"] else "芝"
-            result["distance"] = int(m.group(2))
-    return result
-
-
-# ==============================
-# 馬柱パーサー
-# ==============================
-
-def is_horse_start_for_past(lines: List[str], idx: int, horse_names: set) -> Optional[str]:
-    line = lines[idx]
-    if line in horse_names:
-        return line
-    if idx + 3 < len(lines) and "のデータベース" in lines[idx + 2]:
-        # スマホ：馬番 / 馬名 / -- / 馬名のデータベース
-        if lines[idx + 1] in horse_names:
-            return lines[idx + 1]
-    return None
-
-
-def parse_race_header(line: str) -> Optional[PastRace]:
-    r = PastRace(raw=line)
-
-    # 中央PC例：2026.06.07 東京5 3歳未勝利 ダ1300 1:19.7 良
-    m_date = re.match(r"^(\d{4}\.\d{2}\.\d{2})\s+(.+)$", line)
-    if m_date:
-        r.date = m_date.group(1)
-        rest = m_date.group(2)
-        for p in PLACES:
-            if p in rest:
-                r.place = p
-                break
-        md = re.search(r"(芝|ダ|ダート)(\d{3,4})", rest)
-        if md:
-            r.surface = "ダ" if md.group(1) in ["ダ", "ダート"] else "芝"
-            r.distance = int(md.group(2))
-        for c in ["稍重", "不良", "良", "重", "稍"]:
-            if c in rest:
-                r.condition = "稍重" if c == "稍" else c
-                break
-        mt = re.search(r"(\d:\d{2}\.\d)", rest)
-        if mt:
-            # 今はタイムを直接点数化しない。後で拡張用。
-            pass
-        return r
-
-    # 地方スマホ例：06/02  船橋 1R
-    m_local = re.match(r"^(\d{2}/\d{2})\s+(.+)$", line)
-    if m_local:
-        r.date = m_local.group(1)
-        rest = m_local.group(2)
-        for p in PLACES:
-            if p in rest:
-                r.place = p
-                break
-        return r
-
-    return None
-
-
-def parse_past_performances(text: str, horses: List[Horse]) -> List[Horse]:
+def split_past_blocks(text: str, horses: list[Horse]) -> dict[int, list[str]]:
     lines = clean_lines(text)
-    horse_by_name = {h.name: h for h in horses}
-    horse_names = set(horse_by_name.keys())
-    current: Optional[Horse] = None
-    current_race: Optional[PastRace] = None
+    blocks = {h.number: [] for h in horses}
+    current_no = None
+    horse_names = {h.name: h.number for h in horses}
 
     for idx, line in enumerate(lines):
-        hs = is_horse_start_for_past(lines, idx, horse_names)
-        if hs:
-            current = horse_by_name[hs]
-            current_race = None
-            continue
-
-        if current is None:
-            continue
-
-        header = parse_race_header(line)
-        if header:
-            current.races.append(header)
-            current_race = header
-            continue
-
-        if not current.races:
-            continue
-        r = current.races[-1]
-
-        # 地方スマホは日付行の後に着順だけの行が出る
-        if re.fullmatch(r"\d+", line) and r.finish == 99:
-            val = int(line)
-            if 1 <= val <= 18:
-                r.finish = val
+        # スマホ：馬番→馬名→データベース
+        if re.fullmatch(r"\d+", line):
+            n = int(line)
+            look = lines[idx + 1:idx + 8]
+            if any("のデータベース" in x for x in look) and n in blocks:
+                current_no = n
                 continue
 
-        # 頭数・人気
-        fs = re.search(r"(\d+)頭", line)
-        if fs:
-            # field_sizeは今回は保持しないが、人気抽出の補助に使える
-            pass
-        pop = re.search(r"(\d+)人気", line)
-        if pop:
-            r.popularity = int(pop.group(1))
+        # PC：枠 馬番
+        m = re.match(r"^\d+\s+(\d+)$", line)
+        if m:
+            n = int(m.group(1))
+            if n in blocks:
+                current_no = n
+                continue
 
-        # 距離・馬場・タイム
-        md = re.search(r"(芝|ダ|ダート)(\d{3,4})", line)
-        if md:
-            r.surface = "ダ" if md.group(1) in ["ダ", "ダート"] else "芝"
-            r.distance = int(md.group(2))
-        for c in ["稍重", "不良", "良", "重", "稍"]:
-            if c in line:
-                r.condition = "稍重" if c == "稍" else c
-                break
+        # 馬名そのもの
+        if line in horse_names:
+            current_no = horse_names[line]
+            continue
 
-        # 斤量・馬体重
-        jw = re.search(r"([一-龥ァ-ヴー]{2,6})\s+(\d{2}(?:\.\d)?)", line)
-        if jw and r.jockey == "":
-            r.jockey = jw.group(1)
+        if current_no is not None:
+            blocks[current_no].append(line)
+
+    return blocks
+
+
+def parse_margin_from_lines(lines: list[str]) -> float:
+    for row in lines:
+        if "kg" in row or "頭" in row:
+            continue
+        m = re.search(r"\(([-+]?\d+\.\d+)\)\s*$", row)
+        if m:
             try:
-                r.weight = float(jw.group(2))
-            except Exception:
+                return abs(float(m.group(1)))
+            except:
                 pass
-        bw = re.search(r"(\d{3})kg", line)
-        if bw:
-            r.bodyweight = int(bw.group(1))
-        bd = re.search(r"\(([+-]\d+)\)", line)
-        if bd:
-            try:
-                r.body_diff = int(bd.group(1))
-            except Exception:
-                pass
+    return 99.0
 
-        # 着差：相手名(0.3) など
-        mg = re.search(r"\((\d+\.\d)\)\s*$", line)
-        if mg:
-            try:
-                r.margin = float(mg.group(1))
-            except Exception:
-                pass
 
-        # 通過順位：- 1 1 1 / 4-5 / 3-3-4-3
-        ml = re.search(r"-\s*(\d+\s+\d+\s+\d+)", line)
-        if ml:
-            r.passing = ml.group(1).replace(" ", "-")
-        else:
-            mp = re.search(r"(\d+(?:-\d+)+)", line)
-            if mp and not re.search(r"\d{4}\.\d{2}\.\d{2}", line):
-                r.passing = mp.group(1)
+def parse_passing_from_lines(lines: list[str]) -> str:
+    for row in lines:
+        m = re.search(r"-\s*(\d+)\s+(\d+)\s+(\d+)", row)
+        if m:
+            return "-".join(m.groups())
 
-    for h in horses:
-        h.races = h.races[:9]
+        m = re.search(r"(\d+(?:-\d+)+)\s+\(", row)
+        if m:
+            return m.group(1)
+
+        # 地方の 7 5 5 5
+        if re.fullmatch(r"\d+\s+\d+\s+\d+\s+\d+", row):
+            return "-".join(re.findall(r"\d+", row))
+
+    return ""
+
+
+def parse_finish_from_local_race(lines: list[str]) -> int:
+    for row in lines[1:8]:
+        if re.fullmatch(r"\d+", row):
+            v = int(row)
+            if 1 <= v <= 30:
+                return v
+    return 99
+
+
+def parse_past_performances(text: str, horses: list[Horse]) -> list[Horse]:
+    blocks = split_past_blocks(text, horses)
+    horse_map = {h.number: h for h in horses}
+
+    for no, block in blocks.items():
+        races = []
+
+        for i, line in enumerate(block):
+            # 中央PC例: 2026.06.07 東京5
+            jra = re.match(r"^(\d{4}\.\d{2}\.\d{2})\s+(.+?)(\d+|中)$", line)
+            # 地方スマホ例: 06/02  船橋 1R
+            local = re.match(r"^(\d{2}/\d{2})\s+(.+?)\s+\d+R", line)
+
+            if not jra and not local:
+                continue
+
+            race_lines = block[i:i + 22]
+            race_text = " ".join(race_lines)
+            r = RaceRecord(raw=race_text)
+
+            if jra:
+                r.date = jra.group(1)
+                r.place = re.sub(r"\d+$", "", jra.group(2)).strip()
+                fin_raw = jra.group(3)
+                if fin_raw.isdigit():
+                    r.finish = int(fin_raw)
+            else:
+                r.date = local.group(1)
+                r.place = local.group(2).strip()
+                r.finish = parse_finish_from_local_race(race_lines)
+
+            dm = re.search(r"(芝|ダ)(\d+)", race_text)
+            if dm:
+                r.surface = dm.group(1)
+                r.distance = int(dm.group(2))
+
+            if "不良" in race_text:
+                r.condition = "不良"
+            elif "稍" in race_text or "稍重" in race_text:
+                r.condition = "稍重"
+            elif "重" in race_text:
+                r.condition = "重"
+            elif "良" in race_text:
+                r.condition = "良"
+
+            pm = re.search(r"(\d+)人気", race_text)
+            if pm:
+                r.popularity = int(pm.group(1))
+
+            fs = re.search(r"(\d+)頭", race_text)
+            if fs:
+                r.field_size = int(fs.group(1))
+
+            wm = re.search(r"\b(\d{2}(?:\.\d)?)\b", race_text)
+            if wm:
+                try:
+                    w = float(wm.group(1))
+                    if 45 <= w <= 65:
+                        r.weight = w
+                except:
+                    pass
+
+            bw = re.search(r"(\d{3})kg", race_text)
+            if bw:
+                r.bodyweight = int(bw.group(1))
+
+            r.margin = parse_margin_from_lines(race_lines)
+            r.passing = parse_passing_from_lines(race_lines)
+
+            # 騎手
+            for row in race_lines:
+                if re.match(r"^[ァ-ヴ一-龥]{2,6}$", row):
+                    r.jockey = row
+                    break
+
+            races.append(r)
+
+        horse = horse_map.get(no)
+        if horse:
+            horse.races = races[:9]
+
     return horses
 
 
-# ==============================
-# 評価エンジン
-# ==============================
+def parse_manual_numbers(text: str) -> list[int]:
+    return [int(x) for x in re.findall(r"\d+", text or "")]
 
-def get_style(horse: Horse) -> str:
-    positions = []
+
+def running_style_from_races(horse: Horse) -> str:
+    front = 0
+    stalk = 0
+    close = 0
+    rear = 0
+
     for r in horse.races[:5]:
         nums = re.findall(r"\d+", r.passing or "")
         if not nums:
             continue
-        positions.append(int(nums[0]))
-    if not positions:
+        pos = int(nums[0])
+        if pos <= 2:
+            front += 1
+        elif pos <= 5:
+            stalk += 1
+        elif pos <= 9:
+            close += 1
+        else:
+            rear += 1
+
+    mx = max(front, stalk, close, rear)
+    if mx == 0:
         return "不明"
-    avg = sum(positions) / len(positions)
-    if avg <= 2.5:
+    if mx == front:
         return "逃げ"
-    if avg <= 5:
+    if mx == stalk:
         return "先行"
-    if avg <= 9:
+    if mx == close:
         return "差し"
     return "追込"
 
 
-def eval_recent(h: Horse) -> int:
+def evaluate_horse(horse: Horse, good_frames: list[int], good_track_horses: list[int], condition: str):
     score = 0
-    recent = h.races[:5]
-    if not recent:
-        return 0
-    for idx, r in enumerate(recent):
-        weight = 1.4 if idx < 3 else 1.0
-        base = 0
+    reasons = []
+    cautions = []
+    races = horse.races[:9]
+    recent3 = races[:3]
+    recent5 = races[:5]
+
+    # 近走評価
+    recent_score = 0
+    for r in recent3:
         if r.finish == 1:
-            base = 10
+            recent_score += 12
         elif r.finish == 2:
-            base = 8
+            recent_score += 9
         elif r.finish == 3:
-            base = 6
+            recent_score += 7
         elif r.finish <= 5:
-            base = 4
+            recent_score += 4
         elif r.finish <= 8:
-            base = 2
-        if r.margin <= 0.2:
-            base += 4
-        elif r.margin <= 0.5:
-            base += 2
-        elif r.margin <= 1.0:
-            base += 1
-        score += int(base * weight)
-    if score >= 35:
-        h.reasons.append("近走内容◎")
-    elif score >= 22:
-        h.reasons.append("近走安定")
-    return score
+            recent_score += 2
+    score += recent_score
+    if recent_score >= 22:
+        reasons.append("近3走内容◎")
+    elif recent_score >= 12:
+        reasons.append("近3走安定")
 
-
-def eval_aptitude(h: Horse, current: Dict[str, object], track_condition: str, good_track: List[int]) -> int:
-    score = 0
-    cur_dist = int(current.get("distance") or 0)
-    cur_place = str(current.get("place") or "")
-    cur_surface = str(current.get("surface") or "")
-
-    same_dist = near_dist = dist_good = 0
-    same_place = place_good = 0
-    same_cond = cond_good = 0
-    same_surface = surface_good = 0
-
-    for r in h.races:
-        if cur_dist and r.distance:
-            if abs(r.distance - cur_dist) <= 100:
-                same_dist += 1
-                if r.finish <= 3:
-                    dist_good += 1
-            elif abs(r.distance - cur_dist) <= 200:
-                near_dist += 1
-        if cur_place and r.place == cur_place:
-            same_place += 1
-            if r.finish <= 3:
-                place_good += 1
-        if track_condition and r.condition == track_condition:
-            same_cond += 1
-            if r.finish <= 3:
-                cond_good += 1
-        if cur_surface and r.surface == cur_surface:
-            same_surface += 1
-            if r.finish <= 3:
-                surface_good += 1
-
-    if same_dist >= 2:
-        score += 8 + dist_good * 3
-        h.reasons.append("距離適性")
-    elif near_dist >= 2:
+    # 9走安定
+    in3 = sum(1 for r in races if r.finish <= 3)
+    in5 = sum(1 for r in races if r.finish <= 5)
+    if in3 >= 4:
+        score += 10
+        reasons.append("複勝圏実績多い")
+    elif in3 >= 2:
         score += 5
-        h.reasons.append("近い距離経験")
-
-    if same_place >= 2:
-        score += 6 + place_good * 3
-        h.reasons.append("コース適性")
-    elif same_place == 1 and place_good:
+    if in5 >= 6:
+        score += 8
+        reasons.append("掲示板安定")
+    elif in5 >= 4:
         score += 4
 
-    if same_cond >= 2:
-        score += 5 + cond_good * 3
-        h.reasons.append("馬場適性")
+    # 着差
+    margin_score = 0
+    for r in recent5:
+        if r.margin <= 0.2:
+            margin_score += 5
+        elif r.margin <= 0.5:
+            margin_score += 3
+        elif r.margin <= 1.0:
+            margin_score += 1
+    score += margin_score
+    if margin_score >= 10:
+        reasons.append("着差優秀")
+    elif margin_score >= 5:
+        reasons.append("大きく負けていない")
 
-    if same_surface >= 3:
-        score += min(8, surface_good * 2 + 2)
-
-    if h.number in good_track:
-        score += 8
-        h.reasons.append("手入力:馬場得意")
-
-    return score
-
-
-def eval_pace(h: Horse, track_condition: str, good_frames: List[int]) -> int:
-    score = 0
-    h.style = get_style(h)
+    # 脚質・位置取り
+    style = running_style_from_races(horse)
+    horse.style = style
     front_count = 0
-    for r in h.races[:5]:
+    for r in recent5:
         nums = re.findall(r"\d+", r.passing or "")
         if nums and int(nums[0]) <= 3:
             front_count += 1
-
-    if h.style == "逃げ":
-        score += 10
-        h.reasons.append("逃げ脚質")
-    elif h.style == "先行":
-        score += 8
-        h.reasons.append("先行力")
-    elif h.style == "差し":
-        score += 4
-    elif h.style == "追込":
-        score += 1
-        h.cautions.append("展開待ち")
-
     if front_count >= 3:
+        score += 10
+        reasons.append("先行力◎")
+    elif front_count >= 2:
         score += 6
-        h.reasons.append("近走前目")
+        reasons.append("前目で運べる")
 
-    if track_condition in ["重", "不良"]:
-        if h.style == "逃げ":
-            score += 8
-            h.reasons.append("重不良前残り")
-        elif h.style == "先行":
-            score += 5
-            h.reasons.append("重不良先行")
-
-    if h.frame in good_frames:
+    # 馬場状態
+    same_cond = [r for r in races if r.condition == condition]
+    same_cond_good = sum(1 for r in same_cond if r.finish <= 3)
+    if horse.number in good_track_horses:
+        score += 8
+        reasons.append("手入力:馬場適性")
+    if len(same_cond) >= 2 and same_cond_good >= 1:
         score += 5
-        h.reasons.append("有利枠")
-
-    return score
-
-
-def eval_bonus(h: Horse) -> int:
-    score = 0
-    # 人気以上に走った実績
-    for r in h.races[:5]:
-        if r.popularity >= 7 and r.finish <= 3:
+        reasons.append(f"{condition}馬場実績")
+    if condition in ["重", "不良"]:
+        if style == "逃げ":
+            score += 7
+            reasons.append(f"{condition}馬場×逃げ")
+        elif style == "先行":
             score += 5
-        elif r.popularity >= 10 and r.finish <= 5:
-            score += 4
-    if score >= 6:
-        h.reasons.append("人気以上に好走歴")
+            reasons.append(f"{condition}馬場×先行")
 
-    # 騎手継続
-    if h.races and h.jockey and h.races[0].jockey and h.jockey == h.races[0].jockey:
+    # 枠
+    if horse.frame in good_frames:
+        score += 5
+        reasons.append("有利枠")
+
+    # 人気妙味
+    if 4 <= horse.popularity <= 6:
         score += 4
-        h.reasons.append("継続騎乗")
+        reasons.append("相手妙味")
+    elif 7 <= horse.popularity <= 9:
+        score += 6
+        reasons.append("穴妙味")
 
-    # 馬体重変動注意だけ
-    if h.races and abs(h.races[0].body_diff) >= 15:
-        h.cautions.append("前走馬体重変動大")
+    # 人気以上好走歴
+    upset = 0
+    for r in races:
+        if r.popularity >= 6 and r.finish <= 3:
+            upset += 1
+    if upset >= 2:
+        score += 8
+        reasons.append("人気以上の好走歴")
+    elif upset == 1:
+        score += 4
 
-    return score
+    # 注意
+    if len(recent3) >= 2 and all(r.finish >= 10 for r in recent3[:2]):
+        cautions.append("近2走二桁")
+    if not races:
+        cautions.append("馬柱読み取り不足")
+
+    horse.score = score
+    horse.reasons = reasons
+    horse.cautions = cautions
+    return horse
 
 
-def evaluate_all(horses: List[Horse], current: Dict[str, object], track_condition: str, good_frames: List[int], good_track: List[int]) -> List[Horse]:
+def run_scoring(horses: list[Horse], good_frames: list[int], good_track_horses: list[int], condition: str):
     for h in horses:
-        h.reasons = []
-        h.cautions = []
-        h.recent_score = eval_recent(h)
-        h.aptitude_score = eval_aptitude(h, current, track_condition, good_track)
-        h.pace_score = eval_pace(h, track_condition, good_frames)
-        h.bonus_score = eval_bonus(h)
-        # 馬柱重視：近走45%、適性30%、脚質展開20%、補助5%
-        h.total = h.recent_score + h.aptitude_score + h.pace_score + h.bonus_score
-        if h.popularity >= 10:
-            h.cautions.append("10番人気以下は原則消し")
+        evaluate_horse(h, good_frames, good_track_horses, condition)
     return horses
 
 
-# ==============================
-# 予想ロジック
-# ==============================
+def select_marks(horses: list[Horse]):
+    # 10番人気以下は基本消し
+    usable = [h for h in horses if h.popularity <= 9]
+    top3 = [h for h in usable if h.popularity <= 3]
 
-def make_marks(horses: List[Horse]) -> Dict[str, Horse]:
     marks = {}
-    top3 = sorted([h for h in horses if h.popularity <= 3], key=lambda x: x.total, reverse=True)
-    if not top3:
-        top3 = sorted(horses, key=lambda x: x.total, reverse=True)[:3]
-    if not top3:
-        return marks
-    axis = top3[0]
-    axis.mark = "◎"
+    if top3:
+        axis = sorted(top3, key=lambda h: h.score, reverse=True)[0]
+    elif usable:
+        axis = sorted(usable, key=lambda h: h.score, reverse=True)[0]
+    else:
+        return marks, [], horses
+
     marks["◎"] = axis
 
-    remain = [h for h in horses if h.number != axis.number and h.popularity <= 9]
-    remain = sorted(remain, key=lambda x: x.total, reverse=True)
-    labels = ["〇", "▲", "△", "☆"]
-    for label, h in zip(labels, remain[:4]):
-        h.mark = label
-        marks[label] = h
-    return marks
+    remain = [h for h in usable if h.number != axis.number]
+    remain = sorted(remain, key=lambda h: h.score, reverse=True)
+
+    for mark, horse in zip(["〇", "▲", "△", "☆"], remain[:4]):
+        marks[mark] = horse
+
+    cut = [h for h in horses if h.popularity >= 10]
+    return marks, remain, cut
 
 
-def ability_rank(horses: List[Horse]) -> List[Horse]:
-    return sorted(horses, key=lambda x: x.total, reverse=True)
-
-
-def cut_horses(horses: List[Horse]) -> List[Horse]:
-    return sorted([h for h in horses if h.popularity >= 10], key=lambda x: x.popularity)
-
-
-def hole_rank(horses: List[Horse]) -> List[Horse]:
-    return sorted([h for h in horses if 4 <= h.popularity <= 9], key=lambda x: x.total, reverse=True)
-
-
-def make_bets(marks: Dict[str, Horse]) -> Dict[str, List[str]]:
+def make_bets(marks: dict):
     bets = {"馬連": [], "ワイド": [], "3連単": []}
+
     if "◎" not in marks:
         return bets
+
     a = marks["◎"].number
 
-    for label in ["〇", "▲", "△"]:
-        if label in marks:
-            bets["馬連"].append(f"{a}-{marks[label].number}")
+    for m in ["〇", "▲", "△"]:
+        if m in marks:
+            bets["馬連"].append(f"{a}-{marks[m].number}")
 
-    for label in ["▲", "△"]:
-        if label in marks:
-            bets["ワイド"].append(f"{a}-{marks[label].number}")
+    for m in ["▲", "△"]:
+        if m in marks:
+            bets["ワイド"].append(f"{a}-{marks[m].number}")
     if "▲" in marks and "△" in marks:
         bets["ワイド"].append(f"{marks['▲'].number}-{marks['△'].number}")
 
-    if all(k in marks for k in ["◎", "〇", "▲"]):
-        o = marks["〇"].number
+    if "〇" in marks and "▲" in marks:
+        b = marks["〇"].number
         c = marks["▲"].number
-        bets["3連単"].extend([f"{a}→{o}→{c}", f"{a}→{c}→{o}"])
-    if all(k in marks for k in ["◎", "〇", "△"]):
-        o = marks["〇"].number
+        bets["3連単"].extend([f"{a}→{b}→{c}", f"{a}→{c}→{b}", f"{b}→{a}→{c}", f"{c}→{a}→{b}"])
+
+    if "△" in marks and "〇" in marks and "▲" in marks:
+        b = marks["〇"].number
+        c = marks["▲"].number
         d = marks["△"].number
-        bets["3連単"].extend([f"{a}→{o}→{d}", f"{a}→{d}→{o}"])
-    if all(k in marks for k in ["◎", "〇", "▲"]):
-        o = marks["〇"].number
-        c = marks["▲"].number
-        bets["3連単"].extend([f"{o}→{a}→{c}", f"{c}→{a}→{o}"])
+        bets["3連単"].extend([f"{a}→{b}→{d}", f"{a}→{c}→{d}", f"{a}→{d}→{b}", f"{a}→{d}→{c}"])
+
     return bets
 
 
-def grade(h: Horse) -> str:
-    if h.total >= 70:
+def grade(score: int) -> str:
+    if score >= 55:
         return "S"
-    if h.total >= 55:
+    if score >= 42:
         return "A"
-    if h.total >= 40:
+    if score >= 30:
         return "B"
-    if h.total >= 25:
+    if score >= 18:
         return "C"
     return "D"
 
 
-def comment(h: Horse) -> str:
-    if not h.reasons:
+def comment(horse: Horse) -> str:
+    if not horse.reasons:
         return "強調材料は少なめ。"
-    return " / ".join(h.reasons[:5])
+    return " / ".join(horse.reasons[:5])
 
 
-# ==============================
-# Streamlit UI
-# ==============================
+def race_type(horses: list[Horse]) -> str:
+    ranked = sorted(horses, key=lambda h: h.score, reverse=True)
+    if len(ranked) < 3:
+        return "判定不可"
+    diff = ranked[0].score - ranked[2].score
+    if diff >= 20:
+        return "本命寄り"
+    if diff >= 10:
+        return "やや荒れ"
+    return "混戦・荒れ注意"
 
-st.title("競馬AI2.0")
-st.caption("出走表・馬柱9走・有利枠・馬場得意馬だけで予想するシンプル版")
 
-if "clear_count" not in st.session_state:
-    st.session_state.clear_count = 0
-if st.button("🗑️ 入力内容をクリア"):
-    st.session_state.clear_count += 1
-
-col1, col2 = st.columns(2)
-with col1:
-    racecard_text = st.text_area("① 出走表を貼り付け", height=430, key=f"race_{st.session_state.clear_count}")
-with col2:
-    past_text = st.text_area("② 馬柱9走を貼り付け", height=430, key=f"past_{st.session_state.clear_count}")
-
-col3, col4 = st.columns(2)
-with col3:
-    good_frame_text = st.text_input("③ 有利枠（例：1,3,8）", key=f"frame_{st.session_state.clear_count}")
-with col4:
-    good_track_text = st.text_input("④ 今回の馬場状態が得意な馬番（例：2,7,11）", key=f"track_{st.session_state.clear_count}")
-
-track_condition = st.selectbox("馬場状態", ["良", "稍重", "重", "不良"])
-
-if st.button("予想開始"):
-    good_frames = parse_number_list(good_frame_text)
-    good_track = parse_number_list(good_track_text)
-    current = parse_current_condition(racecard_text + "\n" + past_text)
-
+if st.button("AI予想開始"):
     horses = parse_racecard(racecard_text)
+
     if not horses:
-        st.error("出走表を読み取れませんでした。出走表を少し広めにコピーしてください。")
+        st.error("出走表を読み取れませんでした。コピー範囲を広めにして再度貼ってください。")
         st.stop()
 
     horses = parse_past_performances(past_text, horses)
-    horses = evaluate_all(horses, current, track_condition, good_frames, good_track)
-    marks = make_marks(horses)
+
+    good_frames = parse_manual_numbers(good_frame_text)
+    good_track_horses = parse_manual_numbers(good_track_text)
+
+    horses = run_scoring(horses, good_frames, good_track_horses, track_condition)
+    marks, ranking, cut = select_marks(horses)
     bets = make_bets(marks)
-    ability = ability_rank(horses)
-    holes = hole_rank(horses)
-    cuts = cut_horses(horses)
+    ability = sorted(horses, key=lambda h: h.score, reverse=True)
+    holes = [h for h in ability if 4 <= h.popularity <= 9]
 
     st.success(f"{len(horses)}頭を読み取りました。")
-    st.write(f"馬場状態：{track_condition}")
-    if current.get("place") or current.get("distance"):
-        st.caption(f"推定条件：{current.get('place','')} {current.get('surface','')}{current.get('distance','')}m")
+    st.info(f"レース判定：{race_type(horses)}")
 
     st.header("AI印")
-    for label in ["◎", "〇", "▲", "△", "☆"]:
-        if label not in marks:
+
+    for m in ["◎", "〇", "▲", "△", "☆"]:
+        if m not in marks:
             continue
-        h = marks[label]
-        st.markdown(f"### {label} {h.number} {h.name}｜{h.popularity}番人気｜能力{h.total}｜ランク{grade(h)}")
+        h = marks[m]
+        st.markdown(f"### {m} {h.number} {h.name}｜{h.popularity}番人気｜評価{grade(h.score)}｜{h.score}点")
         st.write(comment(h))
         if h.cautions:
-            st.caption("注意: " + " / ".join(h.cautions))
+            st.warning(" / ".join(h.cautions))
 
     st.divider()
-    st.header("買い目")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.subheader("馬連")
-        st.code(" / ".join(bets["馬連"]) if bets["馬連"] else "なし")
-    with c2:
-        st.subheader("ワイド")
-        st.code(" / ".join(bets["ワイド"]) if bets["ワイド"] else "なし")
-    with c3:
-        st.subheader("3連単")
-        st.code(" / ".join(bets["3連単"]) if bets["3連単"] else "なし")
 
-    st.divider()
     st.header("能力ランキング")
     for i, h in enumerate(ability, 1):
-        st.write(
-            f"{i}位　{h.number} {h.name}｜{h.popularity}番人気｜能力{h.total}｜"
-            f"近走{h.recent_score} / 適性{h.aptitude_score} / 展開{h.pace_score} / 補助{h.bonus_score}｜脚質{h.style}"
-        )
-        if h.reasons:
-            st.caption(" / ".join(h.reasons))
-        if h.cautions:
-            st.caption("注意: " + " / ".join(h.cautions))
+        st.write(f"{i}位　{h.number} {h.name}｜{h.popularity}番人気｜{h.score}点｜脚質:{h.style}")
+        with st.expander(f"{h.number} {h.name} の評価理由"):
+            st.write(comment(h))
+            if h.cautions:
+                st.warning(" / ".join(h.cautions))
+            st.write(f"読み取った過去走：{len(h.races)}走")
 
     st.divider()
+
     st.header("穴候補（4〜9番人気）")
-    if holes:
-        for h in holes[:5]:
-            st.write(f"{h.number} {h.name}｜{h.popularity}番人気｜能力{h.total}｜{comment(h)}")
-    else:
-        st.write("穴候補なし")
+    for h in holes[:5]:
+        st.write(f"{h.number} {h.name}｜{h.popularity}番人気｜{h.score}点｜{comment(h)}")
 
     st.divider()
-    st.header("消し馬（10番人気以下）")
-    if cuts:
-        for h in cuts:
-            st.write(f"{h.number} {h.name}｜{h.popularity}番人気｜能力{h.total}")
-    else:
-        st.write("消し馬なし")
 
-    with st.expander("読み取り確認：馬柱レース数"):
-        for h in horses:
-            st.write(f"{h.number} {h.name}: {len(h.races)}走")
+    st.header("消し馬（10番人気以下）")
+    if cut:
+        for h in cut:
+            st.write(f"{h.number} {h.name}｜{h.popularity}番人気")
+    else:
+        st.write("なし")
+
+    st.divider()
+
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        st.subheader("馬連")
+        for b in bets["馬連"]:
+            st.code(b)
+
+    with c2:
+        st.subheader("ワイド")
+        for b in bets["ワイド"]:
+            st.code(b)
+
+    with c3:
+        st.subheader("3連単")
+        for b in bets["3連単"]:
+            st.code(b)
