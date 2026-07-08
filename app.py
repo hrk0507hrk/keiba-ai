@@ -843,7 +843,7 @@ def grade(score: int) -> str:
 def comment(horse: Horse) -> str:
     if not horse.reasons:
         return "強調材料は少なめ。"
-    return " / ".join(horse.reasons[:5])
+    return " / ".join(horse.reasons)
 
 
 def race_type(horses: list[Horse]) -> str:
