@@ -712,15 +712,29 @@ def evaluate_horse(horse: Horse, good_frames: list[int], good_track_horses: list
         score += 6
         reasons.append("前目で運べる")
 
-    # 馬場状態
-    same_cond = [r for r in races if r.condition == condition]
-    same_cond_good = sum(1 for r in same_cond if r.finish <= 3)
-    if horse.number in good_track_horses:
+    # 枠・馬場適性
+    frame_bonus = horse.frame in good_frames
+    track_bonus = horse.number in good_track_horses
+
+    if frame_bonus:
+        score += 5
+        reasons.append("有利枠")
+
+    if track_bonus:
         score += 8
         reasons.append("手入力:馬場適性")
+
+    if frame_bonus and track_bonus:
+        score += 8
+        reasons.append("有利枠×馬場適性")
+
+    same_cond = [r for r in races if r.condition == condition]
+    same_cond_good = sum(1 for r in same_cond if r.finish <= 3)
+
     if len(same_cond) >= 2 and same_cond_good >= 1:
         score += 5
         reasons.append(f"{condition}馬場実績")
+
     if condition in ["重", "不良"]:
         if style == "逃げ":
             score += 7
@@ -728,11 +742,6 @@ def evaluate_horse(horse: Horse, good_frames: list[int], good_track_horses: list
         elif style == "先行":
             score += 5
             reasons.append(f"{condition}馬場×先行")
-
-    # 枠
-    if horse.frame in good_frames:
-        score += 5
-        reasons.append("有利枠")
 
     # 人気妙味
     if 4 <= horse.popularity <= 6:
