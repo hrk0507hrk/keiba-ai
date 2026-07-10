@@ -640,6 +640,146 @@ def running_style_from_races(horse: Horse) -> str:
     return "追込"
 
 
+
+def evaluate_upper_class_record(horse: Horse):
+    """
+    馬柱9走のraw文字列から上級クラス・重賞実績を評価。
+    同じレースで複数条件が重複しないよう、各走で最上位の評価だけを採用する。
+    """
+    score = 0
+    reasons = []
+    graded_good = 0
+    open_good = 0
+    upper_local_good = 0
+    central_upper_good = 0
+
+    for r in horse.races[:9]:
+        text = (r.raw or "").upper()
+        finish = r.finish
+
+        race_score = 0
+        race_reason = ""
+
+        # G1 / Jpn1
+        if any(k in text for k in ["G1", "GⅠ", "JPN1", "JPNⅠ"]):
+            if finish <= 3:
+                race_score = 20
+                race_reason = "G1・Jpn1好走"
+                graded_good += 1
+            elif finish <= 5:
+                race_score = 12
+                race_reason = "G1・Jpn1掲示板"
+            else:
+                race_score = 6
+                race_reason = "G1・Jpn1出走歴"
+
+        # G2 / Jpn2
+        elif any(k in text for k in ["G2", "GⅡ", "JPN2", "JPNⅡ"]):
+            if finish <= 3:
+                race_score = 16
+                race_reason = "G2・Jpn2好走"
+                graded_good += 1
+            elif finish <= 5:
+                race_score = 10
+                race_reason = "G2・Jpn2掲示板"
+            else:
+                race_score = 5
+                race_reason = "G2・Jpn2出走歴"
+
+        # G3 / Jpn3
+        elif any(k in text for k in ["G3", "GⅢ", "JPN3", "JPNⅢ"]):
+            if finish <= 3:
+                race_score = 14
+                race_reason = "G3・Jpn3好走"
+                graded_good += 1
+            elif finish <= 5:
+                race_score = 8
+                race_reason = "G3・Jpn3掲示板"
+            else:
+                race_score = 4
+                race_reason = "G3・Jpn3出走歴"
+
+        # オープン・リステッド
+        elif any(k in text for k in ["オープン", "OPEN", "リステッド", "LISTED", " OP ", " L "]):
+            if finish <= 3:
+                race_score = 10
+                race_reason = "オープン・L好走"
+                open_good += 1
+            elif finish <= 5:
+                race_score = 6
+                race_reason = "オープン・L掲示板"
+            else:
+                race_score = 3
+                race_reason = "オープン・L出走歴"
+
+        # 地方A級・S級
+        elif any(k in text for k in ["A1", "A2", "Ｓ１", "Ｓ２", "S1", "S2"]):
+            if finish <= 3:
+                race_score = 12
+                race_reason = "地方上級クラス好走"
+                upper_local_good += 1
+            elif finish <= 5:
+                race_score = 7
+                race_reason = "地方上級クラス掲示板"
+            else:
+                race_score = 3
+                race_reason = "地方上級クラス出走歴"
+
+        # 中央3勝・2勝・1勝クラス
+        elif any(k in text for k in ["3勝クラス", "３勝クラス", "1600万"]):
+            if finish <= 5:
+                race_score = 10
+                race_reason = "中央3勝クラス実績"
+                central_upper_good += 1
+            else:
+                race_score = 4
+                race_reason = "中央3勝クラス出走歴"
+
+        elif any(k in text for k in ["2勝クラス", "２勝クラス", "1000万"]):
+            if finish <= 5:
+                race_score = 8
+                race_reason = "中央2勝クラス実績"
+                central_upper_good += 1
+            else:
+                race_score = 3
+                race_reason = "中央2勝クラス出走歴"
+
+        elif any(k in text for k in ["1勝クラス", "１勝クラス", "500万"]):
+            if finish <= 5:
+                race_score = 6
+                race_reason = "中央1勝クラス実績"
+                central_upper_good += 1
+            else:
+                race_score = 2
+                race_reason = "中央1勝クラス出走歴"
+
+        score += race_score
+        if race_reason and race_reason not in reasons:
+            reasons.append(race_reason)
+
+    # 実績の厚みを追加評価
+    if graded_good >= 2:
+        score += 10
+        reasons.append("重賞好走実績複数")
+    elif graded_good == 1:
+        score += 5
+        reasons.append("重賞実績")
+
+    if open_good >= 2:
+        score += 5
+        reasons.append("オープン実績複数")
+
+    if upper_local_good >= 2:
+        score += 6
+        reasons.append("地方上級実績複数")
+
+    if central_upper_good >= 2:
+        score += 5
+        reasons.append("中央上級条件実績複数")
+
+    # 上級実績だけで暴走しすぎないよう上限
+    return min(score, 45), reasons
+
 def evaluate_horse(horse: Horse, good_frames: list[int], good_track_horses: list[int], condition: str):
     score = 0
     reasons = []
@@ -742,6 +882,11 @@ def evaluate_horse(horse: Horse, good_frames: list[int], good_track_horses: list
         elif style == "先行":
             score += 5
             reasons.append(f"{condition}馬場×先行")
+
+    # 上級クラス・重賞実績
+    upper_score, upper_reasons = evaluate_upper_class_record(horse)
+    score += upper_score
+    reasons.extend(upper_reasons)
 
     # 人気妙味
     if 4 <= horse.popularity <= 6:
