@@ -68,6 +68,9 @@ class RaceRecord:
     weight: float = 0.0
     bodyweight: int = 0
     field_size: int = 0
+    race_time: str = ""
+    race_time_sec: float = 0.0
+    last3f: float = 0.0
     raw: str = ""
 
 
@@ -90,6 +93,10 @@ class Horse:
     pace_score: int = 0
     value_score: int = 0
     manual_score: int = 0
+    time_score: int = 0
+    closing_score: int = 0
+    best_time_sec: float = 0.0
+    best_last3f: float = 0.0
     total: int = 0
     style: str = ""
     reasons: list[str] = field(default_factory=list)
@@ -482,17 +489,19 @@ def split_past_blocks(text: str, horses: list[Horse]) -> dict[int, list[str]]:
 
 
 def parse_margin_from_lines(lines: list[str]) -> float:
-    for row in lines:
+    for row in reversed(lines):
+        row = row.strip()
         if "kg" in row or "頭" in row:
+            continue
+        if re.match(r"^(?:-?\s*\d|\d+-\d+)", row):
             continue
         m = re.search(r"\(([-+]?\d+\.\d+)\)\s*$", row)
         if m:
             try:
                 return abs(float(m.group(1)))
-            except:
+            except ValueError:
                 pass
     return 99.0
-
 
 def parse_passing_from_lines(lines: list[str]) -> str:
     for row in lines:
@@ -519,6 +528,51 @@ def parse_finish_from_local_race(lines: list[str]) -> int:
                 return v
     return 99
 
+
+def race_time_to_seconds(value: str) -> float:
+    value = (value or "").strip()
+    if not value:
+        return 0.0
+    try:
+        if ":" in value:
+            minute, second = value.split(":", 1)
+            return int(minute) * 60 + float(second)
+        return float(value)
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def parse_race_time_from_lines(lines: list[str]) -> tuple[str, float]:
+    for row in lines:
+        m = re.search(r"(?:芝|ダ)\d+\s+(\d+:\d{2}\.\d|\d{2}\.\d)", row)
+        if m:
+            value = m.group(1)
+            return value, race_time_to_seconds(value)
+    return "", 0.0
+
+
+def parse_last3f_from_lines(lines: list[str]) -> float:
+    for row in lines:
+        row = row.strip()
+        if not (
+            re.search(r"\d+(?:-\d+)+\s+\(\d{2}\.\d\)", row)
+            or re.search(r"-\s*\d+\s+\d+\s+\d+\s+\(\d{2}\.\d\)", row)
+        ):
+            continue
+        m = re.search(r"\((\d{2}\.\d)\)", row)
+        if m:
+            try:
+                return float(m.group(1))
+            except ValueError:
+                pass
+    return 0.0
+
+
+def parse_current_race_conditions(text: str) -> tuple[str, int]:
+    m = re.search(r"(芝|ダ)\s*(\d{3,4})", text or "")
+    if not m:
+        return "", 0
+    return m.group(1), int(m.group(2))
 
 def parse_past_performances(text: str, horses: list[Horse]) -> list[Horse]:
     blocks = split_past_blocks(text, horses)
@@ -588,6 +642,8 @@ def parse_past_performances(text: str, horses: list[Horse]) -> list[Horse]:
 
             r.margin = parse_margin_from_lines(race_lines)
             r.passing = parse_passing_from_lines(race_lines)
+            r.race_time, r.race_time_sec = parse_race_time_from_lines(race_lines)
+            r.last3f = parse_last3f_from_lines(race_lines)
 
             # 騎手
             for row in race_lines:
@@ -640,6 +696,85 @@ def running_style_from_races(horse: Horse) -> str:
     return "追込"
 
 
+
+def choose_target_distance(horses: list[Horse], current_surface: str, current_distance: int) -> tuple[str, int]:
+    if current_surface and current_distance:
+        return current_surface, current_distance
+    counts = {}
+    for horse in horses:
+        for race in horse.races[:3]:
+            if race.surface and race.distance:
+                key = (race.surface, race.distance)
+                counts[key] = counts.get(key, 0) + 1
+    if not counts:
+        return "", 0
+    return max(counts, key=counts.get)
+
+
+def calculate_clock_profiles(horses: list[Horse], current_surface: str, current_distance: int):
+    surface, distance = choose_target_distance(horses, current_surface, current_distance)
+    time_profiles = []
+    closing_profiles = []
+
+    for horse in horses:
+        relevant = [
+            r for r in horse.races[:9]
+            if r.race_time_sec > 0
+            and (not surface or r.surface == surface)
+            and (not distance or abs(r.distance - distance) <= 100)
+        ]
+        horse.best_time_sec = min((r.race_time_sec for r in relevant), default=0.0)
+        horse.best_last3f = min((r.last3f for r in relevant if r.last3f > 0), default=0.0)
+
+        if horse.best_time_sec > 0:
+            time_profiles.append((horse.number, horse.best_time_sec))
+        if horse.best_last3f > 0:
+            closing_profiles.append((horse.number, horse.best_last3f))
+
+    time_profiles.sort(key=lambda x: x[1])
+    closing_profiles.sort(key=lambda x: x[1])
+
+    def rank_points(rank: int, total: int, points: tuple[int, int, int, int]) -> int:
+        if total <= 0:
+            return 0
+        ratio = rank / total
+        if rank == 1:
+            return points[0]
+        if ratio <= 0.25:
+            return points[1]
+        if ratio <= 0.50:
+            return points[2]
+        if ratio <= 0.75:
+            return points[3]
+        return 0
+
+    time_rank = {no: (i + 1, value) for i, (no, value) in enumerate(time_profiles)}
+    closing_rank = {no: (i + 1, value) for i, (no, value) in enumerate(closing_profiles)}
+
+    for horse in horses:
+        horse.time_score = 0
+        horse.closing_score = 0
+
+        if horse.number in time_rank:
+            rank, value = time_rank[horse.number]
+            horse.time_score = rank_points(rank, len(time_profiles), (12, 9, 6, 3))
+            if horse.time_score > 0:
+                horse.reasons.append(f"持ち時計評価({value:.1f}秒) +{horse.time_score}")
+
+        if horse.number in closing_rank:
+            rank, value = closing_rank[horse.number]
+            horse.closing_score = rank_points(rank, len(closing_profiles), (10, 7, 4, 2))
+            if horse.closing_score > 0:
+                horse.reasons.append(f"上がり時計評価({value:.1f}) +{horse.closing_score}")
+
+        recent_last3f = [r.last3f for r in horse.races[:3] if r.last3f > 0]
+        if len(recent_last3f) >= 3 and recent_last3f[0] < recent_last3f[1] < recent_last3f[2]:
+            horse.closing_score += 3
+            horse.reasons.append("上がり時計良化 +3")
+
+        horse.score += horse.time_score + horse.closing_score
+
+    return surface, distance
 
 def evaluate_upper_class_record(horse: Horse):
     """
@@ -1025,6 +1160,12 @@ if st.button("AI予想開始"):
     good_track_horses = parse_manual_numbers(good_track_text)
 
     horses = run_scoring(horses, good_frames, good_track_horses, track_condition)
+
+    current_surface, current_distance = parse_current_race_conditions(racecard_text)
+    clock_surface, clock_distance = calculate_clock_profiles(
+        horses, current_surface, current_distance
+    )
+
     marks, ranking, cut = select_marks(horses)
     bets = make_bets(marks)
     ability = sorted(horses, key=lambda h: h.score, reverse=True)
@@ -1032,12 +1173,16 @@ if st.button("AI予想開始"):
 
     st.success(f"{len(horses)}頭を読み取りました。")
     st.info(f"レース判定：{race_type(horses)}")
+    if clock_surface and clock_distance:
+        st.caption(f"時計比較条件：{clock_surface}{clock_distance}m前後（±100m）")
 
     with st.expander("読み取り確認（馬番・馬名・人気・オッズ）"):
         for h in horses:
             pop_text = "未取得" if h.popularity == 99 else f"{h.popularity}人気"
             odds_text = "-" if h.odds is None else str(h.odds)
-            st.write(f"{h.number} {h.name}｜{pop_text}｜オッズ {odds_text}")
+            time_text = f"{h.best_time_sec:.1f}秒" if h.best_time_sec > 0 else "未取得"
+            last3f_text = f"{h.best_last3f:.1f}" if h.best_last3f > 0 else "未取得"
+            st.write(f"{h.number} {h.name}｜{pop_text}｜オッズ {odds_text}｜持ち時計 {time_text}｜上がり {last3f_text}")
 
     st.header("AI印")
 
@@ -1054,12 +1199,25 @@ if st.button("AI予想開始"):
 
     st.header("能力ランキング")
     for i, h in enumerate(ability, 1):
-        st.write(f"{i}位　{h.number} {h.name}｜{h.popularity}番人気｜{h.score}点｜脚質:{h.style}")
+        st.write(f"{i}位　{h.number} {h.name}｜{h.popularity}番人気｜総合{h.score}点｜時計{h.time_score}点｜上がり{h.closing_score}点｜脚質:{h.style}")
         with st.expander(f"{h.number} {h.name} の評価理由"):
             st.write(comment(h))
             if h.cautions:
                 st.warning(" / ".join(h.cautions))
             st.write(f"読み取った過去走：{len(h.races)}走")
+            clock_rows = []
+            for r in h.races:
+                if r.race_time_sec <= 0 and r.last3f <= 0:
+                    continue
+                clock_rows.append(
+                    f"{r.date} {r.place} {r.surface}{r.distance}m {r.condition}"
+                    f"｜走破 {r.race_time or '-'}"
+                    f"｜上がり {r.last3f if r.last3f > 0 else '-'}"
+                )
+            if clock_rows:
+                st.caption("時計読み取り")
+                for row in clock_rows:
+                    st.write(row)
 
     st.divider()
 
