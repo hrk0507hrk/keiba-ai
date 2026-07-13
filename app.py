@@ -675,13 +675,18 @@ def parse_time_index_best(text: str) -> dict[int, int | None]:
     """
     netkeibaタイム指数表から「最高」だけ取得する。
 
-    今回のコピー形式に対応:
-    1    1
+    地方形式:
+    1 1
     --
-    ウインフルゴラ    牝4    55.0    大畑慧悟    20    10 ...
+    ウインフルゴラ 牝4 55.0 大畑慧悟 20 ...
 
-    つまり、1頭分が複数行に分かれていても、
-    「枠・馬番」行 → 「印」行 → 「馬名以下」行を連結して読む。
+    中央形式:
+    1
+    1
+    --
+    メルキオル 牡4 57.0 Ｊ．コレット 22 ...
+
+    両方に対応する。
     """
     result: dict[int, int | None] = {}
 
@@ -689,22 +694,46 @@ def parse_time_index_best(text: str) -> dict[int, int | None]:
     i = 0
 
     while i < len(raw_lines):
-        # 先頭行が「枠 馬番」
-        m = re.fullmatch(r"(\d+)\s+(\d+)", raw_lines[i])
+        frame = None
+        horse_no = None
+        block_start = None
 
-        if not m:
+        # 地方など「枠 馬番」が同じ行
+        same_line = re.fullmatch(r"(\d+)\s+(\d+)", raw_lines[i])
+        if same_line:
+            frame = int(same_line.group(1))
+            horse_no = int(same_line.group(2))
+            block_start = i
+            j = i + 1
+
+        # 中央など「枠」「馬番」が別行
+        elif (
+            re.fullmatch(r"\d+", raw_lines[i])
+            and i + 1 < len(raw_lines)
+            and re.fullmatch(r"\d+", raw_lines[i + 1])
+        ):
+            frame = int(raw_lines[i])
+            horse_no = int(raw_lines[i + 1])
+            block_start = i
+            j = i + 2
+
+        else:
             i += 1
             continue
 
-        horse_no = int(m.group(2))
-
-        # 次の数行を1頭分として集める
-        block = [raw_lines[i]]
-        j = i + 1
+        block = raw_lines[block_start:j]
 
         while j < len(raw_lines):
-            # 次の馬の「枠 馬番」が来たら終了
+            # 次の地方形式
             if re.fullmatch(r"\d+\s+\d+", raw_lines[j]):
+                break
+
+            # 次の中央形式
+            if (
+                re.fullmatch(r"\d+", raw_lines[j])
+                and j + 1 < len(raw_lines)
+                and re.fullmatch(r"\d+", raw_lines[j + 1])
+            ):
                 break
 
             block.append(raw_lines[j])
@@ -735,7 +764,8 @@ def parse_time_index_best(text: str) -> dict[int, int | None]:
 
         raw_value = parts[best_pos].replace("*", "").strip()
 
-        if raw_value in {"", "-", "--", "―"}:
+        # 「-」「未」などはデータなし
+        if raw_value in {"", "-", "--", "―", "未"}:
             result[horse_no] = None
             i = j
             continue
@@ -745,6 +775,7 @@ def parse_time_index_best(text: str) -> dict[int, int | None]:
             i = j
             continue
 
+        # 小数点以下切り捨て、マイナスは0扱い
         value = int(float(raw_value))
         result[horse_no] = max(value, 0)
 
