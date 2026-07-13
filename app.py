@@ -757,13 +757,13 @@ def calculate_clock_profiles(horses: list[Horse], current_surface: str, current_
 
         if horse.number in time_rank:
             rank, value = time_rank[horse.number]
-            horse.time_score = rank_points(rank, len(time_profiles), (12, 9, 6, 3))
+            horse.time_score = rank_points(rank, len(time_profiles), (20, 16, 12, 6))
             if horse.time_score > 0:
                 horse.reasons.append(f"持ち時計評価({value:.1f}秒) +{horse.time_score}")
 
         if horse.number in closing_rank:
             rank, value = closing_rank[horse.number]
-            horse.closing_score = rank_points(rank, len(closing_profiles), (10, 7, 4, 2))
+            horse.closing_score = rank_points(rank, len(closing_profiles), (16, 12, 8, 4))
             if horse.closing_score > 0:
                 horse.reasons.append(f"上がり時計評価({value:.1f}) +{horse.closing_score}")
 
