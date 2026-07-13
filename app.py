@@ -1083,7 +1083,7 @@ def select_marks(horses: list[Horse]):
     remain = [h for h in usable if h.number != axis.number]
     remain = sorted(remain, key=lambda h: h.score, reverse=True)
 
-    for mark, horse in zip(["〇", "▲", "△", "☆"], remain[:4]):
+    for mark, horse in zip(["〇", "▲", "△", "☆", "注"], remain[:5]):
         marks[mark] = horse
 
     cut = [h for h in horses if h.popularity >= 10]
@@ -1191,7 +1191,7 @@ if st.button("AI予想開始"):
 
     st.header("AI印")
 
-    for m in ["◎", "〇", "▲", "△", "☆"]:
+    for m in ["◎", "〇", "▲", "△", "☆", "注"]:
         if m not in marks:
             continue
         h = marks[m]
