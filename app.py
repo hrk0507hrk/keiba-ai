@@ -774,6 +774,11 @@ def calculate_clock_profiles(horses: list[Horse], current_surface: str, current_
 
         horse.score += horse.time_score + horse.closing_score
 
+        # 持ち時計0点かつ上がり評価4点以下は、時計材料不足として軽く減点
+        if horse.time_score == 0 and horse.closing_score <= 4:
+            horse.score -= 3
+            horse.reasons.append("時計評価不足 -3")
+
     return surface, distance
 
 def evaluate_upper_class_record(horse: Horse):
