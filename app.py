@@ -29,17 +29,24 @@ with col2:
         key=f"past_{st.session_state.clear_count}",
     )
 
+time_index_text = st.text_area(
+    "③ netkeibaタイム指数を貼ってください",
+    height=240,
+    key=f"time_index_{st.session_state.clear_count}",
+    help="使用するのは「最高」の数値だけです。基準未満・データなしは完全消しになります。",
+)
+
 col3, col4 = st.columns(2)
 
 with col3:
     good_frame_text = st.text_input(
-        "③ 有利枠（例：1,3,8）",
+        "④ 有利枠（例：1,3,8）",
         key=f"frames_{st.session_state.clear_count}",
     )
 
 with col4:
     good_track_text = st.text_input(
-        "④ 今回の馬場状態が得意な馬番（例：2,7,11）",
+        "⑤ 今回の馬場状態が得意な馬番（例：2,7,11）",
         key=f"track_horses_{st.session_state.clear_count}",
     )
 
@@ -97,6 +104,9 @@ class Horse:
     closing_score: int = 0
     best_time_sec: float = 0.0
     best_last3f: float = 0.0
+    best_time_index: int | None = None
+    time_index_pass: bool = True
+    time_index_reason: str = ""
     total: int = 0
     style: str = ""
     reasons: list[str] = field(default_factory=list)
@@ -660,6 +670,102 @@ def parse_past_performances(text: str, horses: list[Horse]) -> list[Horse]:
     return horses
 
 
+
+def parse_time_index_best(text: str) -> dict[int, int | None]:
+    """
+    netkeibaタイム指数表から「最高」だけ取得する。
+    想定例:
+    1  1  --  ウインフルゴラ  牝4  55.0  大畑慧悟  20  10 ...
+    """
+    result: dict[int, int | None] = {}
+
+    for raw_line in (text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        # タブ区切りを優先。空欄は除去する。
+        parts = [p.strip() for p in re.split(r"\t+", line) if p.strip()]
+
+        if len(parts) < 8:
+            continue
+
+        # 先頭2列が枠・馬番である行だけ対象
+        if not re.fullmatch(r"\d+", parts[0]) or not re.fullmatch(r"\d+", parts[1]):
+            continue
+
+        horse_no = int(parts[1])
+
+        try:
+            mark_index = parts.index("--")
+        except ValueError:
+            # 印が別文字や空欄でも、4列目以降を馬名開始とみなす保険
+            mark_index = 2
+
+        # 馬名、性齢、斤量、騎手の次が「最高」
+        best_index_pos = mark_index + 5
+
+        if best_index_pos >= len(parts):
+            result[horse_no] = None
+            continue
+
+        raw_value = parts[best_index_pos].replace("*", "").strip()
+
+        if raw_value in {"", "-", "--"}:
+            result[horse_no] = None
+            continue
+
+        m = re.fullmatch(r"-?\d+(?:\.\d+)?", raw_value)
+        if not m:
+            result[horse_no] = None
+            continue
+
+        # 小数点以下は無視。マイナス値は0扱い。
+        value = int(float(raw_value))
+        result[horse_no] = max(value, 0)
+
+    return result
+
+
+def apply_time_index_filter(
+    horses: list[Horse],
+    time_index_map: dict[int, int | None],
+) -> int | None:
+    """
+    最高値と最低値（マイナスは0）の平均を小数点以下切り捨て。
+    基準未満は完全消し。基準と同数は残す。データなしも消す。
+    """
+    valid_values = [
+        value
+        for value in time_index_map.values()
+        if value is not None
+    ]
+
+    if not valid_values:
+        for horse in horses:
+            horse.best_time_index = None
+            horse.time_index_pass = False
+            horse.time_index_reason = "タイム指数データなし"
+        return None
+
+    threshold = int((max(valid_values) + min(valid_values)) / 2)
+
+    for horse in horses:
+        value = time_index_map.get(horse.number)
+        horse.best_time_index = value
+
+        if value is None:
+            horse.time_index_pass = False
+            horse.time_index_reason = "タイム指数データなし"
+        elif value < threshold:
+            horse.time_index_pass = False
+            horse.time_index_reason = f"タイム指数最高{value}（基準{threshold}未満）"
+        else:
+            horse.time_index_pass = True
+            horse.time_index_reason = f"タイム指数最高{value}（基準{threshold}以上）"
+
+    return threshold
+
 def parse_manual_numbers(text: str) -> list[int]:
     return [int(x) for x in re.findall(r"\d+", text or "")]
 
@@ -1066,8 +1172,11 @@ def run_scoring(horses: list[Horse], good_frames: list[int], good_track_horses: 
 
 
 def select_marks(horses: list[Horse]):
-    # 10番人気以下は基本消し
-    usable = [h for h in horses if h.popularity <= 9]
+    # 10番人気以下、またはタイム指数フィルター落ちは完全消し
+    usable = [
+        h for h in horses
+        if h.popularity <= 9 and h.time_index_pass
+    ]
     top3 = [h for h in usable if h.popularity <= 3]
 
     marks = {}
@@ -1086,7 +1195,10 @@ def select_marks(horses: list[Horse]):
     for mark, horse in zip(["〇", "▲", "△", "☆", "注"], remain[:5]):
         marks[mark] = horse
 
-    cut = [h for h in horses if h.popularity >= 10]
+    cut = [
+        h for h in horses
+        if h.popularity >= 10 or not h.time_index_pass
+    ]
     return marks, remain, cut
 
 
@@ -1164,6 +1276,9 @@ if st.button("AI予想開始"):
     good_frames = parse_manual_numbers(good_frame_text)
     good_track_horses = parse_manual_numbers(good_track_text)
 
+    time_index_map = parse_time_index_best(time_index_text)
+    time_index_threshold = apply_time_index_filter(horses, time_index_map)
+
     horses = run_scoring(horses, good_frames, good_track_horses, track_condition)
 
     current_surface, current_distance = parse_current_race_conditions(racecard_text)
@@ -1173,11 +1288,26 @@ if st.button("AI予想開始"):
 
     marks, ranking, cut = select_marks(horses)
     bets = make_bets(marks)
-    ability = sorted(horses, key=lambda h: h.score, reverse=True)
-    holes = [h for h in ability if 4 <= h.popularity <= 9]
+    ability = sorted(
+        [h for h in horses if h.time_index_pass],
+        key=lambda h: h.score,
+        reverse=True,
+    )
+    holes = [
+        h for h in ability
+        if 4 <= h.popularity <= 9
+    ]
 
     st.success(f"{len(horses)}頭を読み取りました。")
-    st.info(f"レース判定：{race_type(horses)}")
+    st.info(f"レース判定：{race_type(ability)}")
+
+    if time_index_threshold is None:
+        st.error("タイム指数の「最高」を読み取れませんでした。全頭が消し判定になります。")
+    else:
+        st.warning(
+            f"タイム指数足切り基準：{time_index_threshold}"
+            "（基準と同数は残し／基準未満・データなしは完全消し）"
+        )
     if clock_surface and clock_distance:
         st.caption(f"時計比較条件：{clock_surface}{clock_distance}m前後（±100m）")
 
@@ -1187,7 +1317,17 @@ if st.button("AI予想開始"):
             odds_text = "-" if h.odds is None else str(h.odds)
             time_text = f"{h.best_time_sec:.1f}秒" if h.best_time_sec > 0 else "未取得"
             last3f_text = f"{h.best_last3f:.1f}" if h.best_last3f > 0 else "未取得"
-            st.write(f"{h.number} {h.name}｜{pop_text}｜オッズ {odds_text}｜持ち時計 {time_text}｜上がり {last3f_text}")
+            index_text = (
+                str(h.best_time_index)
+                if h.best_time_index is not None
+                else "データなし"
+            )
+            filter_text = "残し" if h.time_index_pass else "消し"
+            st.write(
+                f"{h.number} {h.name}｜{pop_text}｜オッズ {odds_text}"
+                f"｜タイム指数最高 {index_text}｜判定 {filter_text}"
+                f"｜持ち時計 {time_text}｜上がり {last3f_text}"
+            )
 
     st.header("AI印")
 
@@ -1195,7 +1335,16 @@ if st.button("AI予想開始"):
         if m not in marks:
             continue
         h = marks[m]
-        st.markdown(f"### {m} {h.number} {h.name}｜{h.popularity}番人気｜評価{grade(h.score)}｜{h.score}点")
+        index_text = (
+            str(h.best_time_index)
+            if h.best_time_index is not None
+            else "データなし"
+        )
+        st.markdown(
+            f"### {m} {h.number} {h.name}｜{h.popularity}番人気"
+            f"｜評価{grade(h.score)}｜{h.score}点"
+            f"｜タイム指数最高 {index_text}"
+        )
         st.write(comment(h))
         if h.cautions:
             st.warning(" / ".join(h.cautions))
@@ -1204,7 +1353,12 @@ if st.button("AI予想開始"):
 
     st.header("能力ランキング")
     for i, h in enumerate(ability, 1):
-        st.write(f"{i}位　{h.number} {h.name}｜{h.popularity}番人気｜総合{h.score}点｜時計{h.time_score}点｜上がり{h.closing_score}点｜脚質:{h.style}")
+        st.write(
+            f"{i}位　{h.number} {h.name}｜{h.popularity}番人気"
+            f"｜総合{h.score}点｜タイム指数最高 {h.best_time_index}"
+            f"｜時計{h.time_score}点｜上がり{h.closing_score}点"
+            f"｜脚質:{h.style}"
+        )
         with st.expander(f"{h.number} {h.name} の評価理由"):
             st.write(comment(h))
             if h.cautions:
@@ -1232,10 +1386,19 @@ if st.button("AI予想開始"):
 
     st.divider()
 
-    st.header("消し馬（10番人気以下）")
+    st.header("完全消し馬")
     if cut:
         for h in cut:
-            st.write(f"{h.number} {h.name}｜{h.popularity}番人気")
+            reasons = []
+            if h.popularity >= 10:
+                reasons.append("10番人気以下")
+            if not h.time_index_pass:
+                reasons.append(h.time_index_reason)
+
+            st.write(
+                f"{h.number} {h.name}｜{h.popularity}番人気"
+                f"｜{' / '.join(reasons)}"
+            )
     else:
         st.write("なし")
 
