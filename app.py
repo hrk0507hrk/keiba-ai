@@ -674,8 +674,10 @@ def parse_past_performances(text: str, horses: list[Horse]) -> list[Horse]:
 def parse_time_index_best(text: str) -> dict[int, int | None]:
     """
     netkeibaタイム指数表から「最高」だけ取得する。
-    想定例:
-    1  1  --  ウインフルゴラ  牝4  55.0  大畑慧悟  20  10 ...
+
+    タブ区切り・空白区切りの両方に対応。
+    例:
+    1 1 -- ウインフルゴラ 牝4 55.0 大畑慧悟 20 10 20 20 -7 18 15 102.1 10
     """
     result: dict[int, int | None] = {}
 
@@ -684,48 +686,54 @@ def parse_time_index_best(text: str) -> dict[int, int | None]:
         if not line:
             continue
 
-        # タブ区切りを優先。空欄は除去する。
-        parts = [p.strip() for p in re.split(r"\t+", line) if p.strip()]
+        # タブ・複数空白のどちらでも分割
+        parts = [p for p in re.split(r"\s+", line) if p]
 
-        if len(parts) < 8:
+        if len(parts) < 7:
             continue
 
-        # 先頭2列が枠・馬番である行だけ対象
-        if not re.fullmatch(r"\d+", parts[0]) or not re.fullmatch(r"\d+", parts[1]):
+        # 先頭2列が「枠」「馬番」の行だけ対象
+        if not re.fullmatch(r"\d+", parts[0]):
+            continue
+        if not re.fullmatch(r"\d+", parts[1]):
             continue
 
         horse_no = int(parts[1])
 
-        try:
-            mark_index = parts.index("--")
-        except ValueError:
-            # 印が別文字や空欄でも、4列目以降を馬名開始とみなす保険
-            mark_index = 2
+        # 性齢（牡4・牝5・セ6等）の位置を探す
+        sex_age_index = None
+        for i, token in enumerate(parts):
+            if re.fullmatch(r"[牡牝セ騸]\d+", token):
+                sex_age_index = i
+                break
 
-        # 馬名、性齢、斤量、騎手の次が「最高」
-        best_index_pos = mark_index + 5
+        if sex_age_index is None:
+            continue
 
-        if best_index_pos >= len(parts):
+        # 性齢 → 斤量 → 騎手 → 最高
+        best_pos = sex_age_index + 3
+
+        if best_pos >= len(parts):
             result[horse_no] = None
             continue
 
-        raw_value = parts[best_index_pos].replace("*", "").strip()
+        raw_value = parts[best_pos].replace("*", "").strip()
 
-        if raw_value in {"", "-", "--"}:
+        # データなし
+        if raw_value in {"", "-", "--", "―"}:
             result[horse_no] = None
             continue
 
-        m = re.fullmatch(r"-?\d+(?:\.\d+)?", raw_value)
-        if not m:
+        # 整数・小数・マイナスに対応
+        if not re.fullmatch(r"-?\d+(?:\.\d+)?", raw_value):
             result[horse_no] = None
             continue
 
-        # 小数点以下は無視。マイナス値は0扱い。
+        # 小数点以下切り捨て、マイナスは0扱い
         value = int(float(raw_value))
         result[horse_no] = max(value, 0)
 
     return result
-
 
 def apply_time_index_filter(
     horses: list[Horse],
@@ -1302,12 +1310,21 @@ if st.button("AI予想開始"):
     st.info(f"レース判定：{race_type(ability)}")
 
     if time_index_threshold is None:
-        st.error("タイム指数の「最高」を読み取れませんでした。全頭が消し判定になります。")
+        st.error("タイム指数の「最高」を読み取れませんでした。貼り付け形式を確認してください。")
     else:
         st.warning(
             f"タイム指数足切り基準：{time_index_threshold}"
             "（基準と同数は残し／基準未満・データなしは完全消し）"
         )
+
+    with st.expander("タイム指数「最高」読み取り確認"):
+        if time_index_map:
+            for no in sorted(time_index_map):
+                value = time_index_map[no]
+                display = "データなし" if value is None else str(value)
+                st.write(f"{no}番｜最高 {display}")
+        else:
+            st.write("読み取り結果なし")
     if clock_surface and clock_distance:
         st.caption(f"時計比較条件：{clock_surface}{clock_distance}m前後（±100m）")
 
