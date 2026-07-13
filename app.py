@@ -224,47 +224,98 @@ def infer_popularity_from_rows(rows: list[str], start: int, end: int, odds):
 
 
 def parse_racecard_pc(lines: list[str]) -> list[Horse]:
+    """
+    PC版の中央・地方両対応。
+
+    対応例:
+    地方:
+    1 1
+    --
+    馬名
+    牝4 54.0 騎手 ... 490(-3) 37.8
+    9
+
+    中央:
+    1
+    1
+    --
+    馬名
+    牡4 57.0 騎手 ...
+    31.4
+    9
+    """
     horses = []
     i = 0
 
     while i < len(lines):
-        m = re.match(r"^(\d+)\s+(\d+)$", lines[i])
-        if not m:
+        frame = None
+        number = None
+        header_end = None
+
+        # 地方など「枠 馬番」が同じ行
+        m_same = re.fullmatch(r"(\d+)\s+(\d+)", lines[i])
+        if m_same:
+            frame = int(m_same.group(1))
+            number = int(m_same.group(2))
+            header_end = i + 1
+
+        # 中央など「枠」「馬番」が別行
+        elif (
+            re.fullmatch(r"\d+", lines[i])
+            and i + 1 < len(lines)
+            and re.fullmatch(r"\d+", lines[i + 1])
+        ):
+            frame = int(lines[i])
+            number = int(lines[i + 1])
+            header_end = i + 2
+
+        else:
             i += 1
             continue
 
-        frame = int(m.group(1))
-        number = int(m.group(2))
+        # 次の馬のヘッダーまでを1頭分ブロックにする
+        j = header_end
+        block = []
 
-        # 馬名行を探す
-        j = i + 1
-        while j < len(lines) and lines[j] == "--":
+        while j < len(lines):
+            # 次の地方形式
+            if j > header_end and re.fullmatch(r"\d+\s+\d+", lines[j]):
+                break
+
+            # 次の中央形式
+            if (
+                j > header_end
+                and re.fullmatch(r"\d+", lines[j])
+                and j + 1 < len(lines)
+                and re.fullmatch(r"\d+", lines[j + 1])
+            ):
+                break
+
+            block.append(lines[j])
             j += 1
 
-        if j >= len(lines):
-            i += 1
-            continue
-
-        name = lines[j].strip()
-
-        if (
-            not name
-            or name == "--"
-            or name == "編集"
-            or re.fullmatch(r"\d+", name)
-            or "人気" in name
-        ):
-            i += 1
-            continue
-
-        # 次の馬番行までを1頭分ブロックとして取得
-        k = j + 1
-        block = []
-        while k < len(lines):
-            if re.match(r"^\d+\s+\d+$", lines[k]):
+        # 「--」の次を馬名とする
+        name = ""
+        for idx, row in enumerate(block):
+            if row == "--" and idx + 1 < len(block):
+                name = block[idx + 1].strip()
                 break
-            block.append(lines[k])
-            k += 1
+
+        # 保険：最初の文字列らしい行
+        if not name:
+            for row in block:
+                if (
+                    row not in {"--", "編集"}
+                    and not re.fullmatch(r"\d+(?:\.\d+)?", row)
+                    and not re.fullmatch(r"\d+", row)
+                    and "人気" not in row
+                ):
+                    name = row.strip()
+                    break
+
+        if not name:
+            i = j
+            continue
 
         block_text = " ".join(block)
 
@@ -274,94 +325,115 @@ def parse_racecard_pc(lines: list[str]) -> list[Horse]:
         weight = 0.0
         bodyweight = 0
 
-        # 地方PC版：
-        # 牝4 54.0 町田直希 川崎 高月賢一 490(-3) 37.8
-        # 9
-        # 編集
-        info_line = block[0] if block else ""
-        info_parts = info_line.split()
-
-        # 斤量
-        for p in info_parts:
-            try:
-                v = float(p)
-                if 45.0 <= v <= 65.0:
-                    weight = v
-                    break
-            except:
-                pass
-
-        # 騎手：斤量の次に来ることが多い
-        for idx, p in enumerate(info_parts):
-            try:
-                v = float(p)
-                if 45.0 <= v <= 65.0 and idx + 1 < len(info_parts):
-                    jockey = info_parts[idx + 1]
-                    break
-            except:
-                pass
-
-        # 馬体重
-        bw = re.search(r"\b(\d{3})\([+-]?\d+\)", info_line)
-        if bw:
-            bodyweight = int(bw.group(1))
-        else:
-            bw = re.search(r"\b(\d{3})kg", info_line)
-            if bw:
-                bodyweight = int(bw.group(1))
-
-        # オッズ：馬体重の後の小数を優先
-        odds_candidates = []
-        for x in re.findall(r"\b(\d+\.\d+)\b", block_text):
-            try:
-                v = float(x)
-                # 斤量を除外
-                if not (45.0 <= v <= 65.0):
-                    odds_candidates.append(v)
-            except:
-                pass
-        if odds_candidates:
-            odds = odds_candidates[-1]  # 地方PC版は最後の小数がオッズになりやすい
-
-        # 人気：オッズ行/情報行の直後にある単独数字を取得
-        # 例：37.8 の次行 9
-        for idx, row in enumerate(block):
-            row = row.strip()
-
-            # 〇人気表記がある場合
-            mp = re.search(r"(\d+)\s*人気", row)
-            if mp:
-                pop = int(mp.group(1))
+        # 性齢行を探す
+        info_line = ""
+        for row in block:
+            if re.search(r"[牡牝セ騸]\d+", row):
+                info_line = row
                 break
 
-            # 情報行にオッズがあり、その次の単独数字が人気
-            if odds is not None and str(odds) in row:
-                for nxt in block[idx + 1:idx + 5]:
-                    nxt = nxt.strip()
-                    if re.fullmatch(r"\d+", nxt):
-                        v = int(nxt)
-                        if 1 <= v <= 30:
-                            pop = v
-                            break
-                if pop != 99:
+        info_parts = info_line.split()
+
+        # 斤量と騎手
+        for idx, token in enumerate(info_parts):
+            try:
+                value = float(token)
+            except ValueError:
+                continue
+
+            if 45.0 <= value <= 65.0:
+                weight = value
+                if idx + 1 < len(info_parts):
+                    jockey = info_parts[idx + 1]
+                break
+
+        # 馬体重
+        bw = re.search(r"\b(\d{3})(?:kg|\([+-]?\d+\))", block_text)
+        if bw:
+            bodyweight = int(bw.group(1))
+
+        # 「31.4 (9人気)」形式
+        pair = re.search(r"(\d+\.\d+)\s*\((\d+)\s*人気\)", block_text)
+        if pair:
+            odds = float(pair.group(1))
+            pop = int(pair.group(2))
+
+        # 「9人気」表記
+        if pop == 99:
+            mp = re.search(r"(\d+)\s*人気", block_text)
+            if mp:
+                pop = int(mp.group(1))
+
+        # オッズ候補：斤量を除外し、最後の妥当な小数を優先
+        if odds is None:
+            decimal_candidates = []
+            for row_idx, row in enumerate(block):
+                for token in re.findall(r"\b(\d+\.\d+)\b", row):
+                    try:
+                        value = float(token)
+                    except ValueError:
+                        continue
+
+                    if 45.0 <= value <= 65.0:
+                        continue
+
+                    # 走破時計や上がりが混ざらない出走表ブロックを想定
+                    if 1.0 <= value <= 999.9:
+                        decimal_candidates.append((row_idx, value))
+
+            if decimal_candidates:
+                odds_row_idx, odds = decimal_candidates[-1]
+            else:
+                odds_row_idx = None
+        else:
+            odds_row_idx = None
+            for idx, row in enumerate(block):
+                if str(odds) in row:
+                    odds_row_idx = idx
                     break
 
-        # さらに保険：ブロック内の「編集」の直前の単独数字を人気扱い
+        # 人気が数字だけの行の場合
         if pop == 99:
-            for idx, row in enumerate(block):
-                if row == "編集" and idx > 0 and re.fullmatch(r"\d+", block[idx - 1].strip()):
-                    v = int(block[idx - 1].strip())
-                    if 1 <= v <= 30:
-                        pop = v
-                        break
+            # まずオッズ行より後の単独数字を探す
+            if odds_row_idx is not None:
+                for row in block[odds_row_idx + 1:odds_row_idx + 6]:
+                    if re.fullmatch(r"\d+", row):
+                        value = int(row)
+                        if 1 <= value <= 30:
+                            pop = value
+                            break
 
-        # 中央PCなど、別形式への保険
-        if pop == 99 or odds is None:
-            o2, p2 = extract_odds_popularity(block_text)
-            if odds is None:
-                odds = o2
+            # 同じ行に「31.4 9」のように並ぶ場合
+            if pop == 99 and odds is not None:
+                same_line = re.search(
+                    rf"{re.escape(str(odds))}\s+(\d+)(?:\s|$)",
+                    block_text,
+                )
+                if same_line:
+                    value = int(same_line.group(1))
+                    if 1 <= value <= 30:
+                        pop = value
+
+            # 最後の保険：「編集」の直前、またはブロック末尾の単独数字
             if pop == 99:
-                pop = p2
+                for idx, row in enumerate(block):
+                    if (
+                        row == "編集"
+                        and idx > 0
+                        and re.fullmatch(r"\d+", block[idx - 1])
+                    ):
+                        value = int(block[idx - 1])
+                        if 1 <= value <= 30:
+                            pop = value
+                            break
+
+            if pop == 99:
+                for row in reversed(block):
+                    if re.fullmatch(r"\d+", row):
+                        value = int(row)
+                        if 1 <= value <= 30:
+                            pop = value
+                            break
 
         horses.append(
             Horse(
@@ -376,7 +448,7 @@ def parse_racecard_pc(lines: list[str]) -> list[Horse]:
             )
         )
 
-        i = k
+        i = j
 
     return horses
 
