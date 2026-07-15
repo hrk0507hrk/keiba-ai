@@ -865,6 +865,7 @@ def apply_time_index_filter(
             h.best_time_index=None
             h.score-=8
             h.time_index_reason="タイム指数データなし -8"
+            h.reasons.append(h.time_index_reason)
         return None
     threshold=int((max(valid)+min(valid))/2)
     for h in horses:
@@ -873,6 +874,7 @@ def apply_time_index_filter(
         if value is None:
             h.score-=8
             h.time_index_reason="タイム指数データなし -8"
+            h.reasons.append(h.time_index_reason)
             continue
         diff=threshold-value
         if diff<=0:
@@ -880,12 +882,15 @@ def apply_time_index_filter(
         elif diff<=5:
             h.score-=5
             h.time_index_reason=f"タイム指数不足 -5（{value}/{threshold}）"
+            h.reasons.append(h.time_index_reason)
         elif diff<=10:
             h.score-=10
             h.time_index_reason=f"タイム指数不足 -10（{value}/{threshold}）"
+            h.reasons.append(h.time_index_reason)
         else:
             h.score-=15
             h.time_index_reason=f"タイム指数不足 -15（{value}/{threshold}）"
+            h.reasons.append(h.time_index_reason)
     return threshold
 
 def parse_manual_numbers(text: str) -> list[int]:
@@ -1399,9 +1404,11 @@ if st.button("AI予想開始"):
     good_track_horses = parse_manual_numbers(good_track_text)
 
     time_index_map = parse_time_index_best(time_index_text)
-    time_index_threshold = apply_time_index_filter(horses, time_index_map)
 
     horses = run_scoring(horses, good_frames, good_track_horses, track_condition)
+
+    # horse.score が作成された後にタイム指数の減点を反映
+    time_index_threshold = apply_time_index_filter(horses, time_index_map)
 
     current_surface, current_distance = parse_current_race_conditions(racecard_text)
     clock_surface, clock_distance = calculate_clock_profiles(
