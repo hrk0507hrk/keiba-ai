@@ -859,39 +859,33 @@ def apply_time_index_filter(
     horses: list[Horse],
     time_index_map: dict[int, int | None],
 ) -> int | None:
-    """
-    最高値と最低値（マイナスは0）の平均を小数点以下切り捨て。
-    基準未満は完全消し。基準と同数は残す。データなしも消す。
-    """
-    valid_values = [
-        value
-        for value in time_index_map.values()
-        if value is not None
-    ]
-
-    if not valid_values:
-        for horse in horses:
-            horse.best_time_index = None
-            horse.time_index_pass = False
-            horse.time_index_reason = "タイム指数データなし"
+    valid=[v for v in time_index_map.values() if v is not None]
+    if not valid:
+        for h in horses:
+            h.best_time_index=None
+            h.score-=8
+            h.time_index_reason="タイム指数データなし -8"
         return None
-
-    threshold = int((max(valid_values) + min(valid_values)) / 2)
-
-    for horse in horses:
-        value = time_index_map.get(horse.number)
-        horse.best_time_index = value
-
+    threshold=int((max(valid)+min(valid))/2)
+    for h in horses:
+        value=time_index_map.get(h.number)
+        h.best_time_index=value
         if value is None:
-            horse.time_index_pass = False
-            horse.time_index_reason = "タイム指数データなし"
-        elif value < threshold:
-            horse.time_index_pass = False
-            horse.time_index_reason = f"タイム指数最高{value}（基準{threshold}未満）"
+            h.score-=8
+            h.time_index_reason="タイム指数データなし -8"
+            continue
+        diff=threshold-value
+        if diff<=0:
+            h.time_index_reason=f"タイム指数最高{value}（基準{threshold}以上）"
+        elif diff<=5:
+            h.score-=5
+            h.time_index_reason=f"タイム指数不足 -5（{value}/{threshold}）"
+        elif diff<=10:
+            h.score-=10
+            h.time_index_reason=f"タイム指数不足 -10（{value}/{threshold}）"
         else:
-            horse.time_index_pass = True
-            horse.time_index_reason = f"タイム指数最高{value}（基準{threshold}以上）"
-
+            h.score-=15
+            h.time_index_reason=f"タイム指数不足 -15（{value}/{threshold}）"
     return threshold
 
 def parse_manual_numbers(text: str) -> list[int]:
@@ -1303,7 +1297,7 @@ def select_marks(horses: list[Horse]):
     # 10番人気以下、またはタイム指数フィルター落ちは完全消し
     usable = [
         h for h in horses
-        if h.popularity <= 9 and h.time_index_pass
+        if h.popularity <= 9
     ]
     top3 = [h for h in usable if h.popularity <= 3]
 
@@ -1325,7 +1319,7 @@ def select_marks(horses: list[Horse]):
 
     cut = [
         h for h in horses
-        if h.popularity >= 10 or not h.time_index_pass
+        if h.popularity >= 10
     ]
     return marks, remain, cut
 
@@ -1417,7 +1411,7 @@ if st.button("AI予想開始"):
     marks, ranking, cut = select_marks(horses)
     bets = make_bets(marks)
     ability = sorted(
-        [h for h in horses if h.time_index_pass],
+        horses,
         key=lambda h: h.score,
         reverse=True,
     )
