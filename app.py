@@ -6,7 +6,7 @@ from itertools import permutations
 
 st.set_page_config(page_title="競馬AI Ver.4.0 馬柱×指数融合版", layout="wide")
 st.title("競馬AI｜Ver.4.0 馬柱×指数融合版")
-st.caption("馬柱70％＋netkeiba指数30％。馬柱で競馬を読み、指数で能力・近況・適性・展開を裏付けます。")
+st.caption("馬柱50％＋netkeiba指数50％。馬柱とタイム指数を同じ比重で評価します。")
 
 if "clear_count" not in st.session_state:
     st.session_state.clear_count = 0
@@ -856,7 +856,7 @@ def _trend_label(data: TimeIndexData) -> tuple[str, int]:
 
 
 def apply_time_index_scoring(horses: list[Horse], index_map: dict[int, TimeIndexData]):
-    """馬柱70％＋指数30％に再配分し、100点満点へ統合する。データなしは減点しない。"""
+    """馬柱50％＋指数50％に再配分し、100点満点へ統合する。データなしは減点しない。"""
     fields = ["highest","avg5","distance","course","start","chase","closing"]
     pools = {f:[getattr(d,f) for d in index_map.values() if getattr(d,f) is not None] for f in fields}
 
@@ -866,72 +866,50 @@ def apply_time_index_scoring(horses: list[Horse], index_map: dict[int, TimeIndex
         h.best_time_index = d.highest
         h.index_labels = []
 
-        # 既存の馬柱点を正式配分へ圧縮：能力30・安定12・適性8・展開4
-        card_ability = round(h.ability_score / 45 * 30)
-        card_stability = round(h.stability_score / 20 * 12)
+        # 馬柱50点：能力22・安定10・適性8・展開5・補助5
+        card_ability = round(h.ability_score / 45 * 22)
+        card_stability = round(h.stability_score / 20 * 10)
         card_suitability = round(h.suitability_score / 20 * 8)
-        card_pace = round(h.pace_score / 10 * 4)
+        card_pace = round(h.pace_score / 10 * 5)
 
-        # 指数配点：能力15（追走6・5走平均5・最高4）
-        ia = (_relative_points(d.chase,pools["chase"],6)
-              + _relative_points(d.avg5,pools["avg5"],5)
-              + _relative_points(d.highest,pools["highest"],4))
+        # 指数50点：能力23（追走9・5走平均8・最高6）
+        ia = (_relative_points(d.chase,pools["chase"],9)
+              + _relative_points(d.avg5,pools["avg5"],8)
+              + _relative_points(d.highest,pools["highest"],6))
 
-        # 安定8（5走平均5・近3走推移3）
+        # 安定10（5走平均6・近3走推移4）
         trend, trend_bonus = _trend_label(d)
         h.index_trend = trend
-        base_stab = _relative_points(d.avg5,pools["avg5"],5)
-        if trend_bonus >= 0:
-            ist = min(8, base_stab + trend_bonus)
-        else:
-            ist = max(0, base_stab + trend_bonus)
+        base_stab = _relative_points(d.avg5,pools["avg5"],6)
+        trend_adjust = {3: 4, 2: 3, 0: 1, -1: -1, -2: -2}.get(trend_bonus, 1)
+        ist = max(0, min(10, base_stab + trend_adjust))
 
         # 適性12（距離6・コース6）
         isu = (_relative_points(d.distance,pools["distance"],6)
                + _relative_points(d.course,pools["course"],6))
 
-        # 展開6（スタート3・上がり3）＋脚質との相性
+        # 展開5（スタート・上がり）＋脚質との相性
         start_p = _relative_points(d.start,pools["start"],3)
         close_p = _relative_points(d.closing,pools["closing"],3)
         if h.style in {"逃げ","先行"}:
-            ip = min(6, start_p + round(close_p*0.35))
+            ip = min(5, start_p + round(close_p*0.35))
         elif h.style in {"差し","追込"}:
-            ip = min(6, close_p + round(start_p*0.35))
+            ip = min(5, close_p + round(start_p*0.35))
         else:
-            ip = min(6, start_p + close_p)
+            ip = min(5, start_p + close_p)
 
         h.index_ability_score = ia
         h.index_stability_score = ist
         h.index_suitability_score = isu
         h.index_pace_score = ip
 
-        # 指数総合点：馬柱とは完全に独立し、指数だけで100点換算。
-        # 欠損項目は0点にせず、取得できた項目の配点だけで再按分する。
-        index_components = [
-            (d.highest,  _relative_points(d.highest,  pools["highest"], 10), 10),
-            (d.avg5,     _relative_points(d.avg5,     pools["avg5"], 20), 20),
-            (d.distance, _relative_points(d.distance, pools["distance"], 15), 15),
-            (d.course,   _relative_points(d.course,   pools["course"], 15), 15),
-            (d.start,    _relative_points(d.start,    pools["start"], 5), 5),
-            (d.chase,    _relative_points(d.chase,    pools["chase"], 25), 25),
-            (d.closing,  _relative_points(d.closing,  pools["closing"], 5), 5),
+        # 指数総合点：7項目の実数値を単純平均。Noneは平均から除外。
+        index_values = [
+            d.highest, d.avg5, d.distance, d.course,
+            d.start, d.chase, d.closing,
         ]
-        earned = sum(points for value, points, weight in index_components if value is not None)
-        available_max = sum(weight for value, points, weight in index_components if value is not None)
-
-        trend_values = [d.three_ago, d.two_ago, d.last]
-        if all(v is not None for v in trend_values):
-            trend_points = {
-                "↗ 強い上昇": 5,
-                "↗ 上昇": 4,
-                "→ 横ばい": 3,
-                "↘ 下降": 1,
-                "↘ 強い下降": 0,
-            }.get(trend, 3)
-            earned += trend_points
-            available_max += 5
-
-        h.index_total_score = round(earned / available_max * 100) if available_max else 0
+        valid_index_values = [v for v in index_values if v is not None]
+        h.index_total_score = round(sum(valid_index_values) / len(valid_index_values)) if valid_index_values else 0
 
         h.ability_score = min(45, card_ability + ia)
         h.stability_score = min(20, card_stability + ist)
@@ -1827,24 +1805,7 @@ def run_scoring(
 
 
 def select_marks(horses: list[Horse]):
-    """
-    好調時ロジック復元版。
-
-    ・1〜3番人気を「人気馬グループ」として必ず残す
-    ・4〜9番人気を「穴馬グループ」として評価
-    ・人気馬上位3頭 → 穴馬上位3頭の順で、◎〇▲△☆注を付ける
-    ・各グループ内は総合点、安定、能力、適性、展開、馬番で比較
-    ・10番人気以下は完全消し
-
-    これにより、今回の例では
-    ◎コスモストーム
-    〇ワイドクリーガー
-    ▲タガノヘラクレス
-    △タマモジャスミン
-    ☆ホウショウマリス
-    注タマモナポリ
-    の並びに戻る。
-    """
+    """人気を印選定に使用せず、AI総合点だけで上位6頭を選ぶ。"""
     def rank_key(h: Horse):
         return (
             h.score,
@@ -1855,41 +1816,15 @@ def select_marks(horses: list[Horse]):
             -h.number,
         )
 
-    popular = sorted(
-        [h for h in horses if 1 <= h.popularity <= 3],
-        key=rank_key,
-        reverse=True,
-    )
-    holes = sorted(
-        [h for h in horses if 4 <= h.popularity <= 9],
-        key=rank_key,
-        reverse=True,
-    )
-
-    selected = popular[:3] + holes[:3]
-
-    # 人気取得に失敗した馬が多い場合の保険。
-    # 空き印だけを総合順位上位から補充する。
-    if len(selected) < 6:
-        already = {h.number for h in selected}
-        fallback = sorted(
-            [h for h in horses if h.popularity <= 9 and h.number not in already],
-            key=rank_key,
-            reverse=True,
-        )
-        selected.extend(fallback[: 6 - len(selected)])
+    ranked = sorted(horses, key=rank_key, reverse=True)
+    selected = ranked[:6]
 
     marks = {}
-    for mark, horse in zip(["◎", "〇", "▲", "△", "☆", "注"], selected[:6]):
+    for mark, horse in zip(["◎", "〇", "▲", "△", "☆", "注"], selected):
         marks[mark] = horse
 
-    selected_numbers = {h.number for h in selected[:6]}
-    remain = sorted(
-        [h for h in horses if h.popularity <= 9 and h.number not in selected_numbers],
-        key=rank_key,
-        reverse=True,
-    )
-    cut = [h for h in horses if h.popularity >= 10]
+    remain = ranked[6:]
+    cut = []
 
     return marks, remain, cut
 
@@ -1980,7 +1915,7 @@ if st.button("AI予想開始"):
         current_distance,
     )
 
-    # Ver.4.0：馬柱70％＋指数30％へ正式統合
+    # Ver.4.3：馬柱50％＋指数50％へ正式統合
     time_index_highest, time_index_lowest = apply_time_index_scoring(horses, time_index_map)
     clock_surface, clock_distance = calculate_clock_profiles(
         horses,
@@ -2015,8 +1950,8 @@ if st.button("AI予想開始"):
         st.info("指数は未取得です。未取得でも減点せず、馬柱評価だけで予想します。")
     else:
         st.info(
-            f"Ver.4.0指数統合：最高{time_index_highest}／最低{time_index_lowest}"
-            "（馬柱70％＋指数30％・データなしは減点なし）"
+            f"Ver.4.3指数統合：最高{time_index_highest}／最低{time_index_lowest}"
+            "（馬柱50％＋指数50％・データなしは減点なし）"
         )
 
     st.caption(
