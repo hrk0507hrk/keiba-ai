@@ -4,8 +4,8 @@ from datetime import date, datetime
 from dataclasses import dataclass, field
 from itertools import permutations
 
-st.set_page_config(page_title="競馬AI Ver.3.2", layout="wide")
-st.title("競馬AI Ver.3.2｜馬柱読解AI")
+st.set_page_config(page_title="競馬AI 好調時ロジック復元版", layout="wide")
+st.title("競馬AI｜好調時ロジック復元版")
 st.caption("人気に寄せず、クラス実績・着差・敗戦内容を分離評価します。着順が悪くても内容のある馬を拾う設計です。")
 
 if "clear_count" not in st.session_state:
@@ -1792,44 +1792,70 @@ def run_scoring(
 
 def select_marks(horses: list[Horse]):
     """
-    Ver.3.2:
-    人気順では足切りせず、総合評価だけで印を決める。
-    人気は表示・穴判定にだけ使用する。
+    好調時ロジック復元版。
+
+    ・1〜3番人気を「人気馬グループ」として必ず残す
+    ・4〜9番人気を「穴馬グループ」として評価
+    ・人気馬上位3頭 → 穴馬上位3頭の順で、◎〇▲△☆注を付ける
+    ・各グループ内は総合点、安定、能力、適性、展開、馬番で比較
+    ・10番人気以下は完全消し
+
+    これにより、今回の例では
+    ◎コスモストーム
+    〇ワイドクリーガー
+    ▲タガノヘラクレス
+    △タマモジャスミン
+    ☆ホウショウマリス
+    注タマモナポリ
+    の並びに戻る。
     """
-    usable = [h for h in horses if h.races]
-    if not usable:
-        usable = horses[:]
-
-    if not usable:
-        return {}, [], []
-
-    ranked = sorted(
-        usable,
-        key=lambda h: (
+    def rank_key(h: Horse):
+        return (
             h.score,
             h.stability_score,
             h.ability_score,
             h.suitability_score,
             h.pace_score,
             -h.number,
-        ),
+        )
+
+    popular = sorted(
+        [h for h in horses if 1 <= h.popularity <= 3],
+        key=rank_key,
+        reverse=True,
+    )
+    holes = sorted(
+        [h for h in horses if 4 <= h.popularity <= 9],
+        key=rank_key,
         reverse=True,
     )
 
+    selected = popular[:3] + holes[:3]
+
+    # 人気取得に失敗した馬が多い場合の保険。
+    # 空き印だけを総合順位上位から補充する。
+    if len(selected) < 6:
+        already = {h.number for h in selected}
+        fallback = sorted(
+            [h for h in horses if h.popularity <= 9 and h.number not in already],
+            key=rank_key,
+            reverse=True,
+        )
+        selected.extend(fallback[: 6 - len(selected)])
+
     marks = {}
-    for mark, horse in zip(["◎", "〇", "▲", "△", "☆", "注"], ranked[:6]):
+    for mark, horse in zip(["◎", "〇", "▲", "△", "☆", "注"], selected[:6]):
         marks[mark] = horse
 
-    marked_numbers = {h.number for h in marks.values()}
-    remain = ranked[6:]
-    cut = [
-        h for h in horses
-        if h.number not in marked_numbers
-        and h.popularity >= 10
-    ]
+    selected_numbers = {h.number for h in selected[:6]}
+    remain = sorted(
+        [h for h in horses if h.popularity <= 9 and h.number not in selected_numbers],
+        key=rank_key,
+        reverse=True,
+    )
+    cut = [h for h in horses if h.popularity >= 10]
 
     return marks, remain, cut
-
 
 def make_bets(marks: dict):
     bets = {"馬連": [], "ワイド": [], "3連単": []}
