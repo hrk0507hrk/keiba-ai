@@ -125,6 +125,7 @@ class Horse:
     index_stability_score: int = 0
     index_suitability_score: int = 0
     index_pace_score: int = 0
+    index_total_score: int = 0
     index_trend: str = "データなし"
     index_labels: list[str] = field(default_factory=list)
     time_index_pass: bool = True
@@ -903,6 +904,34 @@ def apply_time_index_scoring(horses: list[Horse], index_map: dict[int, TimeIndex
         h.index_stability_score = ist
         h.index_suitability_score = isu
         h.index_pace_score = ip
+
+        # 指数総合点：馬柱とは完全に独立し、指数だけで100点換算。
+        # 欠損項目は0点にせず、取得できた項目の配点だけで再按分する。
+        index_components = [
+            (d.highest,  _relative_points(d.highest,  pools["highest"], 10), 10),
+            (d.avg5,     _relative_points(d.avg5,     pools["avg5"], 20), 20),
+            (d.distance, _relative_points(d.distance, pools["distance"], 15), 15),
+            (d.course,   _relative_points(d.course,   pools["course"], 15), 15),
+            (d.start,    _relative_points(d.start,    pools["start"], 5), 5),
+            (d.chase,    _relative_points(d.chase,    pools["chase"], 25), 25),
+            (d.closing,  _relative_points(d.closing,  pools["closing"], 5), 5),
+        ]
+        earned = sum(points for value, points, weight in index_components if value is not None)
+        available_max = sum(weight for value, points, weight in index_components if value is not None)
+
+        trend_values = [d.three_ago, d.two_ago, d.last]
+        if all(v is not None for v in trend_values):
+            trend_points = {
+                "↗ 強い上昇": 5,
+                "↗ 上昇": 4,
+                "→ 横ばい": 3,
+                "↘ 下降": 1,
+                "↘ 強い下降": 0,
+            }.get(trend, 3)
+            earned += trend_points
+            available_max += 5
+
+        h.index_total_score = round(earned / available_max * 100) if available_max else 0
 
         h.ability_score = min(45, card_ability + ia)
         h.stability_score = min(20, card_stability + ist)
@@ -2032,14 +2061,14 @@ if st.button("AI予想開始"):
 
     st.header("指数比較")
     comparison_rows = []
-    for h in sorted(horses, key=lambda x: x.score, reverse=True):
+    for h in sorted(horses, key=lambda x: x.index_total_score, reverse=True):
         d = h.time_index
         comparison_rows.append({
             "馬番": h.number, "馬名": h.name,
             "最高": d.highest, "5走平均": d.avg5, "距離": d.distance, "コース": d.course,
             "スタート": d.start, "追走": d.chase, "上がり": d.closing,
             "近3走推移": h.index_trend, "指数タイプ": " / ".join(h.index_labels) or "-",
-            "総合点": h.score,
+            "指数総合点": h.index_total_score,
         })
     st.dataframe(comparison_rows, use_container_width=True, hide_index=True)
 
