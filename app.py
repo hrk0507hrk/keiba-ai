@@ -4,9 +4,9 @@ from datetime import date, datetime
 from dataclasses import dataclass, field
 from itertools import permutations
 
-st.set_page_config(page_title="競馬AI 好調時ロジック復元版", layout="wide")
-st.title("競馬AI｜好調時ロジック復元版")
-st.caption("人気に寄せず、クラス実績・着差・敗戦内容を分離評価します。着順が悪くても内容のある馬を拾う設計です。")
+st.set_page_config(page_title="競馬AI Ver.4.0 馬柱×指数融合版", layout="wide")
+st.title("競馬AI｜Ver.4.0 馬柱×指数融合版")
+st.caption("馬柱70％＋netkeiba指数30％。馬柱で競馬を読み、指数で能力・近況・適性・展開を裏付けます。")
 
 if "clear_count" not in st.session_state:
     st.session_state.clear_count = 0
@@ -34,7 +34,7 @@ time_index_text = st.text_area(
     "③ netkeibaタイム指数を貼ってください",
     height=240,
     key=f"time_index_{st.session_state.clear_count}",
-    help="使用するのは「最高」の数値です。低指数やデータなしによる足切り・大幅減点は行いません。",
+    help="最高・5走平均・距離・コース・スタート・追走・上がり・近3走指数を読み取ります。未や－はデータなし扱いで減点しません。",
 )
 
 col3, col4 = st.columns(2)
@@ -83,6 +83,20 @@ class RaceRecord:
 
 
 @dataclass
+class TimeIndexData:
+    highest: int | None = None
+    avg5: int | None = None
+    distance: int | None = None
+    course: int | None = None
+    start: int | None = None
+    chase: int | None = None
+    closing: int | None = None
+    three_ago: int | None = None
+    two_ago: int | None = None
+    last: int | None = None
+
+
+@dataclass
 class Horse:
     frame: int = 0
     number: int = 0
@@ -106,6 +120,13 @@ class Horse:
     best_time_sec: float = 0.0
     best_last3f: float = 0.0
     best_time_index: int | None = None
+    time_index: TimeIndexData = field(default_factory=TimeIndexData)
+    index_ability_score: int = 0
+    index_stability_score: int = 0
+    index_suitability_score: int = 0
+    index_pace_score: int = 0
+    index_trend: str = "データなし"
+    index_labels: list[str] = field(default_factory=list)
     time_index_pass: bool = True
     time_index_reason: str = ""
     score: int = 0
@@ -764,171 +785,157 @@ def parse_past_performances(text: str, horses: list[Horse]) -> list[Horse]:
 
 
 
-def parse_time_index_best(text: str) -> dict[int, int | None]:
-    """
-    netkeibaタイム指数表から「最高」だけ取得する。
+def _to_index_value(token: str) -> int | None:
+    token = (token or "").replace("*", "").strip()
+    if token in {"", "-", "--", "―", "未"}:
+        return None
+    if not re.fullmatch(r"-?\d+(?:\.\d+)?", token):
+        return None
+    return max(int(float(token)), 0)
 
-    地方形式:
-    1 1
-    --
-    ウインフルゴラ 牝4 55.0 大畑慧悟 20 ...
 
-    中央形式:
-    1
-    1
-    --
-    メルキオル 牡4 57.0 Ｊ．コレット 22 ...
-
-    両方に対応する。
-    """
-    result: dict[int, int | None] = {}
-
-    raw_lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+def parse_time_index_table(text: str) -> dict[int, TimeIndexData]:
+    """netkeibaプレミアムの指数表を全項目読み取る。中央・地方の枠/馬番表記に対応。"""
+    result: dict[int, TimeIndexData] = {}
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
     i = 0
-
-    while i < len(raw_lines):
-        frame = None
+    while i < len(lines):
         horse_no = None
-        block_start = None
-
-        # 地方など「枠 馬番」が同じ行
-        same_line = re.fullmatch(r"(\d+)\s+(\d+)", raw_lines[i])
-        if same_line:
-            frame = int(same_line.group(1))
-            horse_no = int(same_line.group(2))
-            block_start = i
-            j = i + 1
-
-        # 中央など「枠」「馬番」が別行
-        elif (
-            re.fullmatch(r"\d+", raw_lines[i])
-            and i + 1 < len(raw_lines)
-            and re.fullmatch(r"\d+", raw_lines[i + 1])
-        ):
-            frame = int(raw_lines[i])
-            horse_no = int(raw_lines[i + 1])
-            block_start = i
-            j = i + 2
-
+        j = i + 1
+        same = re.fullmatch(r"(\d+)\s+(\d+)", lines[i])
+        if same:
+            horse_no = int(same.group(2))
+        elif i + 1 < len(lines) and re.fullmatch(r"\d+", lines[i]) and re.fullmatch(r"\d+", lines[i+1]):
+            horse_no = int(lines[i+1]); j = i + 2
         else:
-            i += 1
-            continue
+            i += 1; continue
 
-        block = raw_lines[block_start:j]
+        block = lines[i:j]
+        while j < len(lines):
+            if re.fullmatch(r"\d+\s+\d+", lines[j]): break
+            if j + 1 < len(lines) and re.fullmatch(r"\d+", lines[j]) and re.fullmatch(r"\d+", lines[j+1]): break
+            block.append(lines[j]); j += 1
 
-        while j < len(raw_lines):
-            # 次の地方形式
-            if re.fullmatch(r"\d+\s+\d+", raw_lines[j]):
-                break
-
-            # 次の中央形式
-            if (
-                re.fullmatch(r"\d+", raw_lines[j])
-                and j + 1 < len(raw_lines)
-                and re.fullmatch(r"\d+", raw_lines[j + 1])
-            ):
-                break
-
-            block.append(raw_lines[j])
-            j += 1
-
-        block_text = " ".join(block)
-        parts = [p for p in re.split(r"\s+", block_text) if p]
-
-        # 性齢の位置を探す
-        sex_age_index = None
-        for idx, token in enumerate(parts):
-            if re.fullmatch(r"[牡牝セ騸]\d+", token):
-                sex_age_index = idx
-                break
-
-        if sex_age_index is None:
-            result[horse_no] = None
-            i = j
-            continue
-
-        # 性齢 → 斤量 → 騎手 → 最高
-        best_pos = sex_age_index + 3
-
-        if best_pos >= len(parts):
-            result[horse_no] = None
-            i = j
-            continue
-
-        raw_value = parts[best_pos].replace("*", "").strip()
-
-        # 「-」「未」などはデータなし
-        if raw_value in {"", "-", "--", "―", "未"}:
-            result[horse_no] = None
-            i = j
-            continue
-
-        if not re.fullmatch(r"-?\d+(?:\.\d+)?", raw_value):
-            result[horse_no] = None
-            i = j
-            continue
-
-        # 小数点以下切り捨て、マイナスは0扱い
-        value = int(float(raw_value))
-        result[horse_no] = max(value, 0)
-
+        parts = [p for p in re.split(r"\s+", " ".join(block)) if p]
+        sex_i = next((k for k,p in enumerate(parts) if re.fullmatch(r"[牡牝セ騸]\d+", p)), None)
+        data = TimeIndexData()
+        if sex_i is not None:
+            # 性齢,斤量,騎手の次から順番に11指数。オッズ・人気は対象外。
+            vals = parts[sex_i+3:sex_i+13]
+            vals += [""] * (10-len(vals))
+            parsed = [_to_index_value(v) for v in vals[:10]]
+            (data.highest, data.start, data.chase, data.closing, data.avg5,
+             data.distance, data.course, data.three_ago,
+             data.two_ago, data.last) = parsed
+        result[horse_no] = data
         i = j
-
     return result
 
 
-def apply_time_index_support(
-    horses: list[Horse],
-    time_index_map: dict[int, int | None],
-) -> tuple[int | None, int | None]:
-    """
-    Ver.3:
-    タイム指数は足切りに使わず、能力評価の補助材料としてのみ使用する。
-    低指数・データなしによる減点は行わない。
-    """
-    valid = [v for v in time_index_map.values() if v is not None]
+def _relative_points(value: int | None, values: list[int], max_points: int) -> int:
+    if value is None or not values or max_points <= 0:
+        return 0
+    lo, hi = min(values), max(values)
+    if hi == lo:
+        return round(max_points * 0.6)
+    ratio = (value - lo) / (hi - lo)
+    return max(0, min(max_points, round(ratio * max_points)))
+
+
+def _trend_label(data: TimeIndexData) -> tuple[str, int]:
+    vals = [data.three_ago, data.two_ago, data.last]
+    if any(v is None for v in vals):
+        return "データ不足", 0
+    a,b,c = vals
+    if a < b < c and c-a >= 8: return "↗ 強い上昇", 3
+    if a <= b <= c and c-a >= 3: return "↗ 上昇", 2
+    if a > b > c and a-c >= 8: return "↘ 強い下降", -2
+    if a >= b >= c and a-c >= 3: return "↘ 下降", -1
+    return "→ 横ばい", 0
+
+
+def apply_time_index_scoring(horses: list[Horse], index_map: dict[int, TimeIndexData]):
+    """馬柱70％＋指数30％に再配分し、100点満点へ統合する。データなしは減点しない。"""
+    fields = ["highest","avg5","distance","course","start","chase","closing"]
+    pools = {f:[getattr(d,f) for d in index_map.values() if getattr(d,f) is not None] for f in fields}
 
     for h in horses:
-        h.best_time_index = time_index_map.get(h.number)
-        h.time_index_pass = True
-        h.time_index_reason = ""
+        d = index_map.get(h.number, TimeIndexData())
+        h.time_index = d
+        h.best_time_index = d.highest
+        h.index_labels = []
 
-    if not valid:
-        for h in horses:
-            h.time_index_reason = "タイム指数データなし（減点なし）"
-        return None, None
+        # 既存の馬柱点を正式配分へ圧縮：能力30・安定12・適性8・展開4
+        card_ability = round(h.ability_score / 45 * 30)
+        card_stability = round(h.stability_score / 20 * 12)
+        card_suitability = round(h.suitability_score / 20 * 8)
+        card_pace = round(h.pace_score / 10 * 4)
 
-    highest = max(valid)
-    lowest = min(valid)
-    spread = max(highest - lowest, 1)
+        # 指数配点：能力15（追走6・5走平均5・最高4）
+        ia = (_relative_points(d.chase,pools["chase"],6)
+              + _relative_points(d.avg5,pools["avg5"],5)
+              + _relative_points(d.highest,pools["highest"],4))
 
-    for h in horses:
-        value = h.best_time_index
-        if value is None:
-            h.time_index_reason = "タイム指数データなし（減点なし）"
-            continue
-
-        relative = (value - lowest) / spread
-
-        if value == highest:
-            bonus = 5
-        elif relative >= 0.75:
-            bonus = 4
-        elif relative >= 0.50:
-            bonus = 3
-        elif relative >= 0.25:
-            bonus = 1
+        # 安定8（5走平均5・近3走推移3）
+        trend, trend_bonus = _trend_label(d)
+        h.index_trend = trend
+        base_stab = _relative_points(d.avg5,pools["avg5"],5)
+        if trend_bonus >= 0:
+            ist = min(8, base_stab + trend_bonus)
         else:
-            bonus = 0
+            ist = max(0, base_stab + trend_bonus)
 
-        h.support_score += bonus
-        if bonus:
-            h.time_index_reason = f"タイム指数最高{value}・補助評価 +{bonus}"
+        # 適性12（距離6・コース6）
+        isu = (_relative_points(d.distance,pools["distance"],6)
+               + _relative_points(d.course,pools["course"],6))
+
+        # 展開6（スタート3・上がり3）＋脚質との相性
+        start_p = _relative_points(d.start,pools["start"],3)
+        close_p = _relative_points(d.closing,pools["closing"],3)
+        if h.style in {"逃げ","先行"}:
+            ip = min(6, start_p + round(close_p*0.35))
+        elif h.style in {"差し","追込"}:
+            ip = min(6, close_p + round(start_p*0.35))
+        else:
+            ip = min(6, start_p + close_p)
+
+        h.index_ability_score = ia
+        h.index_stability_score = ist
+        h.index_suitability_score = isu
+        h.index_pace_score = ip
+
+        h.ability_score = min(45, card_ability + ia)
+        h.stability_score = min(20, card_stability + ist)
+        h.suitability_score = min(20, card_suitability + isu)
+        h.pace_score = min(10, card_pace + ip)
+        h.support_score = min(h.support_score, 5)
+
+        if d.chase is not None and pools["chase"] and d.chase >= max(pools["chase"])-1:
+            h.index_labels.append("追走力S")
+        if d.start is not None and pools["start"] and d.start >= max(pools["start"])-1:
+            h.index_labels.append("先行力S")
+        if d.closing is not None and pools["closing"] and d.closing >= max(pools["closing"])-1:
+            h.index_labels.append("切れ味S")
+        if d.distance is not None and d.course is not None:
+            if _relative_points(d.distance,pools["distance"],6) >= 5 and _relative_points(d.course,pools["course"],6) >= 5:
+                h.index_labels.append("条件替わりプラス")
+        if "上昇" in trend:
+            h.index_labels.append("上昇馬")
+        elif "下降" in trend:
+            h.index_labels.append("下降馬")
+
+        available = sum(v is not None for v in vars(d).values())
+        h.time_index_reason = f"指数{available}/10項目取得｜能力+{ia} 安定+{ist} 適性+{isu} 展開+{ip}｜近況{trend}"
+        if available:
             h.reasons.append(h.time_index_reason)
         else:
-            h.time_index_reason = f"タイム指数最高{value}（補助加点なし・減点なし）"
+            h.time_index_reason = "指数データなし（減点なし）"
 
-    return highest, lowest
+        h.score = h.ability_score+h.stability_score+h.suitability_score+h.pace_score+h.support_score
+        h.interpretation = build_interpretation(h)
+
+    valid_high = [d.highest for d in index_map.values() if d.highest is not None]
+    return (max(valid_high), min(valid_high)) if valid_high else (None,None)
 
 def parse_manual_numbers(text: str) -> list[int]:
     return [int(x) for x in re.findall(r"\d+", text or "")]
@@ -1395,7 +1402,7 @@ def evaluate_horse(
     pace_counts: dict[str, int],
 ):
     """
-    Ver.3.2 馬柱読解型評価
+    Ver.4.0 馬柱側の基礎評価
     能力45・安定20・適性20・展開10・補助5 = 100点
 
     能力は「着差＞着順」。
@@ -1931,7 +1938,7 @@ if st.button("AI予想開始"):
     good_frames = parse_manual_numbers(good_frame_text)
     good_track_horses = parse_manual_numbers(good_track_text)
 
-    time_index_map = parse_time_index_best(time_index_text)
+    time_index_map = parse_time_index_table(time_index_text)
 
     current_surface, current_distance = parse_current_race_conditions(racecard_text)
 
@@ -1944,28 +1951,14 @@ if st.button("AI予想開始"):
         current_distance,
     )
 
-    # Ver.3.1ではタイム指数・時計を補助加点として最後に反映
-    time_index_highest, time_index_lowest = apply_time_index_support(
-        horses,
-        time_index_map,
-    )
+    # Ver.4.0：馬柱70％＋指数30％へ正式統合
+    time_index_highest, time_index_lowest = apply_time_index_scoring(horses, time_index_map)
     clock_surface, clock_distance = calculate_clock_profiles(
         horses,
         current_surface,
         current_distance,
     )
 
-    # 補助点を加えた最終点へ更新
-    for h in horses:
-        h.support_score = min(h.support_score, 5)
-        h.score = (
-            h.ability_score
-            + h.stability_score
-            + h.suitability_score
-            + h.pace_score
-            + h.support_score
-        )
-        h.interpretation = build_interpretation(h)
 
     marks, ranking, cut = select_marks(horses)
     bets = make_bets(marks)
@@ -1990,11 +1983,11 @@ if st.button("AI予想開始"):
     st.info(f"レース判定：{race_type(ability)}")
 
     if time_index_highest is None:
-        st.info("タイム指数は未取得です。Ver.3.1では未取得でも減点せず、馬柱評価だけで予想します。")
+        st.info("指数は未取得です。未取得でも減点せず、馬柱評価だけで予想します。")
     else:
         st.info(
-            f"タイム指数は補助評価として使用：最高{time_index_highest}／最低{time_index_lowest}"
-            "（足切り・マイナス評価なし）"
+            f"Ver.4.0指数統合：最高{time_index_highest}／最低{time_index_lowest}"
+            "（馬柱70％＋指数30％・データなしは減点なし）"
         )
 
     st.caption(
@@ -2002,12 +1995,16 @@ if st.button("AI予想開始"):
         + " / ".join(f"{k}{v}頭" for k, v in pace_counts.items() if v)
     )
 
-    with st.expander("タイム指数「最高」読み取り確認"):
+    with st.expander("指数11項目の読み取り確認"):
         if time_index_map:
             for no in sorted(time_index_map):
-                value = time_index_map[no]
-                display = "データなし" if value is None else str(value)
-                st.write(f"{no}番｜最高 {display}")
+                d = time_index_map[no]
+                fmt = lambda v: "未" if v is None else str(v)
+                st.write(
+                    f"{no}番｜最高{fmt(d.highest)}｜5走平均{fmt(d.avg5)}｜距離{fmt(d.distance)}｜コース{fmt(d.course)}"
+                    f"｜スタート{fmt(d.start)}｜追走{fmt(d.chase)}｜上がり{fmt(d.closing)}"
+                    f"｜3走前{fmt(d.three_ago)}｜2走前{fmt(d.two_ago)}｜前走{fmt(d.last)}"
+                )
         else:
             st.write("読み取り結果なし")
     if clock_surface and clock_distance:
@@ -2024,11 +2021,27 @@ if st.button("AI予想開始"):
                 if h.best_time_index is not None
                 else "データなし"
             )
+            d = h.time_index
+            fmt = lambda v: "未" if v is None else str(v)
             st.write(
                 f"{h.number} {h.name}｜{pop_text}｜オッズ {odds_text}"
-                f"｜タイム指数最高 {index_text}"
-                f"｜持ち時計 {time_text}｜上がり {last3f_text}"
+                f"｜最高{fmt(d.highest)} 5走平均{fmt(d.avg5)} 距離{fmt(d.distance)} コース{fmt(d.course)}"
+                f"｜スタート{fmt(d.start)} 追走{fmt(d.chase)} 上がり{fmt(d.closing)}"
+                f"｜近3走 {fmt(d.three_ago)}→{fmt(d.two_ago)}→{fmt(d.last)}"
             )
+
+    st.header("指数比較")
+    comparison_rows = []
+    for h in sorted(horses, key=lambda x: x.score, reverse=True):
+        d = h.time_index
+        comparison_rows.append({
+            "馬番": h.number, "馬名": h.name,
+            "最高": d.highest, "5走平均": d.avg5, "距離": d.distance, "コース": d.course,
+            "スタート": d.start, "追走": d.chase, "上がり": d.closing,
+            "近3走推移": h.index_trend, "指数タイプ": " / ".join(h.index_labels) or "-",
+            "総合点": h.score,
+        })
+    st.dataframe(comparison_rows, use_container_width=True, hide_index=True)
 
     st.header("AI印")
 
@@ -2051,12 +2064,18 @@ if st.button("AI予想開始"):
             f"｜補助 {h.support_score}/5"
         )
         st.caption(
-            f"能力内訳：クラス{h.class_ability_score}/12"
+            f"馬柱元評価：クラス{h.class_ability_score}/12"
             f"｜着差{h.margin_ability_score}/18"
             f"｜勝負{h.winning_ability_score}/7"
             f"｜内容{h.content_ability_score}/8"
             f"｜減点-{h.ability_penalty}"
         )
+        st.caption(
+            f"指数加点：能力+{h.index_ability_score}/15｜安定+{h.index_stability_score}/8"
+            f"｜適性+{h.index_suitability_score}/12｜展開+{h.index_pace_score}/6｜近況 {h.index_trend}"
+        )
+        if h.index_labels:
+            st.success(" / ".join(h.index_labels))
         st.write(h.interpretation)
         with st.expander("詳しい評価材料"):
             st.write(" / ".join(h.reasons) if h.reasons else "強調材料は少なめ。")
