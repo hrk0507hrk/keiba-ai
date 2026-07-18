@@ -4,9 +4,9 @@ from datetime import date, datetime
 from dataclasses import dataclass, field
 from itertools import permutations
 
-st.set_page_config(page_title="競馬AI Ver.3.1", layout="wide")
-st.title("競馬AI Ver.3.1｜馬柱読解AI")
-st.caption("着差を最重視し、過大評価を抑えながら能力・安定感・適性・展開を評価します。タイム指数は補助材料です。")
+st.set_page_config(page_title="競馬AI Ver.3.2", layout="wide")
+st.title("競馬AI Ver.3.2｜馬柱読解AI")
+st.caption("人気に寄せず、クラス実績・着差・敗戦内容を分離評価します。着順が悪くても内容のある馬を拾う設計です。")
 
 if "clear_count" not in st.session_state:
     st.session_state.clear_count = 0
@@ -111,7 +111,7 @@ class Horse:
     score: int = 0
     total: int = 0
 
-    # Ver.3.1 評価内訳
+    # Ver.3.2 評価内訳
     ability_score: int = 0
     stability_score: int = 0
     suitability_score: int = 0
@@ -1258,33 +1258,86 @@ def build_interpretation(horse: Horse) -> str:
 
 
 def margin_band_points(margin: float) -> int:
-    """着差を最優先で能力換算。データなしは0点。"""
+    """着差の1走評価。上位馬が簡単に満点へ張り付かない6段階。"""
     if margin >= 90:
         return 0
-    if margin <= 0.3:
-        return 6
-    if margin <= 0.7:
+    if margin <= 0.2:
+        return 5
+    if margin <= 0.5:
         return 4
-    if margin <= 1.0:
-        return 2
+    if margin <= 0.8:
+        return 3
     if margin <= 1.2:
-        return 1
+        return 2
     if margin <= 1.5:
-        return 0
-    return -2
+        return 1
+    return 0
 
 
 def finish_support_points(finish: int) -> int:
-    """着順は着差より弱い補助材料として評価。"""
+    """着順は内容評価の補助。着差より弱く扱う。"""
     if finish == 1:
-        return 4
-    if finish == 2:
         return 3
-    if finish == 3:
+    if finish == 2:
         return 2
+    if finish == 3:
+        return 1
     if finish <= 5:
         return 1
     return 0
+
+
+def race_class_base_score(raw: str) -> int:
+    """レース格の基礎点。肩書だけで満点にならないよう最大12点。"""
+    level = race_level_text(raw)
+    return {
+        "G1": 12,
+        "G2": 11,
+        "G3": 10,
+        "OP": 9,
+        "3勝": 8,
+        "2勝": 7,
+        "地方上級": 7,
+        "1勝": 6,
+    }.get(level, 4)
+
+
+def class_performance_score(race: RaceRecord) -> int:
+    """クラス名と、そのクラスで実際に通用したかを一体評価する。"""
+    score = race_class_base_score(race.raw)
+
+    if race.margin < 90:
+        if race.margin <= 0.3:
+            adjustment = 0
+        elif race.margin <= 0.7:
+            adjustment = -1
+        elif race.margin <= 1.0:
+            adjustment = -2
+        elif race.margin <= 1.5:
+            adjustment = -4
+        else:
+            adjustment = -6
+        score += adjustment
+    elif race.finish > 5:
+        score -= 3
+
+    if race.finish == 1:
+        score += 1
+    elif race.finish <= 3:
+        score += 0
+    elif race.finish >= 10:
+        score -= 1
+
+    return max(0, min(score, 12))
+
+
+def passing_gain(race: RaceRecord) -> int:
+    """道中位置から着順まで何頭分押し上げたか。"""
+    nums = [int(x) for x in re.findall(r"\d+", race.passing or "")]
+    if not nums or race.finish >= 90:
+        return 0
+    start_pos = nums[0]
+    return max(start_pos - race.finish, 0)
 
 
 def parse_record_date(value: str) -> date | None:
@@ -1342,7 +1395,7 @@ def evaluate_horse(
     pace_counts: dict[str, int],
 ):
     """
-    Ver.3.1 馬柱読解型評価
+    Ver.3.2 馬柱読解型評価
     能力45・安定20・適性20・展開10・補助5 = 100点
 
     能力は「着差＞着順」。
@@ -1381,45 +1434,66 @@ def evaluate_horse(
     # ─────────────────────────
 
     # ① クラス能力（最大12）
-    upper_score, upper_reasons = evaluate_upper_class_record(horse)
-    horse.class_ability_score = min(round(upper_score * 0.60), 12)
-    horse.reasons.extend(upper_reasons)
-
-    # 上級条件の肩書だけでなく、実際に僅差なら補強
-    upper_close = sum(
-        1 for r in races
-        if race_level_text(r.raw) and r.margin <= 1.0
+    # レース格だけでなく、そのクラスでどこまで通用したかを評価。
+    class_performances = sorted(
+        (class_performance_score(r) for r in races),
+        reverse=True,
     )
-    if upper_close >= 3:
-        horse.class_ability_score = min(horse.class_ability_score + 2, 12)
-        horse.reasons.append("上位条件で僅差内容を複数 +2")
-    elif upper_close >= 1:
+    if class_performances:
+        weights = [0.55, 0.30, 0.15]
+        selected = class_performances[:3]
+        used_weights = weights[:len(selected)]
+        weight_sum = sum(used_weights)
+        class_score = sum(s * w for s, w in zip(selected, used_weights)) / weight_sum
+        horse.class_ability_score = max(0, min(round(class_score), 12))
+
+    best_level = max((race_class_base_score(r.raw) for r in races), default=0)
+    class_close = sum(
+        1 for r in races
+        if race_class_base_score(r.raw) >= max(best_level - 1, 4)
+        and r.margin <= 0.7
+    )
+    if class_close >= 3:
         horse.class_ability_score = min(horse.class_ability_score + 1, 12)
-        horse.reasons.append("上位条件で僅差内容 +1")
+        horse.reasons.append("上位クラス帯で僅差内容を継続 +1")
 
-    # ② 着差能力（最大18）―最重要
-    margin_raw = 0.0
+    if horse.class_ability_score >= 10:
+        horse.reasons.append("上位条件で通用した実績")
+    elif horse.class_ability_score <= 5:
+        horse.cautions.append("クラス実績の裏付けは弱め")
+
+    # ② 着差能力（最大18）
+    # 近5走の平均内容を基準にし、一部の好走だけで満点にならないよう調整。
     margin_weights = [1.00, 0.90, 0.78, 0.66, 0.55]
+    weighted_points = 0.0
+    used_weight = 0.0
     valid_margin_count = 0
-    for idx, r in enumerate(recent5):
-        points = margin_band_points(r.margin)
-        if r.margin < 90:
-            valid_margin_count += 1
-        margin_raw += points * margin_weights[idx]
 
-    # マイナス着差が多くても0未満にはしない
-    horse.margin_ability_score = max(0, min(round(margin_raw), 18))
+    for idx, r in enumerate(recent5):
+        if r.margin >= 90:
+            continue
+        w = margin_weights[idx]
+        weighted_points += margin_band_points(r.margin) * w
+        used_weight += w
+        valid_margin_count += 1
+
+    if used_weight > 0:
+        margin_average = weighted_points / used_weight  # 0～5
+        horse.margin_ability_score = round(margin_average / 5 * 16)
+    else:
+        horse.margin_ability_score = 0
 
     close05, close10, base_level = same_class_close_form(races[:5])
     if close05 >= 3:
-        horse.margin_ability_score = min(horse.margin_ability_score + 3, 18)
-        horse.reasons.append(f"同クラス{base_level or '近走'}0.5秒以内が複数 +3")
+        horse.margin_ability_score += 2
+        horse.reasons.append(f"同クラス{base_level or '近走'}0.5秒以内を複数 +2")
     elif close10 >= 4:
-        horse.margin_ability_score = min(horse.margin_ability_score + 2, 18)
-        horse.reasons.append(f"同クラス{base_level or '近走'}1.0秒以内を継続 +2")
+        horse.margin_ability_score += 1
+        horse.reasons.append(f"同クラス{base_level or '近走'}1.0秒以内を継続 +1")
 
+    horse.margin_ability_score = max(0, min(horse.margin_ability_score, 18))
     if horse.margin_ability_score >= 14:
-        horse.reasons.append("着差能力が高い")
+        horse.reasons.append("近走の着差内容が高水準")
     elif valid_margin_count == 0:
         horse.cautions.append("着差データ不足")
 
@@ -1429,12 +1503,9 @@ def evaluate_horse(
     thirds = sum(1 for r in races if r.finish == 3)
     top3 = wins + seconds + thirds
 
-    winning = 0
-    winning += min(wins * 2, 4)
+    winning = min(wins * 2, 4)
     winning += min(seconds, 2)
     if top3 >= 5:
-        winning += 2
-    elif top3 >= 3:
         winning += 1
     horse.winning_ability_score = min(winning, 7)
 
@@ -1444,37 +1515,48 @@ def evaluate_horse(
         horse.reasons.append("勝利実績あり")
 
     # ④ 内容評価（最大8）
+    # 着順の良さより、負け方・位置取り・継続性を重視。
     content = 0
-    recent_finish_support = sum(
-        finish_support_points(r.finish) * w
-        for r, w in zip(recent5, [1.0, 0.9, 0.75, 0.6, 0.5])
-    )
-    content += min(round(recent_finish_support / 2), 4)
 
-    # 着順が悪くても1秒以内なら能力維持として救済
     bad_but_close = sum(
         1 for r in recent5
         if r.finish >= 6 and r.margin <= 1.0
     )
     if bad_but_close >= 2:
         content += 3
-        horse.reasons.append("着順以上に内容が良い敗戦を複数 +3")
+        horse.reasons.append("着順以上に内容のある敗戦を複数 +3")
     elif bad_but_close == 1:
-        content += 1
-        horse.reasons.append("着順以上に内容が良い敗戦 +1")
+        content += 2
+        horse.reasons.append("着順以上に内容のある敗戦 +2")
 
-    # 近3走で内容が継続
+    strong_closing_runs = sum(
+        1 for r in recent5
+        if passing_gain(r) >= 4 and r.margin <= 1.2
+    )
+    if strong_closing_runs >= 2:
+        content += 2
+        horse.reasons.append("道中位置から大きく押し上げた走りを複数 +2")
+    elif strong_closing_runs == 1:
+        content += 1
+        horse.reasons.append("道中位置から押し上げる内容 +1")
+
     recent_close = sum(1 for r in recent3 if r.margin <= 0.7)
     if recent_close >= 2:
         content += 2
         horse.reasons.append("近3走で僅差内容を維持 +2")
+    elif recent_close == 1:
+        content += 1
 
+    finish_support = sum(
+        finish_support_points(r.finish) * w
+        for r, w in zip(recent5, [1.0, 0.85, 0.70, 0.55, 0.40])
+    )
+    content += min(round(finish_support / 3), 2)
     horse.content_ability_score = min(content, 8)
 
     # ⑤ 能力減点・過大評価防止
     penalty = 0
 
-    # 長期休養。鉄砲実績を馬柱から簡易推定できない場合は普通評価。
     horse.layoff_days = calculate_layoff_days(horse)
     if horse.layoff_days >= 120:
         penalty += 2
@@ -1483,21 +1565,22 @@ def evaluate_horse(
         penalty += 1
         horse.penalty_reasons.append(f"休養明け{horse.layoff_days}日 -1")
 
-    # 同クラスで勝ち切れず、馬券内も少ない
     same_class_races = races[:5]
     if base_level:
         same_class_races = [r for r in races[:5] if race_level_text(r.raw) == base_level]
     same_wins = sum(1 for r in same_class_races if r.finish == 1)
     same_top3 = sum(1 for r in same_class_races if r.finish <= 3)
+    same_close = sum(1 for r in same_class_races if r.margin <= 0.7)
+
+    # 僅差内容があれば「勝ち切れず」の減点を弱める。
     if len(same_class_races) >= 4 and same_wins == 0:
-        if same_top3 == 0:
+        if same_top3 == 0 and same_close == 0:
             penalty += 3
-            horse.penalty_reasons.append("同クラスで勝利・複勝圏なし -3")
-        elif same_top3 <= 1:
+            horse.penalty_reasons.append("同クラスで好走・僅差実績なし -3")
+        elif same_top3 <= 1 and same_close <= 1:
             penalty += 1
             horse.penalty_reasons.append("同クラスで勝ち切れず -1")
 
-    # 過大評価フィルター：能力素材は高いが、勝利も僅差も乏しい
     pre_penalty = (
         horse.class_ability_score
         + horse.margin_ability_score
@@ -1505,14 +1588,16 @@ def evaluate_horse(
         + horse.content_ability_score
     )
     close_all = sum(1 for r in races if r.margin <= 0.7)
-    if pre_penalty >= 30 and wins == 0 and close_all <= 1:
+    heavy_losses = sum(1 for r in recent5 if 1.5 < r.margin < 90)
+
+    if pre_penalty >= 31 and wins == 0 and close_all <= 1:
         penalty += 4
         horse.overvaluation_warning = True
         horse.penalty_reasons.append("高評価に対して勝利・僅差実績不足 -4")
-    elif pre_penalty >= 27 and wins == 0 and top3 <= 1:
+    elif pre_penalty >= 28 and wins == 0 and top3 <= 1 and heavy_losses >= 2:
         penalty += 2
         horse.overvaluation_warning = True
-        horse.penalty_reasons.append("高評価に対して好走実績不足 -2")
+        horse.penalty_reasons.append("高評価に対して大敗が多い -2")
 
     horse.ability_penalty = min(penalty, 8)
     horse.ability_score = max(
@@ -1707,23 +1792,16 @@ def run_scoring(
 
 def select_marks(horses: list[Horse]):
     """
-    Ver.3.1:
-    AI印と能力ランキングを完全に統一する。
-
-    総合点1位＝◎
-    総合点2位＝〇
-    総合点3位＝▲
-    総合点4位＝△
-    総合点5位＝☆
-    総合点6位＝注
-
-    同点の場合は、
-    安定感 → 能力 → 適性 → 展開 → 馬番の順で比較する。
+    Ver.3.2:
+    人気順では足切りせず、総合評価だけで印を決める。
+    人気は表示・穴判定にだけ使用する。
     """
-    usable = [h for h in horses if h.popularity <= 9]
+    usable = [h for h in horses if h.races]
+    if not usable:
+        usable = horses[:]
 
     if not usable:
-        return {}, [], horses
+        return {}, [], []
 
     ranked = sorted(
         usable,
@@ -1742,8 +1820,13 @@ def select_marks(horses: list[Horse]):
     for mark, horse in zip(["◎", "〇", "▲", "△", "☆", "注"], ranked[:6]):
         marks[mark] = horse
 
-    remain = ranked[1:]
-    cut = [h for h in horses if h.popularity >= 10]
+    marked_numbers = {h.number for h in marks.values()}
+    remain = ranked[6:]
+    cut = [
+        h for h in horses
+        if h.number not in marked_numbers
+        and h.popularity >= 10
+    ]
 
     return marks, remain, cut
 
