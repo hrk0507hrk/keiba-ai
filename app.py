@@ -1508,42 +1508,46 @@ def run_scoring(
 
 def select_marks(horses: list[Horse]):
     """
-    ◎は人気だけでなく、能力・安定感を重視して選ぶ。
-    10番人気以下は従来どおり買い目候補から除外するが、
-    能力ランキングには表示して検証できるようにする。
+    Ver.3.1:
+    AI印と能力ランキングを完全に統一する。
+
+    総合点1位＝◎
+    総合点2位＝〇
+    総合点3位＝▲
+    総合点4位＝△
+    総合点5位＝☆
+    総合点6位＝注
+
+    同点の場合は、
+    安定感 → 能力 → 適性 → 展開 → 馬番の順で比較する。
     """
     usable = [h for h in horses if h.popularity <= 9]
+
     if not usable:
         return {}, [], horses
 
-    # 軸候補は1〜3番人気を優先。ただし安定感を強く反映
-    top3 = [h for h in usable if h.popularity <= 3]
-    axis_pool = top3 if top3 else usable
-    axis = max(
-        axis_pool,
+    ranked = sorted(
+        usable,
         key=lambda h: (
-            h.ability_score * 0.50
-            + h.stability_score * 0.30
-            + h.suitability_score * 0.15
-            + h.pace_score * 0.05
+            h.score,
+            h.stability_score,
+            h.ability_score,
+            h.suitability_score,
+            h.pace_score,
+            -h.number,
         ),
-    )
-
-    marks = {"◎": axis}
-    remain = [h for h in usable if h.number != axis.number]
-
-    # 相手は総合点を基本に、3着候補を拾うため安定感を同点時に優先
-    remain = sorted(
-        remain,
-        key=lambda h: (h.score, h.stability_score, h.ability_score),
         reverse=True,
     )
 
-    for mark, horse in zip(["〇", "▲", "△", "☆", "注"], remain[:5]):
+    marks = {}
+    for mark, horse in zip(["◎", "〇", "▲", "△", "☆", "注"], ranked[:6]):
         marks[mark] = horse
 
+    remain = ranked[1:]
     cut = [h for h in horses if h.popularity >= 10]
+
     return marks, remain, cut
+
 
 def make_bets(marks: dict):
     bets = {"馬連": [], "ワイド": [], "3連単": []}
@@ -1659,7 +1663,14 @@ if st.button("AI予想開始"):
     bets = make_bets(marks)
     ability = sorted(
         horses,
-        key=lambda h: h.score,
+        key=lambda h: (
+            h.score,
+            h.stability_score,
+            h.ability_score,
+            h.suitability_score,
+            h.pace_score,
+            -h.number,
+        ),
         reverse=True,
     )
     holes = [
