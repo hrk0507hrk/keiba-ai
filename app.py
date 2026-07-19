@@ -640,11 +640,48 @@ def result_dataframe(horses: Dict[int, Horse]) -> pd.DataFrame:
 st.title("🐎 競馬AI Ver5.1 解析安定版")
 st.caption("タイム指数60点＋馬柱40点｜タイム指数は列固定・同値含む上位3指数値")
 
-racecard_text = st.text_area("① 出走表", height=260, placeholder="出走表を貼り付け")
-past_text = st.text_area("② 馬柱", height=420, placeholder="馬柱を貼り付け")
-timeindex_text = st.text_area("③ netkeibaタイム指数", height=320, placeholder="タイム指数を貼り付け")
+def clear_inputs() -> None:
+    st.session_state["racecard_input"] = ""
+    st.session_state["past_input"] = ""
+    st.session_state["timeindex_input"] = ""
 
-if st.button("予想開始", type="primary", use_container_width=True):
+
+racecard_text = st.text_area(
+    "① 出走表",
+    height=260,
+    placeholder="出走表を貼り付け",
+    key="racecard_input",
+)
+past_text = st.text_area(
+    "② 馬柱",
+    height=420,
+    placeholder="馬柱を貼り付け",
+    key="past_input",
+)
+timeindex_text = st.text_area(
+    "③ netkeibaタイム指数",
+    height=320,
+    placeholder="タイム指数を貼り付け",
+    key="timeindex_input",
+)
+
+button_col1, button_col2 = st.columns([4, 1])
+
+with button_col1:
+    predict_clicked = st.button(
+        "予想開始",
+        type="primary",
+        use_container_width=True,
+    )
+
+with button_col2:
+    st.button(
+        "クリア",
+        use_container_width=True,
+        on_click=clear_inputs,
+    )
+
+if predict_clicked:
     horses = parse_racecard(racecard_text)
     horses = parse_past_performances(past_text, horses)
     horses = parse_time_index(timeindex_text, horses)
