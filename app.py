@@ -150,19 +150,40 @@ def parse_racecard(text: str) -> Dict[int, Horse]:
 
 
 def parse_finish(line: str) -> int:
+    """着順を取得。netkeiba馬柱では日付行末の数字が着順。"""
     match = re.search(r"(\d{1,2})\s*着", line)
-    return safe_int(match.group(1), 99) if match else 99
+    if match:
+        return safe_int(match.group(1), 99)
+
+    # 例: 2026.05.17 新潟6 / 2026.02.25 浦和13
+    match = re.match(
+        r"^20\d{2}[./年]\d{1,2}(?:[./月]\d{1,2})?\s+.+?(\d{1,2})$",
+        normalize_text(line),
+    )
+    if match:
+        value = safe_int(match.group(1), 99)
+        if 1 <= value <= 30:
+            return value
+
+    return 99
 
 
 def parse_margin(line: str) -> float:
-    for pattern in (r"着差\s*[:：]?\s*([+-]?\d+(?:\.\d+)?)", r"(?:差|着差)\s*([+-]?\d+(?:\.\d+)?)"):
+    """勝ち馬名の直後にある着差を取得。馬体重・上がりは除外する。"""
+    for pattern in (
+        r"着差\s*[:：]?\s*([+-]?\d+(?:\.\d+)?)",
+        r"(?:差|着差)\s*([+-]?\d+(?:\.\d+)?)",
+    ):
         match = re.search(pattern, line)
         if match:
             return abs(safe_float(match.group(1), 99.9))
-    decimal_values = re.findall(r"(?<!\d)([+-]?\d+\.\d)(?!\d)", line)
-    plausible = [abs(safe_float(v, 99.9)) for v in decimal_values if abs(safe_float(v, 99.9)) <= 10]
-    if plausible:
-        return plausible[-1]
+
+    # 例: マリアイリダータ(0.6) / アロヒアリイ(-0.1)
+    # 行末の括弧だけを見ることで、馬体重や上がりと混同しない。
+    match = re.search(r"\(([+-]?\d+(?:\.\d+)?)\)\s*$", line)
+    if match:
+        return abs(safe_float(match.group(1), 99.9))
+
     if any(word in line for word in ("クビ", "ハナ", "アタマ")):
         return 0.1
     if "同着" in line:
@@ -171,44 +192,151 @@ def parse_margin(line: str) -> float:
 
 
 def parse_passing(line: str) -> str:
-    match = re.search(r"(?<!\d)(\d{1,2}(?:-\d{1,2}){1,3})(?!\d)", line)
+    # 例: 11-9 (33.5) 500(0)
+    match = re.search(r"^\s*(\d{1,2}(?:-\d{1,2}){1,3})(?:\s|$)", line)
     return match.group(1) if match else ""
 
 
 def parse_class(line: str) -> int:
+    normalized = line.upper().replace("Ｇ", "G")
     for keyword, score in CLASS_TABLE:
-        if keyword in line:
+        if keyword.upper() in normalized:
             return score
     return 3
 
 
-def looks_like_race_record(line: str) -> bool:
-    has_date = bool(re.search(r"(?:20\d{2}[./年]\d{1,2}(?:[./月]\d{1,2})?|\d{1,2}[./]\d{1,2})", line))
-    has_finish = bool(re.search(r"\d{1,2}\s*着", line))
-    return has_date and has_finish
+def contains_race_date(line: str) -> bool:
+    return bool(
+        re.match(
+            r"^20\d{2}[./年]\d{1,2}(?:[./月]\d{1,2})?\s+",
+            normalize_text(line),
+        )
+    )
 
 
-def parse_past_performances(text: str, horses: Dict[int, Horse]) -> Dict[int, Horse]:
+def past_horse_number(line: str, horses: Dict[int, Horse]) -> Optional[int]:
+    """netkeiba馬柱の「枠番 馬番」だけの行から馬番を取得する。"""
+    normalized = normalize_text(line)
+
+    # 例: 1 1 / 5 6 / 8 12
+    match = re.fullmatch(r"([1-8])\s+([1-9]|1[0-8])", normalized)
+    if match:
+        number = safe_int(match.group(2))
+        if number in horses:
+            return number
+
+    # 例: 6番 馬名 / 6 馬名（別形式への保険）
+    match = re.match(r"^(\d{1,2})番(?:\s+|$)", normalized)
+    if match:
+        number = safe_int(match.group(1))
+        if number in horses:
+            return number
+
+    for number, horse in horses.items():
+        if horse.name and horse.name in normalized:
+            return number
+
+    return None
+
+
+def record_from_lines(block_lines: List[str]) -> Optional[RaceRecord]:
+    if not block_lines:
+        return None
+
+    finish = parse_finish(block_lines[0])
+    if finish >= 99:
+        return None
+
+    race_class = 3
+    passing = ""
+    margin = 99.9
+
+    for line in block_lines[1:]:
+        # クラスはレース名行から取得
+        parsed_class = parse_class(line)
+        if parsed_class != 3 or race_class == 3:
+            race_class = parsed_class
+
+        if not passing:
+            passing = parse_passing(line)
+
+        parsed_margin = parse_margin(line)
+        if parsed_margin < 99.9:
+            margin = parsed_margin
+
+    return RaceRecord(
+        finish=finish,
+        margin=margin,
+        passing=passing,
+        race_class=race_class,
+    )
+
+
+def parse_past_performances(
+    text: str,
+    horses: Dict[int, Horse],
+) -> Dict[int, Horse]:
+    """netkeiba複数行馬柱を枠番・馬番行ごとのブロックで読む。"""
     for horse in horses.values():
         horse.records.clear()
-    current: Optional[Horse] = None
-    for line in normalize_lines(text):
-        header = parse_horse_header(line)
-        if header:
-            current = horses.get(header[0])
-            continue
-        if current is None or not looks_like_race_record(line):
-            continue
-        record = RaceRecord(
-            finish=parse_finish(line),
-            margin=parse_margin(line),
-            passing=parse_passing(line),
-            race_class=parse_class(line),
-        )
-        if record.finish < 99:
-            current.records.append(record)
-    return horses
 
+    lines = normalize_lines(text)
+    current: Optional[Horse] = None
+    race_block: List[str] = []
+    waiting_name = False
+    header_candidates: List[str] = []
+
+    def flush_race() -> None:
+        nonlocal race_block
+        if current is not None and race_block and len(current.records) < 5:
+            record = record_from_lines(race_block)
+            if record is not None:
+                current.records.append(record)
+        race_block = []
+
+    def usable_name(line: str) -> bool:
+        if line == "--" or line.startswith("("):
+            return False
+        if re.search(r"kg|人気|美浦|栗東|地方|中\d+週|牡\d|牝\d|セ\d|騙\d", line):
+            return False
+        return bool(re.fullmatch(r"[A-Za-zＡ-Ｚａ-ｚ一-龥ぁ-んァ-ヶー・ヴー]+B?", line))
+
+    for line in lines:
+        # netkeiba形式: 「枠番 馬番」
+        m = re.fullmatch(r"([1-8])\s+([1-9]|1[0-8])", line)
+        if m:
+            flush_race()
+            number = safe_int(m.group(2))
+            current = horses.get(number)
+            if current is None:
+                current = Horse(number=number, name=f"{number}番")
+                horses[number] = current
+            waiting_name = True
+            header_candidates = []
+            continue
+
+        if current is None:
+            continue
+
+        if waiting_name:
+            if usable_name(line):
+                header_candidates.append(line)
+                # 血統欄は「父→馬名→母」の順なので2件目が馬名
+                if len(header_candidates) >= 2:
+                    current.name = header_candidates[1]
+                    waiting_name = False
+            continue
+
+        if contains_race_date(line):
+            flush_race()
+            race_block = [line]
+            continue
+
+        if race_block:
+            race_block.append(line)
+
+    flush_race()
+    return horses
 
 def numeric_tokens(line: str) -> List[int]:
     return [safe_int(token) for token in re.findall(r"(?<![\d.])-?\d+(?![\d.])", line)]
@@ -393,8 +521,8 @@ def result_dataframe(horses: Dict[int, Horse]) -> pd.DataFrame:
     ])
 
 
-st.title("🐎 競馬AI Ver5")
-st.caption("タイム指数60点＋馬柱40点")
+st.title("🐎 競馬AI Ver5.0.1 完成修正版")
+st.caption("タイム指数60点＋馬柱40点｜netkeiba複数行馬柱対応")
 
 racecard_text = st.text_area("① 出走表", height=260, placeholder="出走表を貼り付け")
 past_text = st.text_area("② 馬柱", height=420, placeholder="馬柱を貼り付け")
@@ -404,6 +532,26 @@ if st.button("予想開始", type="primary", use_container_width=True):
     horses = parse_racecard(racecard_text)
     horses = parse_past_performances(past_text, horses)
     horses = parse_time_index(timeindex_text, horses)
+
+    parsed_horses = len(horses)
+    parsed_records = sum(len(h.records) for h in horses.values())
+    parsed_record_horses = sum(1 for h in horses.values() if h.records)
+
+    with st.expander("読み取り確認", expanded=False):
+        st.write(f"認識馬数：{parsed_horses}頭")
+        st.write(f"馬柱認識：{parsed_record_horses}頭・合計{parsed_records}走")
+        st.dataframe(
+            pd.DataFrame([
+                {
+                    "馬番": h.number,
+                    "馬名": h.name,
+                    "近走取得数": len(h.records),
+                }
+                for h in sorted(horses.values(), key=lambda x: x.number)
+            ]),
+            use_container_width=True,
+            hide_index=True,
+        )
 
     errors = validate_inputs(horses)
     if errors:
