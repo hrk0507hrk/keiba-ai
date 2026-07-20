@@ -7,13 +7,20 @@ import streamlit as st
 
 st.set_page_config(page_title="競馬AI Ver5", page_icon="🐎", layout="wide")
 
-TIME_COLUMNS = ("overall", "start", "chase", "closing", "avg5")
+CENTRAL_TIME_COLUMNS = ("overall", "start", "chase", "closing", "avg5")
+LOCAL_TIME_COLUMNS = ("avg5", "distance", "course", "last3", "last2", "last1")
 TIME_LABELS = {
+    "highest": "最高",
     "overall": "全体",
     "start": "スタート",
     "chase": "追走",
     "closing": "上がり",
     "avg5": "5走平均",
+    "distance": "距離",
+    "course": "コース",
+    "last3": "3走",
+    "last2": "2走",
+    "last1": "前走",
 }
 APPEARANCE_SCORE = {1: 20, 2: 34, 3: 46, 4: 54, 5: 60}
 MARKS = ("◎", "○", "▲", "★", "△")
@@ -392,64 +399,76 @@ def find_time_row_starts(cells: List[str]) -> List[int]:
     return starts
 
 
-def parse_time_row(row: List[str]) -> Optional[dict]:
-    """1頭分のタイム指数行を位置固定で解析する。
+def detect_time_index_mode(text: str) -> str:
+    """見出しから中央・地方のタイム指数形式を自動判別する。"""
+    normalized = normalize_text(text).replace(" ", "")
+    if all(label in normalized for label in ("全体", "スタート", "追走", "上がり")):
+        return "central"
+    return "local"
 
-    行構成:
-    枠, 馬番, 印, 馬名, 性齢, 斤量, 騎手,
-    全体, スタート, 追走, 上がり, 5走平均,
-    距離, コース, 3走, 2走, 前走, 単勝オッズ, 人気
 
-    ※表の「最高」は全体・スタート・追走・上がりを束ねる見出しで、
-    独立した数値列ではない。
-    """
+def parse_central_time_row(row: List[str]) -> Optional[dict]:
+    """中央競馬の1頭分を固定位置で解析する。"""
     if len(row) < 19:
         return None
-
     number = safe_int(row[1], 0)
     if not 1 <= number <= 18:
         return None
-
-    # 先頭7セルは固定。指数列は全体から前走まで10セル。
     values = [parse_index_value(value) for value in row[7:17]]
     if len(values) != 10:
         return None
-
-    odds = safe_float(row[17], 0.0)
-    popularity = safe_int(row[18], 99)
-
     return {
-        "number": number,
-        "frame": safe_int(row[0], 0),
-        "name": row[3],
-        "jockey": row[6],
-        "highest": 0,
-        "overall": values[0],
-        "start": values[1],
-        "chase": values[2],
-        "closing": values[3],
-        "avg5": values[4],
-        "distance": values[5],
-        "course": values[6],
-        "last3": values[7],
-        "last2": values[8],
-        "last1": values[9],
-        "odds": odds,
-        "popularity": popularity,
+        "number": number, "frame": safe_int(row[0], 0),
+        "name": row[3], "jockey": row[6],
+        "highest": 0, "overall": values[0], "start": values[1],
+        "chase": values[2], "closing": values[3], "avg5": values[4],
+        "distance": values[5], "course": values[6],
+        "last3": values[7], "last2": values[8], "last1": values[9],
+        "odds": safe_float(row[17], 0.0),
+        "popularity": safe_int(row[18], 99),
     }
 
 
-def parse_time_index(text: str, horses: Dict[int, Horse]) -> Dict[int, Horse]:
-    """netkeibaタイム指数を列位置どおりに読み取る。"""
+def parse_local_time_row(row: List[str]) -> Optional[dict]:
+    """地方競馬の1頭分を固定位置で解析する。
+
+    行構成:
+    枠, 馬番, 印, 馬名, 性齢, 斤量, 騎手,
+    最高, 5走平均, 距離, コース, 3走, 2走, 前走, 単勝オッズ, 人気
+    """
+    if len(row) < 16:
+        return None
+    number = safe_int(row[1], 0)
+    if not 1 <= number <= 18:
+        return None
+    values = [parse_index_value(value) for value in row[7:14]]
+    if len(values) != 7:
+        return None
+    return {
+        "number": number, "frame": safe_int(row[0], 0),
+        "name": row[3], "jockey": row[6],
+        "highest": values[0], "overall": 0, "start": 0,
+        "chase": 0, "closing": 0, "avg5": values[1],
+        "distance": values[2], "course": values[3],
+        "last3": values[4], "last2": values[5], "last1": values[6],
+        "odds": safe_float(row[14], 0.0),
+        "popularity": safe_int(row[15], 99),
+    }
+
+
+def parse_time_index(text: str, horses: Dict[int, Horse]) -> Tuple[Dict[int, Horse], str]:
+    """中央・地方を自動判別してタイム指数を読み取る。"""
     for horse in horses.values():
         horse.timeindex = TimeIndex()
 
+    mode = detect_time_index_mode(text)
     cells = time_index_cells(text)
     starts = find_time_row_starts(cells)
 
     for pos, start_index in enumerate(starts):
         end_index = starts[pos + 1] if pos + 1 < len(starts) else len(cells)
-        parsed = parse_time_row(cells[start_index:end_index])
+        row = cells[start_index:end_index]
+        parsed = parse_central_time_row(row) if mode == "central" else parse_local_time_row(row)
         if parsed is None:
             continue
 
@@ -464,31 +483,25 @@ def parse_time_index(text: str, horses: Dict[int, Horse]) -> Dict[int, Horse]:
         horse.jockey = parsed["jockey"] or horse.jockey
         horse.popularity = parsed["popularity"]
         horse.timeindex = TimeIndex(
-            highest=parsed["highest"],
-            overall=parsed["overall"],
-            start=parsed["start"],
-            chase=parsed["chase"],
-            closing=parsed["closing"],
-            avg5=parsed["avg5"],
-            distance=parsed["distance"],
-            course=parsed["course"],
-            last3=parsed["last3"],
-            last2=parsed["last2"],
-            last1=parsed["last1"],
+            highest=parsed["highest"], overall=parsed["overall"],
+            start=parsed["start"], chase=parsed["chase"],
+            closing=parsed["closing"], avg5=parsed["avg5"],
+            distance=parsed["distance"], course=parsed["course"],
+            last3=parsed["last3"], last2=parsed["last2"], last1=parsed["last1"],
         )
 
-    return horses
+    return horses, mode
 
 def time_value(horse: Horse, column: str) -> int:
     return getattr(horse.timeindex, column)
 
 
-def extract_top3(horses: Dict[int, Horse]) -> Dict[int, Horse]:
+def extract_top3(horses: Dict[int, Horse], time_columns: Tuple[str, ...]) -> Dict[int, Horse]:
     """各項目の上位3つの指数値を採用し、同値は全頭含める。"""
     for horse in horses.values():
         horse.top3_count = 0
 
-    for column in TIME_COLUMNS:
+    for column in time_columns:
         valid = [horse for horse in horses.values() if time_value(horse, column) > 0]
         if not valid:
             continue
@@ -528,10 +541,10 @@ def rank_bonus_for_column(horses: Dict[int, Horse], column: str) -> Dict[int, in
     return bonus
 
 
-def calc_time_score(horses: Dict[int, Horse]) -> Dict[int, Horse]:
+def calc_time_score(horses: Dict[int, Horse], time_columns: Tuple[str, ...]) -> Dict[int, Horse]:
     for horse in horses.values():
         horse.time_score = APPEARANCE_SCORE.get(horse.top3_count, 0) if horse.alive else 0
-    for column in TIME_COLUMNS:
+    for column in time_columns:
         for number, bonus in rank_bonus_for_column(horses, column).items():
             horses[number].time_score += bonus
     for horse in horses.values():
@@ -600,7 +613,7 @@ def calc_racecard_score(horses: Dict[int, Horse]) -> Dict[int, Horse]:
     return horses
 
 
-def finish_scoring(horses: Dict[int, Horse]) -> Dict[int, Horse]:
+def finish_scoring(horses: Dict[int, Horse], item_count: int) -> Dict[int, Horse]:
     for horse in horses.values():
         horse.total_score = horse.time_score + horse.racecard_score if horse.alive else 0
         horse.mark = ""
@@ -608,15 +621,15 @@ def finish_scoring(horses: Dict[int, Horse]) -> Dict[int, Horse]:
     for index, horse in enumerate(ranking[:len(MARKS)]):
         horse.mark = MARKS[index]
     for horse in horses.values():
-        horse.reason = f"TOP3 {horse.top3_count}/5 / 能力 {horse.ability_score}/20 / 安定 {horse.stability_score}/10 / 展開 {horse.pace_score}/10"
+        horse.reason = f"TOP3 {horse.top3_count}/{item_count} / 能力 {horse.ability_score}/20 / 安定 {horse.stability_score}/10 / 展開 {horse.pace_score}/10"
     return horses
 
 
-def validate_inputs(horses: Dict[int, Horse]) -> List[str]:
+def validate_inputs(horses: Dict[int, Horse], time_columns: Tuple[str, ...]) -> List[str]:
     errors: List[str] = []
     if not horses:
         return ["出走表から馬を読み取れませんでした。"]
-    if not any(any(getattr(h.timeindex, c) > 0 for c in TIME_COLUMNS) for h in horses.values()):
+    if not any(any(getattr(h.timeindex, c) > 0 for c in time_columns) for h in horses.values()):
         errors.append("タイム指数を読み取れませんでした。")
     if sum(len(h.records) for h in horses.values()) == 0:
         errors.append("馬柱の近走データを読み取れませんでした。")
@@ -637,8 +650,8 @@ def result_dataframe(horses: Dict[int, Horse]) -> pd.DataFrame:
     ])
 
 
-st.title("🐎 競馬AI Ver5.1 解析安定版")
-st.caption("タイム指数60点＋馬柱40点｜タイム指数は列固定・同値含む上位3指数値")
+st.title("🐎 競馬AI Ver5.3 中央・地方対応版")
+st.caption("中央・地方を自動判別｜タイム指数60点＋馬柱40点｜同値含む上位3指数値")
 
 def clear_inputs() -> None:
     st.session_state["racecard_input"] = ""
@@ -684,13 +697,15 @@ with button_col2:
 if predict_clicked:
     horses = parse_racecard(racecard_text)
     horses = parse_past_performances(past_text, horses)
-    horses = parse_time_index(timeindex_text, horses)
+    horses, time_mode = parse_time_index(timeindex_text, horses)
+    time_columns = CENTRAL_TIME_COLUMNS if time_mode == "central" else LOCAL_TIME_COLUMNS
 
     parsed_horses = len(horses)
     parsed_records = sum(len(h.records) for h in horses.values())
     parsed_record_horses = sum(1 for h in horses.values() if h.records)
 
     with st.expander("読み取り確認", expanded=False):
+        st.write(f"判定形式：{'中央競馬' if time_mode == 'central' else '地方競馬'}")
         st.write(f"認識馬数：{parsed_horses}頭")
         st.write(f"馬柱認識：{parsed_record_horses}頭・合計{parsed_records}走")
         st.dataframe(
@@ -706,34 +721,36 @@ if predict_clicked:
             hide_index=True,
         )
         st.write("タイム指数読み取り")
-        st.dataframe(
-            pd.DataFrame([
-                {
-                    "馬番": h.number,
-                    "馬名": h.name,
-                    "全体": h.timeindex.overall,
-                    "スタート": h.timeindex.start,
-                    "追走": h.timeindex.chase,
-                    "上がり": h.timeindex.closing,
+        diagnostic_rows = []
+        for h in sorted(horses.values(), key=lambda x: x.number):
+            row = {"馬番": h.number, "馬名": h.name}
+            if time_mode == "central":
+                row.update({
+                    "全体": h.timeindex.overall, "スタート": h.timeindex.start,
+                    "追走": h.timeindex.chase, "上がり": h.timeindex.closing,
                     "5走平均": h.timeindex.avg5,
-                }
-                for h in sorted(horses.values(), key=lambda x: x.number)
-            ]),
-            use_container_width=True,
-            hide_index=True,
-        )
+                })
+            else:
+                row.update({
+                    "最高": h.timeindex.highest, "5走平均": h.timeindex.avg5,
+                    "距離": h.timeindex.distance, "コース": h.timeindex.course,
+                    "3走": h.timeindex.last3, "2走": h.timeindex.last2,
+                    "前走": h.timeindex.last1,
+                })
+            diagnostic_rows.append(row)
+        st.dataframe(pd.DataFrame(diagnostic_rows), use_container_width=True, hide_index=True)
 
-    errors = validate_inputs(horses)
+    errors = validate_inputs(horses, time_columns)
     if errors:
         for error in errors:
             st.error(error)
         st.stop()
 
-    horses = extract_top3(horses)
+    horses = extract_top3(horses, time_columns)
     horses = survival_check(horses)
-    horses = calc_time_score(horses)
+    horses = calc_time_score(horses, time_columns)
     horses = calc_racecard_score(horses)
-    horses = finish_scoring(horses)
+    horses = finish_scoring(horses, len(time_columns))
 
     st.divider()
     st.subheader("予想結果")
