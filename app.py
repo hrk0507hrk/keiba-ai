@@ -1,11 +1,12 @@
 import re
+import statistics
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="競馬AI Ver6", page_icon="🐎", layout="wide")
+st.set_page_config(page_title="競馬AI Ver7", page_icon="🐎", layout="wide")
 
 CENTRAL_TIME_COLUMNS = ("overall", "start", "chase", "closing", "avg5")
 LOCAL_TIME_COLUMNS = ("avg5", "distance", "course", "last3", "last2", "last1")
@@ -47,7 +48,9 @@ class RaceConditions:
 
 @dataclass
 class BestRecord:
+    # time_seconds は「今回距離への換算後タイム」
     time_seconds: float = 9999.0
+    original_time_seconds: float = 9999.0
     date: str = ""
     venue: str = ""
     surface: str = ""
@@ -98,6 +101,10 @@ class Horse:
     alive: bool = True
     time_score: int = 0
     best_record: BestRecord = field(default_factory=BestRecord)
+    converted_times: List[float] = field(default_factory=list)
+    converted_avg: float = 9999.0
+    converted_std: float = 9999.0
+    conversion_quality: float = 0.0
     record_score: int = 0
     total_score: int = 0
     mark: str = ""
@@ -673,74 +680,148 @@ def calc_time_score(horses: Dict[int, Horse], time_columns: Tuple[str, ...]) -> 
     return horses
 
 
-def record_match_level(record: RaceRecord, conditions: RaceConditions) -> int:
-    if record.time_seconds >= 9999 or record.distance <= 0:
-        return 0
-    if not conditions.surface or not conditions.distance:
-        return 0
-    if record.surface != conditions.surface or record.distance != conditions.distance:
-        return 0
-    same_venue = bool(conditions.venue and record.venue == conditions.venue)
-    same_going = bool(conditions.going and record.going == conditions.going)
-    if same_venue and same_going:
-        return 3
-    if same_venue:
-        return 2
-    return 1
+def conversion_quality(record: RaceRecord, conditions: RaceConditions) -> float:
+    """換算元レースの信頼度。距離は換算するため一致条件にはしない。"""
+    quality = 1.0
+
+    # 芝とダートは性質が大きく違うため、異なる場合だけ強めに減点。
+    if conditions.surface and record.surface and record.surface != conditions.surface:
+        quality *= 0.82
+
+    if conditions.venue and record.venue:
+        quality *= 1.00 if record.venue == conditions.venue else 0.97
+
+    if conditions.going and record.going:
+        quality *= 1.00 if record.going == conditions.going else 0.97
+
+    return max(0.70, min(1.00, quality))
+
+
+def convert_time_to_distance(
+    time_seconds: float,
+    from_distance: int,
+    to_distance: int,
+    exponent: float = 1.06,
+) -> float:
+    """元タイムを今回距離へ換算する。
+
+    単純比例ではなく、距離が延びるほど少しペースが落ちる前提の指数換算。
+    exponent は後から検証結果に合わせて調整できる。
+    """
+    if time_seconds >= 9999 or from_distance <= 0 or to_distance <= 0:
+        return 9999.0
+    return time_seconds * (to_distance / from_distance) ** exponent
 
 
 def select_best_records(horses: Dict[int, Horse], conditions: RaceConditions) -> Dict[int, Horse]:
+    """近5走をすべて今回距離へ換算し、ベスト・平均・安定度を保存する。"""
     for horse in horses.values():
-        candidates: List[Tuple[int, RaceRecord]] = []
-        for record in horse.records:
-            level = record_match_level(record, conditions)
-            if level > 0:
-                candidates.append((level, record))
+        horse.converted_times = []
+        horse.converted_avg = 9999.0
+        horse.converted_std = 9999.0
+        horse.conversion_quality = 0.0
+        horse.best_record = BestRecord()
 
-        if not candidates:
-            horse.best_record = BestRecord()
+        converted_rows: List[Tuple[float, float, RaceRecord]] = []
+        for record in horse.records:
+            converted = convert_time_to_distance(
+                record.time_seconds,
+                record.distance,
+                conditions.distance,
+            )
+            if converted >= 9999:
+                continue
+            quality = conversion_quality(record, conditions)
+            # 条件差はタイムそのものを大きく加工せず、比較用に小さく補正する。
+            adjusted = converted / quality
+            converted_rows.append((adjusted, quality, record))
+
+        if not converted_rows:
             continue
 
-        highest_level = max(level for level, _ in candidates)
-        best = min(
-            (record for level, record in candidates if level == highest_level),
-            key=lambda record: record.time_seconds,
+        converted_rows.sort(key=lambda row: row[0])
+        horse.converted_times = [row[0] for row in converted_rows]
+        horse.converted_avg = statistics.mean(horse.converted_times)
+        horse.converted_std = (
+            statistics.pstdev(horse.converted_times)
+            if len(horse.converted_times) >= 2
+            else 9999.0
         )
+        horse.conversion_quality = statistics.mean(row[1] for row in converted_rows)
+
+        best_time, best_quality, best = converted_rows[0]
+        same_surface = bool(conditions.surface and best.surface == conditions.surface)
+        same_venue = bool(conditions.venue and best.venue == conditions.venue)
+        same_going = bool(conditions.going and best.going == conditions.going)
+        match_level = 3 if same_surface and same_venue and same_going else 2 if same_surface else 1
+
         horse.best_record = BestRecord(
-            time_seconds=best.time_seconds,
+            time_seconds=best_time,
+            original_time_seconds=best.time_seconds,
             date=best.date,
             venue=best.venue,
             surface=best.surface,
             distance=best.distance,
             going=best.going,
-            match_level=highest_level,
+            match_level=match_level,
         )
     return horses
 
 
+def _lower_is_better(value: float, best: float, worst: float) -> float:
+    if value >= 9999:
+        return 0.0
+    if worst <= best:
+        return 1.0
+    return max(0.0, min(1.0, (worst - value) / (worst - best)))
+
+
 def calc_record_score(horses: Dict[int, Horse]) -> Dict[int, Horse]:
-    """採用持ち時計を0～50点化。一致レベルも反映する。"""
-    valid = [h for h in horses.values() if h.best_record.time_seconds < 9999]
+    """換算タイムを0～50点化。ベスト55％・平均30％・安定度15％。"""
+    valid = [h for h in horses.values() if h.converted_times]
     if not valid:
         for horse in horses.values():
             horse.record_score = 0
         return horses
 
-    times = [h.best_record.time_seconds for h in valid]
-    fastest, slowest = min(times), max(times)
-    level_factor = {3: 1.00, 2: 0.94, 1: 0.88}
+    best_values = [h.best_record.time_seconds for h in valid]
+    avg_values = [h.converted_avg for h in valid]
+    std_values = [h.converted_std for h in valid if h.converted_std < 9999]
 
+    best_min, best_max = min(best_values), max(best_values)
+    avg_min, avg_max = min(avg_values), max(avg_values)
+    std_min = min(std_values) if std_values else 0.0
+    std_max = max(std_values) if std_values else 0.0
+
+    raw_scores: Dict[int, float] = {}
     for horse in horses.values():
-        if horse.best_record.time_seconds >= 9999:
-            horse.record_score = 0
+        if not horse.converted_times:
+            raw_scores[horse.number] = 0.0
             continue
-        if slowest == fastest:
-            base = 50.0
+
+        best_component = _lower_is_better(horse.best_record.time_seconds, best_min, best_max)
+        avg_component = _lower_is_better(horse.converted_avg, avg_min, avg_max)
+        if horse.converted_std < 9999 and std_values:
+            stability_component = _lower_is_better(horse.converted_std, std_min, std_max)
         else:
-            # 最速50点、最遅25点。極端なタイム差で0点化しない。
-            base = 50.0 - 25.0 * (horse.best_record.time_seconds - fastest) / (slowest - fastest)
-        score = base * level_factor.get(horse.best_record.match_level, 0.0)
-        horse.record_score = max(0, min(50, round(score)))
+            # 1走だけでは安定性を判断できないため中立より少し下。
+            stability_component = 0.40
+
+        sample_coverage = min(1.0, len(horse.converted_times) / 5.0)
+        reliability = 0.85 + 0.15 * (sample_coverage * horse.conversion_quality)
+        raw_scores[horse.number] = (
+            0.55 * best_component
+            + 0.30 * avg_component
+            + 0.15 * stability_component
+        ) * reliability
+
+    best_raw = max(raw_scores.values(), default=0.0)
+    for horse in horses.values():
+        horse.record_score = (
+            round(50 * raw_scores[horse.number] / best_raw)
+            if best_raw > 0 else 0
+        )
+        horse.record_score = max(0, min(50, horse.record_score))
     return horses
 
 
@@ -765,13 +846,14 @@ def finish_scoring(horses: Dict[int, Horse], item_count: int) -> Dict[int, Horse
     for index, horse in enumerate(ranking):
         horse.mark = MARKS[index] if index < len(MARKS) else "△"
         record_text = (
-            f"{horse.best_record.venue}{horse.best_record.surface}{horse.best_record.distance} "
-            f"{horse.best_record.going} {format_time(horse.best_record.time_seconds)}"
-            if horse.best_record.time_seconds < 9999 else "該当持ち時計なし"
+            f"元:{horse.best_record.venue}{horse.best_record.surface}{horse.best_record.distance} "
+            f"{horse.best_record.going} {format_time(horse.best_record.original_time_seconds)} "
+            f"→換算 {format_time(horse.best_record.time_seconds)}"
+            if horse.best_record.time_seconds < 9999 else "換算可能タイムなし"
         )
         horse.reason = (
             f"指数TOP3 {horse.top3_count}/{item_count} / "
-            f"持ち時計 {record_text} / 一致Lv.{horse.best_record.match_level}"
+            f"{record_text} / 対象{len(horse.converted_times)}走"
         )
     return horses
 
@@ -812,14 +894,18 @@ def result_dataframe(horses: Dict[int, Horse]) -> pd.DataFrame:
             "馬名": h.name,
             "人気": "-" if h.popularity == 99 else h.popularity,
             "タイム指数50": h.time_score,
-            "持ち時計50": h.record_score,
+            "換算タイム50": h.record_score,
             "総合100": h.total_score,
-            "採用タイム": format_time(h.best_record.time_seconds),
-            "採用条件": (
-                f"{h.best_record.venue} {h.best_record.surface}{h.best_record.distance} {h.best_record.going}"
+            "ベスト換算": format_time(h.best_record.time_seconds),
+            "平均換算": format_time(h.converted_avg),
+            "安定度(秒)": "-" if h.converted_std >= 9999 else round(h.converted_std, 2),
+            "対象走数": len(h.converted_times),
+            "採用元": (
+                f"{h.best_record.venue} {h.best_record.surface}{h.best_record.distance} {h.best_record.going} "
+                f"{format_time(h.best_record.original_time_seconds)}"
                 if h.best_record.time_seconds < 9999 else "なし"
             ),
-            "一致レベル": h.best_record.match_level,
+            "条件信頼度": round(h.conversion_quality, 2),
             "採用日": h.best_record.date or "-",
             "評価": h.reason,
         }
@@ -833,8 +919,8 @@ def clear_inputs() -> None:
     st.session_state["timeindex_input"] = ""
 
 
-st.title("🐎 競馬AI Ver6 中央・地方対応版")
-st.caption("中央・地方を自動判別｜タイム指数50点＋同条件ベストタイム50点｜全馬順位")
+st.title("🐎 競馬AI Ver7 換算タイム版")
+st.caption("中央・地方を自動判別｜タイム指数50点＋近5走換算タイム50点｜全馬順位")
 
 
 racecard_text = st.text_area(
@@ -948,14 +1034,18 @@ if predict_clicked:
                 "馬番": h.number,
                 "馬名": h.name,
                 "タイム指数50": h.time_score,
-                "持ち時計50": h.record_score,
+                "換算タイム50": h.record_score,
                 "総合100": h.total_score,
-                "採用タイム": format_time(h.best_record.time_seconds),
+                "元タイム": format_time(h.best_record.original_time_seconds),
+                "ベスト換算": format_time(h.best_record.time_seconds),
+                "平均換算": format_time(h.converted_avg),
+                "安定度(秒)": "-" if h.converted_std >= 9999 else round(h.converted_std, 2),
+                "対象走数": len(h.converted_times),
                 "競馬場": h.best_record.venue or "-",
                 "芝ダ": h.best_record.surface or "-",
-                "距離": h.best_record.distance or "-",
+                "元距離": h.best_record.distance or "-",
                 "馬場": h.best_record.going or "-",
-                "一致Lv": h.best_record.match_level,
+                "条件信頼度": round(h.conversion_quality, 2),
                 "採用日": h.best_record.date or "-",
             })
         st.dataframe(pd.DataFrame(detail_rows), use_container_width=True, hide_index=True)
