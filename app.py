@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="競馬AI Ver5", page_icon="🐎", layout="wide")
+st.set_page_config(page_title="競馬AI Ver6", page_icon="🐎", layout="wide")
 
 CENTRAL_TIME_COLUMNS = ("overall", "start", "chase", "closing", "avg5")
 LOCAL_TIME_COLUMNS = ("avg5", "distance", "course", "last3", "last2", "last1")
@@ -22,15 +22,31 @@ TIME_LABELS = {
     "last2": "2走",
     "last1": "前走",
 }
-APPEARANCE_SCORE = {1: 20, 2: 34, 3: 46, 4: 54, 5: 60}
-MARKS = ("◎", "○", "▲", "★", "△", "△")
-CLASS_TABLE = (
-    ("G1", 10), ("GI", 10), ("G2", 9), ("GII", 9),
-    ("G3", 8), ("GIII", 8), ("リステッド", 7), ("L", 7),
-    ("OP", 7), ("オープン", 7), ("3勝", 6), ("1600万", 6),
-    ("2勝", 5), ("1000万", 5), ("1勝", 4), ("500万", 4),
-    ("未勝利", 2), ("新馬", 1),
+MARKS = ("◎", "○", "▲", "★")
+VENUES = (
+    "札幌", "函館", "福島", "新潟", "東京", "中山", "中京", "京都", "阪神", "小倉",
+    "門別", "盛岡", "水沢", "浦和", "船橋", "大井", "川崎", "金沢", "笠松", "名古屋",
+    "園田", "姫路", "高知", "佐賀", "帯広"
 )
+
+
+@dataclass
+class RaceConditions:
+    venue: str = ""
+    surface: str = ""
+    distance: int = 0
+    going: str = ""
+
+
+@dataclass
+class BestRecord:
+    time_seconds: float = 9999.0
+    date: str = ""
+    venue: str = ""
+    surface: str = ""
+    distance: int = 0
+    going: str = ""
+    match_level: int = 0
 
 
 @dataclass
@@ -39,6 +55,12 @@ class RaceRecord:
     margin: float = 99.9
     passing: str = ""
     race_class: int = 0
+    date: str = ""
+    venue: str = ""
+    surface: str = ""
+    distance: int = 0
+    going: str = ""
+    time_seconds: float = 9999.0
 
 
 @dataclass
@@ -66,12 +88,10 @@ class Horse:
     records: List[RaceRecord] = field(default_factory=list)
     timeindex: TimeIndex = field(default_factory=TimeIndex)
     top3_count: int = 0
-    alive: bool = False
-    ability_score: int = 0
-    stability_score: int = 0
-    pace_score: int = 0
-    racecard_score: int = 0
+    alive: bool = True
     time_score: int = 0
+    best_record: BestRecord = field(default_factory=BestRecord)
+    record_score: int = 0
     total_score: int = 0
     mark: str = ""
     reason: str = ""
@@ -146,6 +166,47 @@ def extract_jockey(line: str) -> str:
     return re.sub(r"\s+\d+(?:\.\d+)?kg.*$", "", jockey).strip()
 
 
+def parse_race_conditions(text: str) -> RaceConditions:
+    normalized = normalize_text(text).replace("ダート", "ダ").replace("芝コース", "芝")
+
+    venue = ""
+    for candidate in VENUES:
+        if candidate in normalized:
+            venue = candidate
+            break
+
+    surface = ""
+    distance = 0
+    surface_distance_patterns = (
+        r"(芝|ダ|障)\s*[右左直内外]*\s*(\d{3,4})\s*m?",
+        r"(\d{3,4})\s*m?\s*(芝|ダ|障)",
+    )
+    for pattern in surface_distance_patterns:
+        match = re.search(pattern, normalized)
+        if not match:
+            continue
+        if pattern.startswith(r"(芝"):
+            surface, distance_text = match.group(1), match.group(2)
+        else:
+            distance_text, surface = match.group(1), match.group(2)
+        distance = safe_int(distance_text)
+        break
+
+    going = ""
+    for pattern in (
+        r"馬場(?:状態)?\s*[:：]?\s*(良|稍重|重|不良)",
+        r"(?:芝|ダート?|障害)\s*[:：]?\s*(良|稍重|重|不良)",
+        r"\b(良|稍重|重|不良)\b",
+    ):
+        match = re.search(pattern, normalized)
+        if match:
+            going = match.group(1)
+            break
+
+
+    return RaceConditions(venue=venue, surface=surface, distance=distance, going=going)
+
+
 def parse_racecard(text: str) -> Dict[int, Horse]:
     horses: Dict[int, Horse] = {}
     current: Optional[Horse] = None
@@ -167,7 +228,6 @@ def parse_racecard(text: str) -> Dict[int, Horse]:
         if jockey:
             current.jockey = jockey
     return horses
-
 
 def parse_finish(line: str) -> int:
     """着順を取得。netkeiba馬柱では日付行末の数字が着順。"""
@@ -259,6 +319,65 @@ def past_horse_number(line: str, horses: Dict[int, Horse]) -> Optional[int]:
     return None
 
 
+def parse_time_seconds(text: str) -> float:
+    match = re.search(r"(?<!\d)(\d{1,2}):(\d{2})[.．](\d)(?!\d)", text)
+    if match:
+        return safe_int(match.group(1)) * 60 + safe_int(match.group(2)) + safe_int(match.group(3)) / 10
+    return 9999.0
+
+
+def format_time(seconds: float) -> str:
+    if seconds >= 9999:
+        return "なし"
+    minutes = int(seconds // 60)
+    remain = seconds - minutes * 60
+    return f"{minutes}:{remain:04.1f}"
+
+
+def extract_record_conditions(block_lines: List[str]) -> Tuple[str, str, int, str, str, float]:
+    joined = " ".join(block_lines).replace("ダート", "ダ")
+    first = normalize_text(block_lines[0]) if block_lines else ""
+
+    date_match = re.match(r"^(20\d{2}[./年]\d{1,2}(?:[./月]\d{1,2})?)", first)
+    date = date_match.group(1) if date_match else ""
+
+    venue = ""
+    for candidate in VENUES:
+        if candidate in joined:
+            venue = candidate
+            break
+
+    surface = ""
+    distance = 0
+    for pattern in (
+        r"(芝|ダ|障)\s*[右左直内外]*\s*(\d{3,4})\s*m?",
+        r"(\d{3,4})\s*m?\s*(芝|ダ|障)",
+    ):
+        match = re.search(pattern, joined)
+        if not match:
+            continue
+        if pattern.startswith(r"(芝"):
+            surface, distance_text = match.group(1), match.group(2)
+        else:
+            distance_text, surface = match.group(1), match.group(2)
+        distance = safe_int(distance_text)
+        break
+
+    going = ""
+    for pattern in (
+        r"馬場(?:状態)?\s*[:：]?\s*(良|稍重|重|不良)",
+        r"(?:芝|ダ)\s*(良|稍重|重|不良)",
+        r"(?<![一-龥])(良|稍重|重|不良)(?![一-龥])",
+    ):
+        match = re.search(pattern, joined)
+        if match:
+            going = match.group(1)
+            break
+
+
+    return date, venue, surface, distance, going, parse_time_seconds(joined)
+
+
 def record_from_lines(block_lines: List[str]) -> Optional[RaceRecord]:
     if not block_lines:
         return None
@@ -272,25 +391,29 @@ def record_from_lines(block_lines: List[str]) -> Optional[RaceRecord]:
     margin = 99.9
 
     for line in block_lines[1:]:
-        # クラスはレース名行から取得
         parsed_class = parse_class(line)
         if parsed_class != 3 or race_class == 3:
             race_class = parsed_class
-
         if not passing:
             passing = parse_passing(line)
-
         parsed_margin = parse_margin(line)
         if parsed_margin < 99.9:
             margin = parsed_margin
+
+    date, venue, surface, distance, going, time_seconds = extract_record_conditions(block_lines)
 
     return RaceRecord(
         finish=finish,
         margin=margin,
         passing=passing,
         race_class=race_class,
+        date=date,
+        venue=venue,
+        surface=surface,
+        distance=distance,
+        going=going,
+        time_seconds=time_seconds,
     )
-
 
 def parse_past_performances(
     text: str,
@@ -497,7 +620,6 @@ def time_value(horse: Horse, column: str) -> int:
 
 
 def extract_top3(horses: Dict[int, Horse], time_columns: Tuple[str, ...]) -> Dict[int, Horse]:
-    """各項目の上位3つの指数値を採用し、同値は全頭含める。"""
     for horse in horses.values():
         horse.top3_count = 0
 
@@ -505,207 +627,153 @@ def extract_top3(horses: Dict[int, Horse], time_columns: Tuple[str, ...]) -> Dic
         valid = [horse for horse in horses.values() if time_value(horse, column) > 0]
         if not valid:
             continue
-
-        top3_values = set(
-            sorted(
-                {time_value(horse, column) for horse in valid},
-                reverse=True,
-            )[:3]
-        )
-
+        top3_values = set(sorted({time_value(horse, column) for horse in valid}, reverse=True)[:3])
         for horse in valid:
             if time_value(horse, column) in top3_values:
                 horse.top3_count += 1
-
     return horses
 
 
 def survival_check(horses: Dict[int, Horse]) -> Dict[int, Horse]:
-    """タイム指数TOP3登場馬に加え、人気上位3頭は必ず残す。"""
+    # Ver6は全馬を順位付けする。人気上位3頭も必ず候補に残る。
     for horse in horses.values():
-        horse.alive = horse.top3_count > 0 or horse.popularity <= 3
+        has_time = any(value > 0 for value in vars(horse.timeindex).values())
+        horse.alive = has_time or horse.popularity <= 3 or bool(horse.records)
     return horses
-
-
-def rank_bonus_for_column(horses: Dict[int, Horse], column: str) -> Dict[int, int]:
-    valid = [h for h in horses.values() if h.alive and time_value(h, column) > 0]
-    if not valid:
-        return {}
-    distinct = sorted({time_value(h, column) for h in valid}, reverse=True)
-    bonus: Dict[int, int] = {}
-    for horse in valid:
-        value = time_value(horse, column)
-        if value == distinct[0]:
-            bonus[horse.number] = 2
-        elif len(distinct) >= 2 and value == distinct[1]:
-            bonus[horse.number] = 1
-    return bonus
 
 
 def calc_time_score(horses: Dict[int, Horse], time_columns: Tuple[str, ...]) -> Dict[int, Horse]:
+    """タイム指数を0～50点へ正規化。各項目の相対値を平均する。"""
+    column_max = {
+        column: max((time_value(h, column) for h in horses.values()), default=0)
+        for column in time_columns
+    }
+
+    raw_scores: Dict[int, float] = {}
     for horse in horses.values():
-        horse.time_score = APPEARANCE_SCORE.get(horse.top3_count, 0) if horse.alive else 0
-    for column in time_columns:
-        for number, bonus in rank_bonus_for_column(horses, column).items():
-            horses[number].time_score += bonus
+        ratios = [
+            time_value(horse, column) / column_max[column]
+            for column in time_columns
+            if column_max[column] > 0 and time_value(horse, column) > 0
+        ]
+        coverage = len(ratios) / len(time_columns) if time_columns else 0
+        raw_scores[horse.number] = (sum(ratios) / len(ratios) * coverage) if ratios else 0.0
+
+    best_raw = max(raw_scores.values(), default=0.0)
     for horse in horses.values():
-        horse.time_score = min(horse.time_score, 60)
+        horse.time_score = round(50 * raw_scores[horse.number] / best_raw) if best_raw > 0 else 0
+        horse.time_score = max(0, min(50, horse.time_score))
     return horses
 
 
-def recent_five(records: List[RaceRecord]) -> List[RaceRecord]:
-    return records[:5]
-
-
-def calc_ability_score(records: List[RaceRecord]) -> int:
-    records = recent_five(records)
-    if not records:
+def record_match_level(record: RaceRecord, conditions: RaceConditions) -> int:
+    if record.time_seconds >= 9999 or record.distance <= 0:
         return 0
-    finishes = [r.finish for r in records if 1 <= r.finish < 99]
-    if finishes:
-        avg = sum(finishes) / len(finishes)
-        finish_score = 10 if avg <= 1.5 else 9 if avg <= 2.5 else 8 if avg <= 3.5 else 7 if avg <= 4.5 else 6 if avg <= 5.5 else 5 if avg <= 6.5 else 4 if avg <= 7.5 else 3 if avg <= 8.5 else 2 if avg <= 10 else 1
-    else:
-        finish_score = 0
-    classes = [r.race_class for r in records if r.race_class > 0]
-    if classes:
-        avg_class = sum(classes) / len(classes)
-        class_score = 6 if avg_class >= 9 else 5 if avg_class >= 7 else 4 if avg_class >= 6 else 3 if avg_class >= 5 else 2 if avg_class >= 3 else 1
-    else:
-        class_score = 0
-    margins = [r.margin for r in records if 0 <= r.margin < 10]
-    if margins:
-        avg_margin = sum(margins) / len(margins)
-        margin_score = 4 if avg_margin <= 0.2 else 3 if avg_margin <= 0.5 else 2 if avg_margin <= 1.0 else 1 if avg_margin <= 1.5 else 0
-    else:
-        margin_score = 0
-    return min(finish_score + class_score + margin_score, 20)
-
-
-def calc_stability_score(records: List[RaceRecord]) -> int:
-    valid = [r for r in recent_five(records) if 1 <= r.finish < 99]
-    if not valid:
+    if not conditions.surface or not conditions.distance:
         return 0
-    rate = sum(1 for r in valid if r.finish <= 3) / len(valid)
-    return 10 if rate >= 1.0 else 8 if rate >= 0.8 else 6 if rate >= 0.6 else 4 if rate >= 0.4 else 2 if rate >= 0.2 else 0
-
-
-def calc_pace_score(records: List[RaceRecord]) -> int:
-    positions = []
-    for record in recent_five(records):
-        match = re.search(r"\d{1,2}", record.passing or "")
-        if match:
-            positions.append(safe_int(match.group()))
-    if not positions:
+    if record.surface != conditions.surface or record.distance != conditions.distance:
         return 0
-    rate = sum(1 for pos in positions if pos <= 3) / len(positions)
-    return 10 if rate >= 1.0 else 8 if rate >= 0.8 else 6 if rate >= 0.6 else 4 if rate >= 0.4 else 2 if rate >= 0.2 else 0
+    same_venue = bool(conditions.venue and record.venue == conditions.venue)
+    same_going = bool(conditions.going and record.going == conditions.going)
+    if same_venue and same_going:
+        return 3
+    if same_venue:
+        return 2
+    return 1
 
 
-def calc_racecard_score(horses: Dict[int, Horse]) -> Dict[int, Horse]:
+def select_best_records(horses: Dict[int, Horse], conditions: RaceConditions) -> Dict[int, Horse]:
     for horse in horses.values():
-        if not horse.alive:
-            horse.ability_score = horse.stability_score = horse.pace_score = horse.racecard_score = 0
+        candidates: List[Tuple[int, RaceRecord]] = []
+        for record in horse.records:
+            level = record_match_level(record, conditions)
+            if level > 0:
+                candidates.append((level, record))
+
+        if not candidates:
+            horse.best_record = BestRecord()
             continue
-        horse.ability_score = calc_ability_score(horse.records)
-        horse.stability_score = calc_stability_score(horse.records)
-        horse.pace_score = calc_pace_score(horse.records)
-        horse.racecard_score = min(horse.ability_score + horse.stability_score + horse.pace_score, 40)
+
+        highest_level = max(level for level, _ in candidates)
+        best = min(
+            (record for level, record in candidates if level == highest_level),
+            key=lambda record: record.time_seconds,
+        )
+        horse.best_record = BestRecord(
+            time_seconds=best.time_seconds,
+            date=best.date,
+            venue=best.venue,
+            surface=best.surface,
+            distance=best.distance,
+            going=best.going,
+            match_level=highest_level,
+        )
     return horses
 
 
-def axis_penalty(horse: Horse) -> int:
-    """最終候補の中から◎を決めるための内部減点。表示には使用しない。"""
-    penalty = 0
-    recent = recent_five(horse.records)
+def calc_record_score(horses: Dict[int, Horse]) -> Dict[int, Horse]:
+    """採用持ち時計を0～50点化。一致レベルも反映する。"""
+    valid = [h for h in horses.values() if h.best_record.time_seconds < 9999]
+    if not valid:
+        for horse in horses.values():
+            horse.record_score = 0
+        return horses
 
-    if sum(1 for record in recent if record.finish >= 10) >= 2:
-        penalty += 3
-    if horse.top3_count <= 1:
-        penalty += 2
-    if horse.stability_score <= 2:
-        penalty += 1
-    if horse.pace_score <= 2:
-        penalty += 1
+    times = [h.best_record.time_seconds for h in valid]
+    fastest, slowest = min(times), max(times)
+    level_factor = {3: 1.00, 2: 0.94, 1: 0.88}
 
-    return penalty
+    for horse in horses.values():
+        if horse.best_record.time_seconds >= 9999:
+            horse.record_score = 0
+            continue
+        if slowest == fastest:
+            base = 50.0
+        else:
+            # 最速50点、最遅25点。極端なタイム差で0点化しない。
+            base = 50.0 - 25.0 * (horse.best_record.time_seconds - fastest) / (slowest - fastest)
+        score = base * level_factor.get(horse.best_record.match_level, 0.0)
+        horse.record_score = max(0, min(50, round(score)))
+    return horses
 
 
 def finish_scoring(horses: Dict[int, Horse], item_count: int) -> Dict[int, Horse]:
-    """人気上位3頭＋AI評価上位の穴馬で5～6頭に絞り、内部判定で◎を決める。"""
     for horse in horses.values():
-        horse.total_score = horse.time_score + horse.racecard_score if horse.alive else 0
+        horse.total_score = horse.time_score + horse.record_score
         horse.mark = ""
 
-    alive_horses = [horse for horse in horses.values() if horse.alive]
-    ranking_key = lambda h: (
-        h.total_score,
-        h.time_score,
-        h.racecard_score,
-        -h.popularity,
-        -h.number,
-    )
-
-    favorites = sorted(
-        [horse for horse in alive_horses if horse.popularity <= 3],
-        key=lambda h: (h.popularity, -h.total_score, h.number),
-    )
-
-    outsiders = sorted(
-        [horse for horse in alive_horses if horse.popularity > 3],
-        key=ranking_key,
+    ranking = sorted(
+        horses.values(),
+        key=lambda h: (
+            h.total_score,
+            h.record_score,
+            h.time_score,
+            h.best_record.match_level,
+            -h.popularity,
+            -h.number,
+        ),
         reverse=True,
     )
 
-    candidate_limit = min(6, len(alive_horses))
-    candidates = favorites[:3]
-
-    for horse in outsiders:
-        if len(candidates) >= candidate_limit:
-            break
-        candidates.append(horse)
-
-    if len(candidates) < candidate_limit:
-        remaining = sorted(
-            [horse for horse in alive_horses if horse not in candidates],
-            key=ranking_key,
-            reverse=True,
+    for index, horse in enumerate(ranking):
+        horse.mark = MARKS[index] if index < len(MARKS) else "△"
+        record_text = (
+            f"{horse.best_record.venue}{horse.best_record.surface}{horse.best_record.distance} "
+            f"{horse.best_record.going} {format_time(horse.best_record.time_seconds)}"
+            if horse.best_record.time_seconds < 9999 else "該当持ち時計なし"
         )
-        candidates.extend(remaining[:candidate_limit - len(candidates)])
-
-    if candidates:
-        axis = min(
-            candidates,
-            key=lambda h: (
-                axis_penalty(h),
-                -h.total_score,
-                -h.time_score,
-                -h.racecard_score,
-                h.popularity,
-                h.number,
-            ),
-        )
-        axis.mark = "◎"
-
-        others = sorted(
-            [horse for horse in candidates if horse.number != axis.number],
-            key=ranking_key,
-            reverse=True,
-        )
-        for mark, horse in zip(MARKS[1:], others):
-            horse.mark = mark
-
-    for horse in horses.values():
         horse.reason = (
-            f"TOP3 {horse.top3_count}/{item_count} / "
-            f"能力 {horse.ability_score}/20 / "
-            f"安定 {horse.stability_score}/10 / "
-            f"展開 {horse.pace_score}/10"
+            f"指数TOP3 {horse.top3_count}/{item_count} / "
+            f"持ち時計 {record_text} / 一致Lv.{horse.best_record.match_level}"
         )
     return horses
 
 
-def validate_inputs(horses: Dict[int, Horse], time_columns: Tuple[str, ...]) -> List[str]:
+def validate_inputs(
+    horses: Dict[int, Horse],
+    time_columns: Tuple[str, ...],
+    conditions: RaceConditions,
+) -> List[str]:
     errors: List[str] = []
     if not horses:
         return ["出走表から馬を読み取れませんでした。"]
@@ -713,39 +781,53 @@ def validate_inputs(horses: Dict[int, Horse], time_columns: Tuple[str, ...]) -> 
         errors.append("タイム指数を読み取れませんでした。")
     if sum(len(h.records) for h in horses.values()) == 0:
         errors.append("馬柱の近走データを読み取れませんでした。")
+    if not conditions.surface or not conditions.distance:
+        errors.append("出走表から芝・ダートと距離を読み取れませんでした。")
     return errors
 
 
 def result_dataframe(horses: Dict[int, Horse]) -> pd.DataFrame:
     mark_order = {"◎": 0, "○": 1, "▲": 2, "★": 3, "△": 4}
     ranking = sorted(
-        [h for h in horses.values() if h.mark],
+        horses.values(),
         key=lambda h: (
             mark_order.get(h.mark, 99),
             -h.total_score,
+            -h.record_score,
             -h.time_score,
             h.number,
         ),
     )
     return pd.DataFrame([
         {
-            "印": h.mark, "馬番": h.number, "馬名": h.name,
-            "TOP3回数": h.top3_count, "タイム60": h.time_score,
-            "能力20": h.ability_score, "安定10": h.stability_score,
-            "展開10": h.pace_score, "馬柱40": h.racecard_score,
-            "総合100": h.total_score, "評価": h.reason,
+            "印": h.mark,
+            "馬番": h.number,
+            "馬名": h.name,
+            "人気": "-" if h.popularity == 99 else h.popularity,
+            "タイム指数50": h.time_score,
+            "持ち時計50": h.record_score,
+            "総合100": h.total_score,
+            "採用タイム": format_time(h.best_record.time_seconds),
+            "採用条件": (
+                f"{h.best_record.venue} {h.best_record.surface}{h.best_record.distance} {h.best_record.going}"
+                if h.best_record.time_seconds < 9999 else "なし"
+            ),
+            "一致レベル": h.best_record.match_level,
+            "採用日": h.best_record.date or "-",
+            "評価": h.reason,
         }
         for h in ranking
     ])
 
 
-st.title("🐎 競馬AI Ver5.4 中央・地方対応版")
-st.caption("中央・地方を自動判別｜タイム指数60点＋馬柱40点｜同値含む上位3指数値")
-
 def clear_inputs() -> None:
     st.session_state["racecard_input"] = ""
     st.session_state["past_input"] = ""
     st.session_state["timeindex_input"] = ""
+
+
+st.title("🐎 競馬AI Ver6 中央・地方対応版")
+st.caption("中央・地方を自動判別｜タイム指数50点＋同条件ベストタイム50点｜全馬順位")
 
 
 racecard_text = st.text_area(
@@ -784,6 +866,7 @@ with button_col2:
     )
 
 if predict_clicked:
+    race_conditions = parse_race_conditions(racecard_text)
     horses = parse_racecard(racecard_text)
     horses = parse_past_performances(past_text, horses)
     horses, time_mode = parse_time_index(timeindex_text, horses)
@@ -795,6 +878,7 @@ if predict_clicked:
 
     with st.expander("読み取り確認", expanded=False):
         st.write(f"判定形式：{'中央競馬' if time_mode == 'central' else '地方競馬'}")
+        st.write(f"対象条件：{race_conditions.venue or '不明'} {race_conditions.surface or '不明'}{race_conditions.distance or '不明'} {race_conditions.going or '不明'}")
         st.write(f"認識馬数：{parsed_horses}頭")
         st.write(f"馬柱認識：{parsed_record_horses}頭・合計{parsed_records}走")
         st.dataframe(
@@ -829,7 +913,7 @@ if predict_clicked:
             diagnostic_rows.append(row)
         st.dataframe(pd.DataFrame(diagnostic_rows), use_container_width=True, hide_index=True)
 
-    errors = validate_inputs(horses, time_columns)
+    errors = validate_inputs(horses, time_columns, race_conditions)
     if errors:
         for error in errors:
             st.error(error)
@@ -838,7 +922,8 @@ if predict_clicked:
     horses = extract_top3(horses, time_columns)
     horses = survival_check(horses)
     horses = calc_time_score(horses, time_columns)
-    horses = calc_racecard_score(horses)
+    horses = select_best_records(horses, race_conditions)
+    horses = calc_record_score(horses)
     horses = finish_scoring(horses, len(time_columns))
 
     st.divider()
@@ -849,11 +934,21 @@ if predict_clicked:
     else:
         st.dataframe(result, use_container_width=True, hide_index=True)
 
-    eliminated = pd.DataFrame([
-        {"馬番": h.number, "馬名": h.name, "TOP3回数": h.top3_count}
-        for h in sorted(horses.values(), key=lambda x: x.number)
-        if not h.mark
-    ])
-    if not eliminated.empty:
-        with st.expander("消し馬"):
-            st.dataframe(eliminated, use_container_width=True, hide_index=True)
+    with st.expander("全馬の採点詳細"):
+        detail_rows = []
+        for h in sorted(horses.values(), key=lambda x: (-x.total_score, x.number)):
+            detail_rows.append({
+                "馬番": h.number,
+                "馬名": h.name,
+                "タイム指数50": h.time_score,
+                "持ち時計50": h.record_score,
+                "総合100": h.total_score,
+                "採用タイム": format_time(h.best_record.time_seconds),
+                "競馬場": h.best_record.venue or "-",
+                "芝ダ": h.best_record.surface or "-",
+                "距離": h.best_record.distance or "-",
+                "馬場": h.best_record.going or "-",
+                "一致Lv": h.best_record.match_level,
+                "採用日": h.best_record.date or "-",
+            })
+        st.dataframe(pd.DataFrame(detail_rows), use_container_width=True, hide_index=True)
