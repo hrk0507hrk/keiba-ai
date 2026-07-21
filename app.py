@@ -23,7 +23,7 @@ TIME_LABELS = {
     "last1": "前走",
 }
 APPEARANCE_SCORE = {1: 20, 2: 34, 3: 46, 4: 54, 5: 60}
-MARKS = ("◎", "○", "▲", "★", "△")
+MARKS = ("◎", "○", "▲", "★", "△", "△")
 CLASS_TABLE = (
     ("G1", 10), ("GI", 10), ("G2", 9), ("GII", 9),
     ("G3", 8), ("GIII", 8), ("リステッド", 7), ("L", 7),
@@ -521,8 +521,9 @@ def extract_top3(horses: Dict[int, Horse], time_columns: Tuple[str, ...]) -> Dic
 
 
 def survival_check(horses: Dict[int, Horse]) -> Dict[int, Horse]:
+    """タイム指数TOP3登場馬に加え、人気上位3頭は必ず残す。"""
     for horse in horses.values():
-        horse.alive = horse.top3_count > 0
+        horse.alive = horse.top3_count > 0 or horse.popularity <= 3
     return horses
 
 
@@ -613,15 +614,94 @@ def calc_racecard_score(horses: Dict[int, Horse]) -> Dict[int, Horse]:
     return horses
 
 
+def axis_penalty(horse: Horse) -> int:
+    """最終候補の中から◎を決めるための内部減点。表示には使用しない。"""
+    penalty = 0
+    recent = recent_five(horse.records)
+
+    if sum(1 for record in recent if record.finish >= 10) >= 2:
+        penalty += 3
+    if horse.top3_count <= 1:
+        penalty += 2
+    if horse.stability_score <= 2:
+        penalty += 1
+    if horse.pace_score <= 2:
+        penalty += 1
+
+    return penalty
+
+
 def finish_scoring(horses: Dict[int, Horse], item_count: int) -> Dict[int, Horse]:
+    """人気上位3頭＋AI評価上位の穴馬で5～6頭に絞り、内部判定で◎を決める。"""
     for horse in horses.values():
         horse.total_score = horse.time_score + horse.racecard_score if horse.alive else 0
         horse.mark = ""
-    ranking = sorted([h for h in horses.values() if h.alive], key=lambda h: (h.total_score, h.time_score, h.racecard_score, -h.number), reverse=True)
-    for index, horse in enumerate(ranking[:len(MARKS)]):
-        horse.mark = MARKS[index]
+
+    alive_horses = [horse for horse in horses.values() if horse.alive]
+    ranking_key = lambda h: (
+        h.total_score,
+        h.time_score,
+        h.racecard_score,
+        -h.popularity,
+        -h.number,
+    )
+
+    favorites = sorted(
+        [horse for horse in alive_horses if horse.popularity <= 3],
+        key=lambda h: (h.popularity, -h.total_score, h.number),
+    )
+
+    outsiders = sorted(
+        [horse for horse in alive_horses if horse.popularity > 3],
+        key=ranking_key,
+        reverse=True,
+    )
+
+    candidate_limit = min(6, len(alive_horses))
+    candidates = favorites[:3]
+
+    for horse in outsiders:
+        if len(candidates) >= candidate_limit:
+            break
+        candidates.append(horse)
+
+    if len(candidates) < candidate_limit:
+        remaining = sorted(
+            [horse for horse in alive_horses if horse not in candidates],
+            key=ranking_key,
+            reverse=True,
+        )
+        candidates.extend(remaining[:candidate_limit - len(candidates)])
+
+    if candidates:
+        axis = min(
+            candidates,
+            key=lambda h: (
+                axis_penalty(h),
+                -h.total_score,
+                -h.time_score,
+                -h.racecard_score,
+                h.popularity,
+                h.number,
+            ),
+        )
+        axis.mark = "◎"
+
+        others = sorted(
+            [horse for horse in candidates if horse.number != axis.number],
+            key=ranking_key,
+            reverse=True,
+        )
+        for mark, horse in zip(MARKS[1:], others):
+            horse.mark = mark
+
     for horse in horses.values():
-        horse.reason = f"TOP3 {horse.top3_count}/{item_count} / 能力 {horse.ability_score}/20 / 安定 {horse.stability_score}/10 / 展開 {horse.pace_score}/10"
+        horse.reason = (
+            f"TOP3 {horse.top3_count}/{item_count} / "
+            f"能力 {horse.ability_score}/20 / "
+            f"安定 {horse.stability_score}/10 / "
+            f"展開 {horse.pace_score}/10"
+        )
     return horses
 
 
@@ -637,7 +717,16 @@ def validate_inputs(horses: Dict[int, Horse], time_columns: Tuple[str, ...]) -> 
 
 
 def result_dataframe(horses: Dict[int, Horse]) -> pd.DataFrame:
-    ranking = sorted([h for h in horses.values() if h.alive], key=lambda h: (h.total_score, h.time_score, h.racecard_score, -h.number), reverse=True)
+    mark_order = {"◎": 0, "○": 1, "▲": 2, "★": 3, "△": 4}
+    ranking = sorted(
+        [h for h in horses.values() if h.mark],
+        key=lambda h: (
+            mark_order.get(h.mark, 99),
+            -h.total_score,
+            -h.time_score,
+            h.number,
+        ),
+    )
     return pd.DataFrame([
         {
             "印": h.mark, "馬番": h.number, "馬名": h.name,
@@ -650,7 +739,7 @@ def result_dataframe(horses: Dict[int, Horse]) -> pd.DataFrame:
     ])
 
 
-st.title("🐎 競馬AI Ver5.3 中央・地方対応版")
+st.title("🐎 競馬AI Ver5.4 中央・地方対応版")
 st.caption("中央・地方を自動判別｜タイム指数60点＋馬柱40点｜同値含む上位3指数値")
 
 def clear_inputs() -> None:
@@ -763,7 +852,7 @@ if predict_clicked:
     eliminated = pd.DataFrame([
         {"馬番": h.number, "馬名": h.name, "TOP3回数": h.top3_count}
         for h in sorted(horses.values(), key=lambda x: x.number)
-        if not h.alive
+        if not h.mark
     ])
     if not eliminated.empty:
         with st.expander("消し馬"):
