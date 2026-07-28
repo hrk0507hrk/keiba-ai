@@ -1283,11 +1283,12 @@ def calculate_axis_index(horse: Horse) -> float:
     """能力ではなく『崩れにくさ』を重視した軸専用指数。"""
     score = (
         horse.score.stability_score * 0.30
-        + horse.score.time_index * 0.25
-        + horse.score.recent_form * 0.15
-        + horse.score.suitability * 0.10
-        + horse.score.survival_score * 0.10
+        + horse.score.recent_form * 0.25
+        + horse.score.time_index * 0.15
+        + horse.score.ability_index * 0.10
         + horse.score.race_level * 0.10
+        + horse.score.suitability * 0.10
+        + min(horse.score.weight_bonus, 2.0)
         - horse.score.danger_score * 0.30
     )
     return clamp(score)
@@ -1394,35 +1395,36 @@ def assign_weight_allowance(horses: Dict[int, Horse]) -> None:
 
 
 def calculate_weight_bonus(horse: Horse) -> float:
-    """軽斤量と先行力を生存・印選定へ反映する。"""
+    """軽斤量は補助材料に限定し、単独で順位を大きく動かさない。"""
     allowance = horse.weight_allowance
+
     if allowance >= 2.0:
-        bonus = 4.0
-    elif allowance >= 1.0:
         bonus = 2.0
-    elif allowance >= 0.5:
+    elif allowance >= 1.0:
         bonus = 1.0
+    elif allowance >= 0.5:
+        bonus = 0.5
     else:
         bonus = 0.0
 
     recent_values = recent_time_values(horse)
     recent_peak = max(recent_values) if recent_values else -99
 
-    # 軽斤量で前へ行け、直近3走内にプラス指数がある馬を追加評価。
+    # 軽斤量＋前向きな脚質＋直近指数の裏付けがある場合だけ小幅加点。
     if (
         allowance >= 2.0
         and horse.running_style in ("逃げ", "先行")
         and recent_peak >= 10
     ):
-        bonus += 5.0
+        bonus += 1.0
     elif (
         allowance >= 1.0
         and horse.running_style in ("逃げ", "先行")
         and recent_peak >= 0
     ):
-        bonus += 2.0
+        bonus += 0.5
 
-    return clamp(bonus, 0, 12)
+    return clamp(bonus, 0, 3)
 
 
 def calculate_danger_score(horse: Horse) -> float:
@@ -1729,13 +1731,31 @@ def build_comment(horse: Horse) -> str:
     return "・".join(reasons[:3])
 
 
+def mark_order_key(horse: Horse):
+    """○以下の印順。能力を主軸に、印選定指数と軸適性で補正する。"""
+    return (
+        horse.score.ability_index,
+        horse.score.selection_score,
+        horse.score.axis_index,
+        horse.score.recent_form,
+        horse.score.time_index,
+        -horse.popularity,
+        -horse.number,
+    )
+
+
 def select_marks(horses: Dict[int, Horse]) -> List[Horse]:
-    """人気1～3位を印に残し、◎順は軸指数と軸禁止判定を優先する。"""
+    """
+    人気1～3位は必ず印に残すが、◎○▲へ固定しない。
+
+    1. 人気1～3位の中から軸指数最上位を◎
+    2. 残りの人気上位2頭を必須候補にする
+    3. 人気4～8位から印選定指数上位4頭を選ぶ
+    4. 6頭を能力中心で並べ、○▲△☆注穴を付ける
+    """
     for horse in horses.values():
         horse.mark = ""
         horse.comment = ""
-
-    selected: List[Horse] = []
 
     top_popular = [
         horse
@@ -1747,43 +1767,58 @@ def select_marks(horses: Dict[int, Horse]) -> List[Horse]:
             not horse.score.axis_banned,
             horse.score.axis_index,
             horse.score.stability_score,
-            ranking_key(horse),
+            horse.score.ability_index,
+            horse.score.selection_score,
         ),
         reverse=True,
     )
 
+    # 人気情報が不足した時だけ総合上位で補完する。
     if len(top_popular) < 3:
         already = {horse.number for horse in top_popular}
         fallback = [
-            horse for horse in sorted(horses.values(), key=ranking_key, reverse=True)
+            horse
+            for horse in sorted(horses.values(), key=ranking_key, reverse=True)
             if horse.number not in already
         ]
         top_popular.extend(fallback[: 3 - len(top_popular)])
 
-    for mark, horse in zip(("◎", "○", "▲"), top_popular[:3]):
-        horse.mark = mark
-        horse.comment = build_comment(horse)
-        selected.append(horse)
+    if not top_popular:
+        return []
 
-    selected_numbers = {horse.number for horse in selected}
+    axis = top_popular[0]
+    axis.mark = "◎"
+    axis.comment = build_comment(axis)
+
+    mandatory_top = top_popular[1:3]
+    mandatory_numbers = {horse.number for horse in top_popular[:3]}
 
     middle_popular = [
         horse
         for horse in horses.values()
         if 4 <= horse.popularity <= 8
-        and horse.number not in selected_numbers
+        and horse.number not in mandatory_numbers
     ]
     middle_popular.sort(key=middle_selection_key, reverse=True)
 
-    for mark, horse in zip(("△", "☆", "注", "穴"), middle_popular[:4]):
+    # 人気4～8位は5頭中4頭を生存・印選定評価で残す。
+    selected_middle = middle_popular[:4]
+
+    partner_pool = mandatory_top + selected_middle
+    partner_pool.sort(key=mark_order_key, reverse=True)
+
+    selected: List[Horse] = [axis]
+    for mark, horse in zip(("○", "▲", "△", "☆", "注", "穴"), partner_pool[:6]):
         horse.mark = mark
         horse.comment = build_comment(horse)
         selected.append(horse)
 
+    # データ不足時の保険。既選出馬以外を能力順で7頭まで補う。
     if len(selected) < 7:
         selected_numbers = {horse.number for horse in selected}
         fallback = [
-            horse for horse in sorted(horses.values(), key=middle_selection_key, reverse=True)
+            horse
+            for horse in sorted(horses.values(), key=mark_order_key, reverse=True)
             if horse.number not in selected_numbers
         ]
         remaining_marks = list(MARKS[len(selected):])
@@ -1982,9 +2017,9 @@ def clear_inputs():
     st.session_state["timeindex_input"] = ""
 
 
-st.title("🐎 競馬AI Next v0.6.1 指数分散・軸候補修正版")
+st.title("🐎 競馬AI Next v0.6.2 軸配点・印順位修正版")
 st.caption(
-    "指数の上限張り付きを解消し、適格馬の接戦時は軸候補2頭を表示"
+    "軸配点を安定・近走重視へ調整｜人気上位3頭は残しつつ印順は能力比較"
 )
 
 racecard_text = st.text_area(
