@@ -231,6 +231,34 @@ def parse_conditions(text: str) -> RaceConditions:
     )
 
 
+def merge_conditions(
+    explicit_text: str,
+    racecard_text: str,
+) -> RaceConditions:
+    """
+    任意のレース条件入力を優先し、不足している項目だけ出走表から補う。
+    例: 「中京 ダ1400 良」
+    """
+    explicit = parse_conditions(explicit_text)
+    fallback = parse_conditions(racecard_text)
+
+    return RaceConditions(
+        venue=explicit.venue or fallback.venue,
+        surface=explicit.surface or fallback.surface,
+        distance=explicit.distance or fallback.distance,
+        going=explicit.going or fallback.going,
+    )
+
+
+def has_known_conditions(conditions: RaceConditions) -> bool:
+    return any((
+        conditions.venue,
+        conditions.surface,
+        conditions.distance,
+        conditions.going,
+    ))
+
+
 # =========================================================
 # Racecard parser
 # =========================================================
@@ -871,15 +899,24 @@ def score_race_level(horse: Horse, conditions: RaceConditions) -> float:
 
     weights = [1.00, 0.90, 0.80, 0.70, 0.60]
     weighted_scores = []
-    current_strength = venue_strength(conditions.venue)
+
+    # 開催場が不明な場合は、競馬場格差による相手弱化加点を使わない。
+    # 「不明＝最弱の競馬場」と誤認して中央実績を過大評価するのを防ぐ。
+    current_strength = (
+        venue_strength(conditions.venue)
+        if conditions.venue
+        else None
+    )
 
     for index, record in enumerate(horse.records[:5]):
         level = class_score(record.race_class)
-        prior_strength = venue_strength(record.venue)
 
-        # 中央・南関から他地区へ移る場合は、過去に戦った相手レベルを加点する。
-        if prior_strength > current_strength:
-            level += (prior_strength - current_strength) * 10
+        if current_strength is not None and record.venue:
+            prior_strength = venue_strength(record.venue)
+
+            # 中央・南関から他地区へ移る場合のみ、過去の相手レベルを加点する。
+            if prior_strength > current_strength:
+                level += (prior_strength - current_strength) * 10
 
         performance = margin_performance_score(record.margin)
         level += (performance - 50) * 0.14
@@ -896,6 +933,11 @@ def score_suitability(
 ) -> float:
     if not horse.records:
         return 45.0
+
+    # 現在条件が一つも分からない時は、過去着差を「条件適性」として
+    # 重複評価せず、中立値に固定する。
+    if not has_known_conditions(conditions):
+        return 50.0
 
     scores = []
 
@@ -2036,14 +2078,21 @@ def diagnostic_dataframe(horses: Dict[int, Horse]) -> pd.DataFrame:
 # =========================================================
 
 def clear_inputs():
+    st.session_state["conditions_input"] = ""
     st.session_state["racecard_input"] = ""
     st.session_state["past_input"] = ""
     st.session_state["timeindex_input"] = ""
 
 
-st.title("🐎 競馬AI Next v0.6.3 着順・Jpn重賞読取修正版")
+st.title("🐎 競馬AI Next v0.6.4 レース条件・格差補正修正版")
 st.caption(
-    "日付行末の正式着順を反映｜JpnI～III・地方重賞に対応｜通過順位の着順代用を廃止"
+    "開催場不明時の競馬場格差加点を停止｜条件不明時は適性を中立化｜任意のレース条件入力を追加"
+)
+
+conditions_text = st.text_input(
+    "レース条件（任意）",
+    placeholder="例：中京 ダ1400 良　※分かる項目だけでもOK",
+    key="conditions_input",
 )
 
 racecard_text = st.text_area(
@@ -2084,7 +2133,7 @@ with button_col2:
     )
 
 if predict_clicked:
-    conditions = parse_conditions(racecard_text)
+    conditions = merge_conditions(conditions_text, racecard_text)
     horses = parse_racecard(racecard_text)
     horses = parse_past_performances(past_text, horses)
     horses, time_mode = parse_time_index(timeindex_text, horses)
@@ -2108,6 +2157,17 @@ if predict_clicked:
             st.error(error)
 
         st.stop()
+
+    if not has_known_conditions(conditions):
+        st.warning(
+            "レース条件が読み取れなかったため、競馬場格差補正は使用せず、"
+            "条件適性は中立値で判定します。軸精度を上げるには"
+            "「中京 ダ1400 良」のようにレース条件を入力してください。"
+        )
+    elif not conditions.venue:
+        st.info(
+            "開催場が不明なため、競馬場格差・相手弱化の加点は使用しません。"
+        )
 
     horses = score_horses(
         horses,
