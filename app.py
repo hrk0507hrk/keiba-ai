@@ -34,6 +34,10 @@ CLASS_SCORES = {
     "G1": 100, "GI": 100,
     "G2": 92, "GII": 92,
     "G3": 86, "GIII": 86,
+    "JPN1": 100, "JPNI": 100,
+    "JPN2": 92, "JPNII": 92,
+    "JPN3": 86, "JPNIII": 86,
+    "重賞": 82,
     "L": 80, "リステッド": 80,
     "OP": 78, "オープン": 78,
     "A1": 84, "A2": 80,
@@ -322,11 +326,29 @@ def contains_date(line: str) -> bool:
 
 
 def parse_finish(lines: List[str]) -> Tuple[int, bool]:
-    """明示された着順だけを読む。日付行末の数字（レース番号）は着順にしない。"""
-    for line in lines:
-        if contains_date(line):
-            continue
+    """
+    netkeiba馬柱の日付行末にある数字を正式な着順として読む。
 
+    例:
+        2026.06.20 阪神5  -> 5着
+        2026.05.23 東京1  -> 1着
+
+    「中」「取」「除」「失」など数字ではない結果は着順不明として扱う。
+    """
+    if lines:
+        date_line = normalize_text(lines[0])
+        match = re.match(
+            r"^20\d{2}[./年]\d{1,2}(?:[./月]\d{1,2})?"
+            r"\s+.+?(\d{1,2})$",
+            date_line,
+        )
+        if match:
+            finish = safe_int(match.group(1), 99)
+            if 1 <= finish <= 99:
+                return finish, True
+
+    # 別形式で「5着」「着順:5」と明記される場合にも対応。
+    for line in lines:
         match = re.search(r"(?:着順\s*[:：]?\s*)?(\d{1,2})\s*着", line)
         if match:
             return safe_int(match.group(1), 99), True
@@ -419,13 +441,16 @@ def parse_record_conditions(lines: List[str]):
 
     race_class = ""
     for pattern in (
-        r"\b(GI|GII|GIII|G1|G2|G3)\b",
+        # 長い表記を先に並べ、JpnIIIをJpnIとして途中一致させない。
+        r"(JpnIII|JpnII|JpnI|Jpn3|Jpn2|Jpn1|GIII|GII|GI|G3|G2|G1)",
+        r"(重賞)",
         r"(A1|A2|B1|B2|B3|C1|C2|C3)",
         r"(3勝|2勝|1勝|未勝利|新馬|OP|オープン|リステッド)",
     ):
         match = re.search(pattern, joined, re.I)
         if match:
-            race_class = match.group(1).upper()
+            label = match.group(1)
+            race_class = label.upper() if label != "重賞" else label
             break
 
     return date, venue, surface, distance, going, race_class
@@ -453,12 +478,11 @@ def record_from_block(lines: List[str]) -> Optional[RaceRecord]:
         if not last3f:
             last3f = parse_last3f(line)
 
-    # 貼り付け形式に着順がない場合は、勝ち馬なら1着、その他は最終コーナー位置を弱い推定値にする。
-    if not finish_known:
-        if margin is not None and margin < 0:
-            finish = 1
-        elif passing:
-            finish = safe_int(passing.split("-")[-1], 99)
+    # 着順不明時は通過順位を着順として代用しない。
+    # 着差が負なら自身が勝ったことだけは確定できるため1着とする。
+    if not finish_known and margin is not None and margin < 0:
+        finish = 1
+        finish_known = True
 
     date, venue, surface, distance, going, race_class = parse_record_conditions(lines)
 
@@ -2017,9 +2041,9 @@ def clear_inputs():
     st.session_state["timeindex_input"] = ""
 
 
-st.title("🐎 競馬AI Next v0.6.2 軸配点・印順位修正版")
+st.title("🐎 競馬AI Next v0.6.3 着順・Jpn重賞読取修正版")
 st.caption(
-    "軸配点を安定・近走重視へ調整｜人気上位3頭は残しつつ印順は能力比較"
+    "日付行末の正式着順を反映｜JpnI～III・地方重賞に対応｜通過順位の着順代用を廃止"
 )
 
 racecard_text = st.text_area(
