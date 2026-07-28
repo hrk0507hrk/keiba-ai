@@ -115,6 +115,7 @@ class ScoreDetail:
     danger_score: float = 0.0
     recent_peak_score: float = 0.0
     weight_bonus: float = 0.0
+    high_class_win_bonus: float = 0.0
     selection_score: float = 0.0
     stability_score: float = 0.0
     axis_index: float = 0.0
@@ -735,6 +736,49 @@ def class_score(label: str) -> float:
         return 52.0
 
     return float(CLASS_SCORES.get(label.upper(), 52.0))
+
+
+def recent_high_class_win_bonus(horse: Horse) -> float:
+    """
+    直近の高格レース勝利を、軸指数ではなく印選定・生存判定だけで評価する。
+
+    前走勝利:
+      GI/JpnI       +8
+      GII/JpnII     +7
+      GIII/JpnIII   +6
+      地方重賞      +5
+      L/OP          +4
+
+    2走前勝利は半分。最大10点に抑える。
+    """
+    if not horse.records:
+        return 0.0
+
+    base_points = {
+        "GI": 8.0, "G1": 8.0,
+        "JPNI": 8.0, "JPN1": 8.0,
+        "GII": 7.0, "G2": 7.0,
+        "JPNII": 7.0, "JPN2": 7.0,
+        "GIII": 6.0, "G3": 6.0,
+        "JPNIII": 6.0, "JPN3": 6.0,
+        "重賞": 5.0,
+        "L": 4.0, "リステッド": 4.0,
+        "OP": 4.0, "オープン": 4.0,
+    }
+
+    bonus = 0.0
+    for index, multiplier in ((0, 1.0), (1, 0.5)):
+        if index >= len(horse.records):
+            continue
+
+        record = horse.records[index]
+        if not record.finish_known or record.finish != 1:
+            continue
+
+        label = (record.race_class or "").upper()
+        bonus += base_points.get(label, 0.0) * multiplier
+
+    return round(min(bonus, 10.0), 1)
 
 
 def venue_strength(venue: str) -> int:
@@ -1566,6 +1610,10 @@ def calculate_survival_score(horse: Horse, conditions: RaceConditions) -> float:
     score += class_relief_bonus(horse, conditions) * 0.55
     score += horse.score.weight_bonus
 
+    # 高格レース勝利は平均値に埋もれないよう、生存判定にも小幅反映する。
+    # 軸指数には入れず、相手候補を落としすぎないための救済用途に限定。
+    score += horse.score.high_class_win_bonus * 0.60
+
     if horse.age and horse.age <= 5:
         score += 4
     elif horse.age >= 9 and horse.score.time_index < 55 and horse.score.weight_bonus < 2:
@@ -1641,6 +1689,7 @@ def score_horses(
         horse.score.transition_bonus = round(class_relief_bonus(horse, conditions), 1)
         horse.score.age_adjustment = round(age_adjustment(horse), 1)
         horse.score.weight_bonus = round(calculate_weight_bonus(horse), 1)
+        horse.score.high_class_win_bonus = recent_high_class_win_bonus(horse)
 
         raw_time_scores[horse.number] = score_time_index(horse, mode)
         raw_peak_scores[horse.number] = recent_peak_score(horse)
@@ -1696,6 +1745,7 @@ def score_horses(
             + horse.score.time_index * 0.20
             + horse.score.recent_peak_score * 0.10
             + horse.score.weight_bonus
+            + horse.score.high_class_win_bonus
             - horse.score.danger_score * 0.18,
             0,
             100,
@@ -1782,6 +1832,11 @@ def build_comment(horse: Horse) -> str:
 
     if horse.score.recent_peak_score >= 85:
         reasons.append("直近3走内に高指数")
+
+    if horse.score.high_class_win_bonus >= 6:
+        reasons.append("直近の高格重賞勝利を評価")
+    elif horse.score.high_class_win_bonus >= 4:
+        reasons.append("直近のOP級勝利を評価")
 
     if horse.score.danger_score >= 45:
         reasons.append("休養・指数面の危険あり")
@@ -2023,6 +2078,7 @@ def result_dataframe(selected: List[Horse]) -> pd.DataFrame:
                 "軸タイプ": horse.score.axis_type,
                 "軸判定": "軸禁止" if horse.score.axis_banned else "候補可",
                 "軽斤量補正": horse.score.weight_bonus,
+                "高格勝利補正": horse.score.high_class_win_bonus,
                 "印選定指数": horse.score.selection_score,
                 "生存指数": horse.score.survival_score,
                 "危険度": horse.score.danger_score,
@@ -2050,6 +2106,7 @@ def diagnostic_dataframe(horses: Dict[int, Horse]) -> pd.DataFrame:
                 "斤量": horse.carried_weight,
                 "斤量差": horse.weight_allowance,
                 "軽斤量補正": horse.score.weight_bonus,
+                "高格勝利補正": horse.score.high_class_win_bonus,
                 "馬体増減": horse.weight_change,
                 "休養週": horse.layoff_weeks,
                 "相手弱化": horse.score.transition_bonus,
@@ -2084,9 +2141,9 @@ def clear_inputs():
     st.session_state["timeindex_input"] = ""
 
 
-st.title("🐎 競馬AI Next v0.6.4 レース条件・格差補正修正版")
+st.title("🐎 競馬AI Next v0.6.5 直近高格勝利補正版")
 st.caption(
-    "開催場不明時の競馬場格差加点を停止｜条件不明時は適性を中立化｜任意のレース条件入力を追加"
+    "前走・2走前の高格レース勝利を印選定と生存判定へ追加｜軸指数は変更なし"
 )
 
 conditions_text = st.text_input(
