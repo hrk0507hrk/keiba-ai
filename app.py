@@ -1042,21 +1042,25 @@ def score_closing_power_all(horses: Dict[int, Horse]) -> Dict[int, float]:
 
 
 def time_index_to_score(value: Optional[int]) -> float:
-    """実指数0を55点とし、マイナスを厳格に減点する固定変換。"""
+    """実指数を固定基準へ変換する。高指数帯でも点差が残るよう緩やかに圧縮する。"""
     if value is None:
         return 50.0
 
     points = [
-        (-40, 0),
-        (-30, 8),
-        (-20, 25),
-        (-10, 40),
-        (0, 55),
-        (10, 70),
-        (20, 82),
-        (30, 92),
-        (40, 97),
-        (60, 100),
+        (-40, 5),
+        (-30, 12),
+        (-20, 22),
+        (-10, 32),
+        (0, 42),
+        (10, 52),
+        (20, 60),
+        (30, 67),
+        (40, 73),
+        (50, 79),
+        (60, 84),
+        (70, 89),
+        (80, 93),
+        (100, 98),
     ]
 
     if value <= points[0][0]:
@@ -1081,6 +1085,67 @@ def weighted_index_score(items: List[Tuple[Optional[int], float]]) -> float:
     return clamp(
         sum(time_index_to_score(value) * weight for value, weight in available)
         / total_weight
+    )
+
+
+def blend_field_scores(
+    raw_scores: Dict[int, float],
+    relative_low: float = 45.0,
+    relative_high: float = 90.0,
+    absolute_weight: float = 0.65,
+) -> Dict[int, float]:
+    """固定基準とレース内相対順位を混ぜ、上限張り付きと同点化を抑える。"""
+    if not raw_scores:
+        return {}
+
+    items = sorted(raw_scores.items(), key=lambda item: item[1])
+    count = len(items)
+    relative_scores: Dict[int, float] = {}
+
+    index = 0
+    while index < count:
+        end = index
+        current_value = items[index][1]
+        while end + 1 < count and abs(items[end + 1][1] - current_value) < 1e-9:
+            end += 1
+
+        if count == 1:
+            percentile = 0.5
+        else:
+            average_position = (index + end) / 2
+            percentile = average_position / (count - 1)
+
+        relative_value = relative_low + (relative_high - relative_low) * percentile
+        for position in range(index, end + 1):
+            relative_scores[items[position][0]] = relative_value
+        index = end + 1
+
+    relative_weight = 1.0 - absolute_weight
+    return {
+        number: round(clamp(
+            clamp(raw_score) * absolute_weight
+            + relative_scores[number] * relative_weight,
+            20,
+            95,
+        ), 1)
+        for number, raw_score in raw_scores.items()
+    }
+
+
+def blend_survival_scores(raw_scores: Dict[int, float]) -> Dict[int, float]:
+    """生存指数専用。過剰加点を圧縮しつつ、レース内で45～90程度へ分散させる。"""
+    if not raw_scores:
+        return {}
+
+    compressed = {
+        number: clamp(50.0 + (raw_score - 50.0) * 0.55, 20, 95)
+        for number, raw_score in raw_scores.items()
+    }
+    return blend_field_scores(
+        compressed,
+        relative_low=42.0,
+        relative_high=90.0,
+        absolute_weight=0.58,
     )
 
 
@@ -1456,7 +1521,7 @@ def calculate_survival_score(horse: Horse, conditions: RaceConditions) -> float:
     if abs(horse.weight_change) >= 15:
         score -= 2
 
-    return clamp(score)
+    return clamp(score, 0, 130)
 
 
 def assign_fixed_ability_indices(horses: Dict[int, Horse]) -> Dict[int, Horse]:
@@ -1495,17 +1560,40 @@ def score_horses(
     assign_weight_allowance(horses)
     closing_scores = score_closing_power_all(horses)
 
+    raw_time_scores: Dict[int, float] = {}
+    raw_peak_scores: Dict[int, float] = {}
+
+    # 基礎項目とタイム指数の固定基準値を先に計算する。
     for horse in horses.values():
         horse.score.recent_form = round(score_recent_form(horse), 1)
         horse.score.race_level = round(score_race_level(horse, conditions), 1)
         horse.score.suitability = round(score_suitability(horse, conditions), 1)
         horse.score.running_style = round(score_running_style(horse, front_count), 1)
         horse.score.closing_power = round(closing_scores.get(horse.number, 50.0), 1)
-        horse.score.time_index = round(score_time_index(horse, mode), 1)
         horse.score.transition_bonus = round(class_relief_bonus(horse, conditions), 1)
         horse.score.age_adjustment = round(age_adjustment(horse), 1)
-        horse.score.recent_peak_score = round(recent_peak_score(horse), 1)
         horse.score.weight_bonus = round(calculate_weight_bonus(horse), 1)
+
+        raw_time_scores[horse.number] = score_time_index(horse, mode)
+        raw_peak_scores[horse.number] = recent_peak_score(horse)
+
+    # 固定基準65％＋レース内相対順位35％で、99～100点への張り付きを解消する。
+    normalized_time_scores = blend_field_scores(
+        raw_time_scores,
+        relative_low=43.0,
+        relative_high=91.0,
+        absolute_weight=0.65,
+    )
+    normalized_peak_scores = blend_field_scores(
+        raw_peak_scores,
+        relative_low=45.0,
+        relative_high=90.0,
+        absolute_weight=0.62,
+    )
+
+    for horse in horses.values():
+        horse.score.time_index = normalized_time_scores.get(horse.number, 50.0)
+        horse.score.recent_peak_score = normalized_peak_scores.get(horse.number, 50.0)
 
         total = (
             horse.score.recent_form * WEIGHTS["recent_form"]
@@ -1523,9 +1611,16 @@ def score_horses(
 
     assign_fixed_ability_indices(horses)
 
+    raw_survival_scores: Dict[int, float] = {}
     for horse in horses.values():
         horse.score.danger_score = round(calculate_danger_score(horse), 1)
-        horse.score.survival_score = round(calculate_survival_score(horse, conditions), 1)
+        raw_survival_scores[horse.number] = calculate_survival_score(horse, conditions)
+
+    normalized_survival_scores = blend_survival_scores(raw_survival_scores)
+
+    for horse in horses.values():
+        horse.score.survival_score = normalized_survival_scores.get(horse.number, 50.0)
+
         # 印選定は能力だけでなく、生存・直近指数・軽斤量・危険度を合成する。
         horse.score.selection_score = round(clamp(
             horse.score.ability_index * 0.38
@@ -1701,45 +1796,19 @@ def select_marks(horses: Dict[int, Horse]) -> List[Horse]:
 
 
 def axis_candidate_pool(horses: Dict[int, Horse]) -> List[Horse]:
-    """人気上位の安全馬を基本に、明確に上なら4～6番人気の穴軸も候補化する。"""
-    top_popular = sorted(
-        [
-            horse for horse in horses.values()
-            if 1 <= horse.popularity <= 3 and not horse.score.axis_banned
-        ],
-        key=lambda horse: (
-            horse.score.axis_index,
-            horse.score.stability_score,
-            horse.score.time_index,
-        ),
-        reverse=True,
-    )
-
-    hole_candidates = sorted(
-        [
-            horse for horse in horses.values()
-            if 4 <= horse.popularity <= 6
-            and not horse.score.axis_banned
-            and horse.score.axis_index >= 68
-        ],
-        key=lambda horse: (
-            horse.score.axis_index,
-            horse.score.stability_score,
-            horse.score.time_index,
-        ),
-        reverse=True,
-    )
-
-    pool = list(top_popular)
-    if hole_candidates:
-        best_hole = hole_candidates[0]
-        best_top_score = top_popular[0].score.axis_index if top_popular else -1
-        if not top_popular or best_hole.score.axis_index >= best_top_score + 6:
-            pool.insert(0, best_hole)
+    """人気1～3位と、軸指数68以上の4～6番人気を同じ候補プールで比較する。"""
+    candidates = [
+        horse for horse in horses.values()
+        if (
+            (1 <= horse.popularity <= 3)
+            or (4 <= horse.popularity <= 6 and horse.score.axis_index >= 68)
+        )
+        and not horse.score.axis_banned
+    ]
 
     unique: List[Horse] = []
     used = set()
-    for horse in pool:
+    for horse in candidates:
         if horse.number in used:
             continue
         used.add(horse.number)
@@ -1799,17 +1868,26 @@ def axis_guidance(
     difficulty: str,
     stars: str,
 ) -> Tuple[str, str, Optional[Horse]]:
-    """大混戦は軸なし、混戦は2頭、差7以上のみ単独軸候補にする。"""
-    if not candidates or difficulty == "大混戦":
+    """適格馬不在だけを軸なしとし、上位差が小さい場合は軸候補2頭を表示する。"""
+    if not candidates:
+        return "軸なし", "単独軸非推奨", None
+
+    first = candidates[0]
+    if first.score.axis_index < 60:
         return "軸なし", "単独軸非推奨", None
 
     star_count = stars.count("★")
-    first = candidates[0]
 
-    if difficulty == "混戦" or star_count <= 2:
+    if len(candidates) >= 2 and (
+        difficulty in ("大混戦", "混戦")
+        or star_count <= 2
+    ):
         pair = candidates[:2]
         names = "・".join(f"{horse.number}番 {horse.name}" for horse in pair)
         return names, "軸候補2頭", first
+
+    if star_count <= 2:
+        return f"{first.number}番 {first.name}", "単独軸非推奨", first
 
     return f"{first.number}番 {first.name}", "単独軸候補", first
 
@@ -1904,9 +1982,9 @@ def clear_inputs():
     st.session_state["timeindex_input"] = ""
 
 
-st.title("🐎 競馬AI Next v0.6 軸専用エンジン版")
+st.title("🐎 競馬AI Next v0.6.1 指数分散・軸候補修正版")
 st.caption(
-    "能力指数とは別に、安定度・軸指数・軸禁止・穴軸候補を独立判定"
+    "指数の上限張り付きを解消し、適格馬の接戦時は軸候補2頭を表示"
 )
 
 racecard_text = st.text_area(
@@ -1991,11 +2069,15 @@ if predict_clicked:
     if selected:
         summary_col1, summary_col2, summary_col3, summary_col4 = st.columns(4)
         with summary_col1:
-            axis_delta = (
-                f"軸指数 {primary_axis.score.axis_index:.1f}・{primary_axis.score.axis_type}"
-                if primary_axis is not None
-                else "適格な軸候補なし"
-            )
+            if primary_axis is None:
+                axis_delta = "適格な軸候補なし"
+            elif axis_operation == "軸候補2頭":
+                axis_delta = f"適格馬あり・上位差 {axis_gap:.1f}"
+            else:
+                axis_delta = (
+                    f"軸指数 {primary_axis.score.axis_index:.1f}・"
+                    f"{primary_axis.score.axis_type}"
+                )
             st.metric("軸候補", axis_names, axis_delta)
         with summary_col2:
             st.metric("軸信頼度", confidence_stars, f"軸指数差 {axis_gap:.1f}")
@@ -2004,8 +2086,16 @@ if predict_clicked:
         with summary_col4:
             st.metric("軸運用", axis_operation)
 
-        if axis_operation != "単独軸候補":
-            st.info("◎は予想上位印です。実際の軸運用は上段の『軸候補・軸運用』判定を優先してください。")
+        if axis_operation == "軸候補2頭":
+            st.info(
+                "適格な軸候補はいますが、上位の軸指数差が小さいため2頭候補です。"
+                "◎は予想上位印であり、実際の軸運用は上段判定を優先してください。"
+            )
+        elif axis_operation != "単独軸候補":
+            st.info(
+                "◎は予想上位印です。実際の軸運用は上段の"
+                "『軸候補・軸運用』判定を優先してください。"
+            )
 
     st.subheader("予想結果")
 
