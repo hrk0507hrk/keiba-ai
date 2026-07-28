@@ -44,12 +44,13 @@ CLASS_SCORES = {
 }
 
 WEIGHTS = {
-    "recent_form": 0.34,
-    "race_level": 0.20,
-    "suitability": 0.14,
-    "running_style": 0.12,
-    "closing_power": 0.10,
-    "time_index": 0.10,
+    # 検証1件目を反映した暫定配分。数レース蓄積後に再調整する。
+    "recent_form": 0.28,
+    "race_level": 0.28,
+    "suitability": 0.16,
+    "running_style": 0.08,
+    "closing_power": 0.08,
+    "time_index": 0.12,
 }
 
 
@@ -74,24 +75,26 @@ class RaceRecord:
     going: str = ""
     race_class: str = ""
     finish: int = 99
-    margin: float = 99.9
+    finish_known: bool = False
+    margin: Optional[float] = None
     passing: str = ""
     last3f: float = 0.0
 
 
 @dataclass
 class TimeIndex:
-    highest: int = 0
-    overall: int = 0
-    start: int = 0
-    chase: int = 0
-    closing: int = 0
-    avg5: int = 0
-    distance: int = 0
-    course: int = 0
-    last3: int = 0
-    last2: int = 0
-    last1: int = 0
+    # Noneは「データなし」、0は実際の指数0として区別する。
+    highest: Optional[int] = None
+    overall: Optional[int] = None
+    start: Optional[int] = None
+    chase: Optional[int] = None
+    closing: Optional[int] = None
+    avg5: Optional[int] = None
+    distance: Optional[int] = None
+    course: Optional[int] = None
+    last3: Optional[int] = None
+    last2: Optional[int] = None
+    last1: Optional[int] = None
 
 
 @dataclass
@@ -104,6 +107,7 @@ class ScoreDetail:
     time_index: float = 0.0
     total: float = 0.0
     ability_index: int = 0
+    ability_rank: int = 0
 
 
 @dataclass
@@ -118,6 +122,9 @@ class Horse:
     records: List[RaceRecord] = field(default_factory=list)
     time_index: TimeIndex = field(default_factory=TimeIndex)
     running_style: str = ""
+    style_hint: str = ""
+    layoff_weeks: int = 0
+    front_competitors: int = 0
     score: ScoreDetail = field(default_factory=ScoreDetail)
     mark: str = ""
     comment: str = ""
@@ -282,34 +289,44 @@ def contains_date(line: str) -> bool:
     )
 
 
-def parse_finish(line: str) -> int:
-    match = re.search(r"(\d{1,2})\s*着", line)
-    if match:
-        return safe_int(match.group(1), 99)
+def parse_finish(lines: List[str]) -> Tuple[int, bool]:
+    """明示された着順だけを読む。日付行末の数字（レース番号）は着順にしない。"""
+    for line in lines:
+        if contains_date(line):
+            continue
 
-    match = re.match(
-        r"^20\d{2}[./年]\d{1,2}(?:[./月]\d{1,2})?\s+.+?(\d{1,2})$",
-        line,
-    )
-    return safe_int(match.group(1), 99) if match else 99
+        match = re.search(r"(?:着順\s*[:：]?\s*)?(\d{1,2})\s*着", line)
+        if match:
+            return safe_int(match.group(1), 99), True
+
+    return 99, False
 
 
-def parse_margin(line: str) -> float:
+def parse_margin(line: str) -> Optional[float]:
     match = re.search(
         r"着差\s*[:：]?\s*([+-]?\d+(?:\.\d+)?)",
         line,
     )
     if match:
-        return abs(safe_float(match.group(1), 99.9))
+        return safe_float(match.group(1), 0.0)
 
+    # 通過順＋上がり＋馬体重の行にある増減値は着差ではない。
+    if re.search(r"\d{1,2}(?:-\d{1,2}){1,3}", line):
+        return None
+    if re.search(r"\d{3}\([+-]?\d+\)\s*$", line):
+        return None
+
+    # 最終行の勝ち馬名（着差）を取得。負値は自身が勝ったことを表す。
     match = re.search(r"\(([+-]?\d+(?:\.\d+)?)\)\s*$", line)
     if match:
-        return abs(safe_float(match.group(1), 99.9))
+        return safe_float(match.group(1), 0.0)
 
-    if any(word in line for word in ("クビ", "ハナ", "アタマ")):
+    if "ハナ" in line:
+        return 0.05
+    if any(word in line for word in ("クビ", "アタマ")):
         return 0.1
 
-    return 99.9
+    return None
 
 
 def parse_passing(line: str) -> str:
@@ -386,23 +403,30 @@ def record_from_block(lines: List[str]) -> Optional[RaceRecord]:
     if not lines:
         return None
 
-    finish = parse_finish(lines[0])
-    if finish >= 99:
-        return None
-
-    margin = 99.9
+    finish, finish_known = parse_finish(lines)
+    margin: Optional[float] = None
     passing = ""
     last3f = 0.0
 
-    for line in lines[1:]:
-        if margin >= 99.9:
-            margin = parse_margin(line)
+    # 着差は通常ブロック最終行にあるため後ろから探す。
+    for line in reversed(lines[1:]):
+        margin = parse_margin(line)
+        if margin is not None:
+            break
 
+    for line in lines[1:]:
         if not passing:
             passing = parse_passing(line)
 
         if not last3f:
             last3f = parse_last3f(line)
+
+    # 貼り付け形式に着順がない場合は、勝ち馬なら1着、その他は最終コーナー位置を弱い推定値にする。
+    if not finish_known:
+        if margin is not None and margin < 0:
+            finish = 1
+        elif passing:
+            finish = safe_int(passing.split("-")[-1], 99)
 
     date, venue, surface, distance, going, race_class = parse_record_conditions(lines)
 
@@ -414,6 +438,7 @@ def record_from_block(lines: List[str]) -> Optional[RaceRecord]:
         going=going,
         race_class=race_class,
         finish=finish,
+        finish_known=finish_known,
         margin=margin,
         passing=passing,
         last3f=last3f,
@@ -477,6 +502,17 @@ def parse_past_performances(
         if current is None:
             continue
 
+        # 馬柱ヘッダーの「逃中3週」「追中16週」などを取得する。
+        style_match = re.search(r"(逃|先|差|追)中(\d+)週", line)
+        if style_match and not block:
+            current.style_hint = {
+                "逃": "逃げ",
+                "先": "先行",
+                "差": "差し",
+                "追": "追込",
+            }[style_match.group(1)]
+            current.layoff_weeks = safe_int(style_match.group(2), 0)
+
         if contains_date(line):
             flush()
             block = [line]
@@ -507,13 +543,13 @@ def time_cells(text: str) -> List[str]:
     ]
 
 
-def index_value(value: str) -> int:
+def index_value(value: str) -> Optional[int]:
     value = normalize_text(value).replace("＊", "*").rstrip("*")
 
     if value in {"未", "-", "--", "―", "－", "なし"}:
-        return 0
+        return None
 
-    return safe_int(value, 0) if re.fullmatch(r"-?\d+", value) else 0
+    return safe_int(value, 0) if re.fullmatch(r"-?\d+", value) else None
 
 
 def parse_time_index(
@@ -602,6 +638,32 @@ def class_score(label: str) -> float:
     return float(CLASS_SCORES.get(label.upper(), 52.0))
 
 
+def venue_strength(venue: str) -> int:
+    """競馬場の基礎レベル。過去の強い所属場から地方下級条件へ替わる馬を評価する。"""
+    if venue in {"札幌", "函館", "福島", "新潟", "東京", "中山", "中京", "京都", "阪神", "小倉"}:
+        return 3
+    if venue in {"浦和", "船橋", "大井", "川崎"}:
+        return 2
+    if venue:
+        return 1
+    return 0
+
+
+def class_relief_bonus(horse: Horse, conditions: RaceConditions) -> float:
+    if not horse.records or not conditions.venue:
+        return 0.0
+
+    current_strength = venue_strength(conditions.venue)
+    prior_strength = average([venue_strength(r.venue) for r in horse.records if r.venue], current_strength)
+    difference = prior_strength - current_strength
+
+    if difference >= 1.5:
+        return 14.0
+    if difference >= 0.75:
+        return 9.0
+    return 0.0
+
+
 def infer_running_style(horse: Horse) -> str:
     positions = []
 
@@ -616,7 +678,7 @@ def infer_running_style(horse: Horse) -> str:
             continue
 
     if not positions:
-        horse.running_style = "不明"
+        horse.running_style = horse.style_hint or "不明"
         return horse.running_style
 
     avg_first = average([p[0] for p in positions], 9.0)
@@ -635,44 +697,95 @@ def infer_running_style(horse: Horse) -> str:
     return style
 
 
+def margin_performance_score(margin: Optional[float]) -> float:
+    if margin is None:
+        return 48.0
+    if margin < 0:
+        return 100.0
+    if margin <= 0.2:
+        return 92.0
+    if margin <= 0.5:
+        return 84.0
+    if margin <= 1.0:
+        return 72.0
+    if margin <= 1.5:
+        return 62.0
+    if margin <= 2.0:
+        return 52.0
+    if margin <= 3.0:
+        return 40.0
+    if margin <= 4.0:
+        return 28.0
+    return 18.0
+
+
+def position_content_score(record: RaceRecord) -> float:
+    if not record.passing:
+        return 50.0
+
+    try:
+        positions = [int(v) for v in record.passing.split("-")]
+    except ValueError:
+        return 50.0
+
+    first = positions[0]
+    last = positions[-1]
+    score = 70 - max(0, last - 1) * 4
+    score += clamp((first - last) * 4, -12, 16)
+    return clamp(score, 20, 90)
+
+
 def score_recent_form(horse: Horse) -> float:
     if not horse.records:
         return 35.0
 
     recency_weights = [1.00, 0.90, 0.80, 0.70, 0.60]
-    scores = []
+    weighted_scores = []
 
     for index, record in enumerate(horse.records[:5]):
-        finish_component = clamp(105 - record.finish * 9, 10, 100)
+        margin_component = margin_performance_score(record.margin)
+        position_component = position_content_score(record)
 
-        if record.margin < 99:
-            margin_component = clamp(100 - record.margin * 24, 10, 100)
+        if record.finish < 99:
+            finish_component = clamp(105 - record.finish * 9, 10, 100)
+            finish_weight = 0.28 if record.finish_known else 0.10
         else:
-            margin_component = 45
+            finish_component = 48.0
+            finish_weight = 0.0
 
-        row_score = finish_component * 0.58 + margin_component * 0.42
-        scores.append(row_score * recency_weights[index])
+        # 着順が明示されていない形式では、着差とレース内容を中心に評価する。
+        margin_weight = 0.62 if not record.finish_known else 0.52
+        position_weight = 1.0 - margin_weight - finish_weight
+        row_score = (
+            margin_component * margin_weight
+            + finish_component * finish_weight
+            + position_component * position_weight
+        )
+        weighted_scores.append(row_score * recency_weights[index])
 
-    denominator = sum(recency_weights[:len(scores)])
-    return clamp(sum(scores) / denominator if denominator else 35.0)
+    denominator = sum(recency_weights[:len(weighted_scores)])
+    return clamp(sum(weighted_scores) / denominator if denominator else 35.0)
 
 
-def score_race_level(horse: Horse) -> float:
+def score_race_level(horse: Horse, conditions: RaceConditions) -> float:
     if not horse.records:
         return 45.0
 
     weights = [1.00, 0.90, 0.80, 0.70, 0.60]
     weighted_scores = []
+    current_strength = venue_strength(conditions.venue)
 
     for index, record in enumerate(horse.records[:5]):
         level = class_score(record.race_class)
+        prior_strength = venue_strength(record.venue)
 
-        if record.margin < 0.5:
-            level += 6
-        elif record.margin > 1.5:
-            level -= 8
+        # 中央・南関から他地区へ移る場合は、過去に戦った相手レベルを加点する。
+        if prior_strength > current_strength:
+            level += (prior_strength - current_strength) * 10
 
-        weighted_scores.append(level * weights[index])
+        performance = margin_performance_score(record.margin)
+        level += (performance - 50) * 0.14
+        weighted_scores.append(clamp(level) * weights[index])
 
     return clamp(
         sum(weighted_scores) / sum(weights[:len(weighted_scores)])
@@ -707,39 +820,59 @@ def score_suitability(
                 score -= 6
 
         if conditions.venue and record.venue:
-            score += 10 if record.venue == conditions.venue else 0
+            score += 8 if record.venue == conditions.venue else 0
 
         if conditions.going and record.going:
             score += 5 if record.going == conditions.going else 0
 
-        score += clamp((6 - record.finish) * 2.5, -8, 12)
+        # 着順が欠ける形式でも着差から条件実績を評価する。
+        score += (margin_performance_score(record.margin) - 50) * 0.18
         scores.append(clamp(score))
 
-    return clamp(average(scores, 45.0))
+    result = average(scores, 45.0)
+
+    # 長期休養は軽く減点。ただし強い競馬場からの条件緩和があれば減点を抑える。
+    relief = class_relief_bonus(horse, conditions)
+    if horse.layoff_weeks >= 13:
+        result -= 2 if relief >= 9 else 6
+    elif horse.layoff_weeks >= 9:
+        result -= 1 if relief >= 9 else 4
+    elif horse.layoff_weeks >= 5:
+        result -= 2
+
+    return clamp(result)
 
 
-def score_running_style(horse: Horse) -> float:
+def score_running_style(horse: Horse, front_count: int) -> float:
     style = infer_running_style(horse)
 
     base_score = {
-        "逃げ": 88.0,
-        "先行": 82.0,
-        "差し": 64.0,
-        "追込": 48.0,
+        "逃げ": 76.0,
+        "先行": 74.0,
+        "差し": 68.0,
+        "追込": 58.0,
         "不明": 55.0,
     }[style]
 
+    # 逃げ・先行馬が多い時は同型競合を減点。単騎逃げだけを上げる。
+    if style == "逃げ":
+        if front_count <= 1:
+            base_score += 7
+        elif front_count == 2:
+            base_score -= 6
+        else:
+            base_score -= 12
+    elif style == "先行" and front_count >= 4:
+        base_score -= 4
+
     if horse.records:
-        valid_finishes = [
-            record.finish
-            for record in horse.records
-            if record.finish < 99
-        ]
+        weak_runs = sum(
+            1 for record in horse.records[:5]
+            if record.margin is not None and record.margin >= 3.0
+        )
+        base_score -= weak_runs * 2
 
-        avg_finish = average(valid_finishes, 9.0)
-        if avg_finish >= 8:
-            base_score -= 10
-
+    horse.front_competitors = front_count
     return clamp(base_score)
 
 
@@ -751,8 +884,8 @@ def score_closing_power(horse: Horse) -> float:
     ]
 
     if not values:
-        if horse.time_index.closing > 0:
-            return clamp(horse.time_index.closing)
+        if horse.time_index.closing is not None:
+            return clamp(50 + horse.time_index.closing * 0.9)
 
         return 45.0
 
@@ -781,59 +914,58 @@ def score_closing_power(horse: Horse) -> float:
     return clamp(score)
 
 
+def weighted_index_score(items: List[Tuple[Optional[int], float]]) -> float:
+    available = [(value, weight) for value, weight in items if value is not None]
+    if not available:
+        return 40.0
+
+    total_weight = sum(weight for _, weight in available)
+    raw = sum(value * weight for value, weight in available) / total_weight
+
+    # 実指数0を中立50点とし、マイナス指数もそのまま減点する固定基準。
+    return clamp(50 + raw * 0.9)
+
+
 def score_time_index(horse: Horse, mode: str) -> float:
     ti = horse.time_index
 
     if mode == "central":
-        values = [
-            ti.overall,
-            ti.start,
-            ti.chase,
-            ti.closing,
-            ti.avg5,
-            ti.distance,
-            ti.course,
-            ti.last3,
-            ti.last2,
-            ti.last1,
-        ]
-    else:
-        values = [
-            ti.highest,
-            ti.avg5,
-            ti.distance,
-            ti.course,
-            ti.last3,
-            ti.last2,
-            ti.last1,
-        ]
+        return weighted_index_score([
+            (ti.overall, 0.12),
+            (ti.start, 0.07),
+            (ti.chase, 0.08),
+            (ti.closing, 0.10),
+            (ti.avg5, 0.13),
+            (ti.distance, 0.10),
+            (ti.course, 0.10),
+            (ti.last3, 0.08),
+            (ti.last2, 0.10),
+            (ti.last1, 0.12),
+        ])
 
-    valid = [value for value in values if value > 0]
-    if not valid:
-        return 40.0
-
-    return clamp(average([clamp(v) for v in valid]))
+    return weighted_index_score([
+        (ti.highest, 0.08),
+        (ti.avg5, 0.16),
+        (ti.distance, 0.14),
+        (ti.course, 0.14),
+        (ti.last3, 0.12),
+        (ti.last2, 0.16),
+        (ti.last1, 0.20),
+    ])
 
 
-def normalize_ability_indices(horses: Dict[int, Horse]) -> Dict[int, Horse]:
-    """レース内の総合点を、差が見やすい能力指数（65～98）へ変換する。"""
-    valid = list(horses.values())
-    if not valid:
-        return horses
+def assign_fixed_ability_indices(horses: Dict[int, Horse]) -> Dict[int, Horse]:
+    """レース内順位ではなく、同じ総合点なら常に同じ指数になる固定基準。"""
+    for horse in horses.values():
+        horse.score.ability_index = round(clamp(35 + horse.score.total * 0.75, 35, 99))
 
-    totals = [horse.score.total for horse in valid]
-    minimum = min(totals)
-    maximum = max(totals)
-
-    if maximum - minimum < 0.01:
-        for horse in valid:
-            horse.score.ability_index = 80
-        return horses
-
-    for horse in valid:
-        relative = (horse.score.total - minimum) / (maximum - minimum)
-        # 極端な100固定を避けつつ、レース内の差を見やすくする。
-        horse.score.ability_index = round(65 + relative * 33)
+    ranked = sorted(
+        horses.values(),
+        key=lambda h: (h.score.ability_index, h.score.total),
+        reverse=True,
+    )
+    for rank, horse in enumerate(ranked, start=1):
+        horse.score.ability_rank = rank
 
     return horses
 
@@ -843,25 +975,22 @@ def score_horses(
     conditions: RaceConditions,
     mode: str,
 ) -> Dict[int, Horse]:
+    # 先に全頭の脚質を確定し、逃げ・先行の競合数を出す。
+    for horse in horses.values():
+        infer_running_style(horse)
+
+    front_count = sum(
+        1 for horse in horses.values()
+        if horse.running_style in ("逃げ", "先行")
+    )
+
     for horse in horses.values():
         horse.score.recent_form = round(score_recent_form(horse), 1)
-        horse.score.race_level = round(score_race_level(horse), 1)
-        horse.score.suitability = round(
-            score_suitability(horse, conditions),
-            1,
-        )
-        horse.score.running_style = round(
-            score_running_style(horse),
-            1,
-        )
-        horse.score.closing_power = round(
-            score_closing_power(horse),
-            1,
-        )
-        horse.score.time_index = round(
-            score_time_index(horse, mode),
-            1,
-        )
+        horse.score.race_level = round(score_race_level(horse, conditions), 1)
+        horse.score.suitability = round(score_suitability(horse, conditions), 1)
+        horse.score.running_style = round(score_running_style(horse, front_count), 1)
+        horse.score.closing_power = round(score_closing_power(horse), 1)
+        horse.score.time_index = round(score_time_index(horse, mode), 1)
 
         total = (
             horse.score.recent_form * WEIGHTS["recent_form"]
@@ -874,7 +1003,7 @@ def score_horses(
 
         horse.score.total = round(clamp(total), 1)
 
-    return normalize_ability_indices(horses)
+    return assign_fixed_ability_indices(horses)
 
 
 # =========================================================
@@ -920,8 +1049,13 @@ def build_comment(horse: Horse) -> str:
     ):
         reasons.append("上がり3Fの末脚を評価")
 
-    if horse.score.time_index >= 75:
+    if horse.score.time_index >= 70:
         reasons.append("タイム指数も上位")
+    elif horse.score.time_index <= 38:
+        reasons.append("近走タイム指数は低調")
+
+    if horse.running_style == "逃げ" and horse.front_competitors >= 2:
+        reasons.append("同型との先行争いに注意")
 
     if horse.popularity <= 3 and horse.score.ability_index < 75:
         reasons.append("上位人気のため印は残す")
@@ -1002,28 +1136,46 @@ def axis_confidence(selected: List[Horse]) -> Tuple[str, str, float]:
     second_index = selected[1].score.ability_index if len(selected) >= 2 else axis.score.ability_index
     gap = axis.score.ability_index - second_index
 
-    if axis.score.ability_index >= 94 and gap >= 5:
-        stars = "★★★★★"
-    elif axis.score.ability_index >= 90 and gap >= 3:
-        stars = "★★★★☆"
-    elif axis.score.ability_index >= 85 and gap >= 1:
-        stars = "★★★☆☆"
-    elif axis.score.ability_index >= 78:
-        stars = "★★☆☆☆"
+    if axis.score.ability_index >= 90 and gap >= 5:
+        star_count = 5
+    elif axis.score.ability_index >= 86 and gap >= 3:
+        star_count = 4
+    elif axis.score.ability_index >= 80 and gap >= 1:
+        star_count = 3
+    elif axis.score.ability_index >= 73:
+        star_count = 2
     else:
-        stars = "★☆☆☆☆"
+        star_count = 1
+
+    # 近走・相手・指数のうち弱点が重なる軸は信頼度を強制的に抑える。
+    red_flags = sum([
+        axis.score.recent_form < 55,
+        axis.score.race_level < 55,
+        axis.score.time_index < 45,
+    ])
+    if red_flags >= 2:
+        star_count = min(star_count, 2)
+    elif red_flags == 1:
+        star_count = min(star_count, 3)
+
+    if axis.running_style == "逃げ" and axis.front_competitors >= 2:
+        star_count = min(star_count, 3)
+
+    stars = "★" * star_count + "☆" * (5 - star_count)
 
     selected_indices = [horse.score.ability_index for horse in selected]
     spread = max(selected_indices) - min(selected_indices) if selected_indices else 0
+    top_three = selected_indices[:3]
+    top_spread = max(top_three) - min(top_three) if top_three else 0
 
-    if gap >= 6 and spread >= 18:
+    if star_count >= 4 and gap >= 4:
         difficulty = "本命寄り"
-    elif gap >= 3 and spread >= 12:
-        difficulty = "やや荒れ"
-    elif spread >= 8:
+    elif top_spread <= 4:
+        difficulty = "大混戦"
+    elif spread <= 10:
         difficulty = "混戦"
     else:
-        difficulty = "大混戦"
+        difficulty = "やや荒れ"
 
     return stars, difficulty, gap
 
@@ -1042,6 +1194,7 @@ def result_dataframe(selected: List[Horse]) -> pd.DataFrame:
                 "人気": "-" if horse.popularity == 99 else horse.popularity,
                 "オッズ": "-" if horse.odds <= 0 else horse.odds,
                 "推定脚質": horse.running_style,
+                "能力順位": horse.score.ability_rank,
                 "能力指数": horse.score.ability_index,
                 "近走内容": horse.score.recent_form,
                 "レースレベル": horse.score.race_level,
@@ -1067,6 +1220,9 @@ def diagnostic_dataframe(horses: Dict[int, Horse]) -> pd.DataFrame:
                 "推定脚質": horse.running_style,
                 "内部総合": horse.score.total,
                 "能力指数": horse.score.ability_index,
+                "能力順位": horse.score.ability_rank,
+                "休養週": horse.layoff_weeks,
+                "先行候補数": horse.front_competitors,
             }
             for horse in sorted(
                 horses.values(),
@@ -1086,9 +1242,9 @@ def clear_inputs():
     st.session_state["timeindex_input"] = ""
 
 
-st.title("🐎 競馬AI Next v0.2")
+st.title("🐎 競馬AI Next v0.3 検証修正版")
 st.caption(
-    "出走表＋馬柱＋タイム指数｜人気1～3位は必ず◎○▲｜人気4～8位から△☆注穴"
+    "着順誤読修正・マイナス指数対応・相手レベル補正・同型競合・固定能力指数を実装"
 )
 
 racecard_text = st.text_area(
@@ -1143,7 +1299,7 @@ if predict_clicked:
         errors.append("馬柱の近走データを読み取れませんでした。")
 
     if not any(
-        any(value > 0 for value in vars(horse.time_index).values())
+        any(value is not None for value in vars(horse.time_index).values())
         for horse in horses.values()
     ):
         errors.append("タイム指数を読み取れませんでした。")
