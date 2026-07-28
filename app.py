@@ -103,6 +103,7 @@ class ScoreDetail:
     closing_power: float = 0.0
     time_index: float = 0.0
     total: float = 0.0
+    ability_index: int = 0
 
 
 @dataclass
@@ -814,6 +815,29 @@ def score_time_index(horse: Horse, mode: str) -> float:
     return clamp(average([clamp(v) for v in valid]))
 
 
+def normalize_ability_indices(horses: Dict[int, Horse]) -> Dict[int, Horse]:
+    """レース内の総合点を、差が見やすい能力指数（65～98）へ変換する。"""
+    valid = list(horses.values())
+    if not valid:
+        return horses
+
+    totals = [horse.score.total for horse in valid]
+    minimum = min(totals)
+    maximum = max(totals)
+
+    if maximum - minimum < 0.01:
+        for horse in valid:
+            horse.score.ability_index = 80
+        return horses
+
+    for horse in valid:
+        relative = (horse.score.total - minimum) / (maximum - minimum)
+        # 極端な100固定を避けつつ、レース内の差を見やすくする。
+        horse.score.ability_index = round(65 + relative * 33)
+
+    return horses
+
+
 def score_horses(
     horses: Dict[int, Horse],
     conditions: RaceConditions,
@@ -850,7 +874,7 @@ def score_horses(
 
         horse.score.total = round(clamp(total), 1)
 
-    return horses
+    return normalize_ability_indices(horses)
 
 
 # =========================================================
@@ -859,6 +883,7 @@ def score_horses(
 
 def ranking_key(horse: Horse):
     return (
+        horse.score.ability_index,
         horse.score.total,
         horse.score.recent_form,
         horse.score.race_level,
@@ -875,10 +900,10 @@ def build_comment(horse: Horse) -> str:
     if horse.score.recent_form >= 75:
         reasons.append("近走内容が優秀")
     elif horse.score.recent_form <= 45:
-        reasons.append("近走内容に不安")
+        reasons.append("近走内容は低評価")
 
     if horse.score.race_level >= 70:
-        reasons.append("相手関係を高評価")
+        reasons.append("相手レベルを高評価")
 
     if horse.score.suitability >= 72:
         reasons.append("今回条件への適性あり")
@@ -898,6 +923,9 @@ def build_comment(horse: Horse) -> str:
     if horse.score.time_index >= 75:
         reasons.append("タイム指数も上位")
 
+    if horse.popularity <= 3 and horse.score.ability_index < 75:
+        reasons.append("上位人気のため印は残す")
+
     if not reasons:
         reasons.append("総合バランスで選出")
 
@@ -905,46 +933,99 @@ def build_comment(horse: Horse) -> str:
 
 
 def select_marks(horses: Dict[int, Horse]) -> List[Horse]:
+    """人気1～3位は必ず◎○▲。人気4～8位から能力上位4頭へ残りの印。"""
     for horse in horses.values():
         horse.mark = ""
         horse.comment = ""
 
+    selected: List[Horse] = []
+
+    # 人気1～3位は必ず残し、この3頭の能力順で◎○▲を決定する。
     top_popular = [
         horse
         for horse in horses.values()
         if 1 <= horse.popularity <= 3
     ]
-
     top_popular.sort(key=ranking_key, reverse=True)
 
-    if not top_popular:
-        top_popular = sorted(
-            horses.values(),
-            key=ranking_key,
-            reverse=True,
-        )[:3]
+    # 人気の読み取り欠損時だけ、総合上位から不足分を補完する。
+    if len(top_popular) < 3:
+        already = {horse.number for horse in top_popular}
+        fallback = [
+            horse for horse in sorted(horses.values(), key=ranking_key, reverse=True)
+            if horse.number not in already
+        ]
+        top_popular.extend(fallback[: 3 - len(top_popular)])
 
-    axis = top_popular[0]
-    axis.mark = "◎"
-    axis.comment = build_comment(axis)
-
-    candidates = [
-        horse
-        for horse in horses.values()
-        if horse.number != axis.number
-        and 1 <= horse.popularity <= 8
-    ]
-
-    candidates.sort(key=ranking_key, reverse=True)
-
-    selected = [axis]
-
-    for mark, horse in zip(MARKS[1:], candidates[:6]):
+    for mark, horse in zip(("◎", "○", "▲"), top_popular[:3]):
         horse.mark = mark
         horse.comment = build_comment(horse)
         selected.append(horse)
 
+    selected_numbers = {horse.number for horse in selected}
+
+    # 人気4～8位の5頭から能力上位4頭を選ぶ。ここで1頭だけ消える。
+    middle_popular = [
+        horse
+        for horse in horses.values()
+        if 4 <= horse.popularity <= 8
+        and horse.number not in selected_numbers
+    ]
+    middle_popular.sort(key=ranking_key, reverse=True)
+
+    for mark, horse in zip(("△", "☆", "注", "穴"), middle_popular[:4]):
+        horse.mark = mark
+        horse.comment = build_comment(horse)
+        selected.append(horse)
+
+    # 人気取得が不完全でも印を7頭まで表示できるよう補完する。
+    if len(selected) < 7:
+        selected_numbers = {horse.number for horse in selected}
+        fallback = [
+            horse for horse in sorted(horses.values(), key=ranking_key, reverse=True)
+            if horse.number not in selected_numbers
+        ]
+        remaining_marks = list(MARKS[len(selected):])
+        for mark, horse in zip(remaining_marks, fallback[: 7 - len(selected)]):
+            horse.mark = mark
+            horse.comment = build_comment(horse)
+            selected.append(horse)
+
     return selected
+
+
+def axis_confidence(selected: List[Horse]) -> Tuple[str, str, float]:
+    if not selected:
+        return "★☆☆☆☆", "判定不能", 0.0
+
+    axis = selected[0]
+    second_index = selected[1].score.ability_index if len(selected) >= 2 else axis.score.ability_index
+    gap = axis.score.ability_index - second_index
+
+    if axis.score.ability_index >= 94 and gap >= 5:
+        stars = "★★★★★"
+    elif axis.score.ability_index >= 90 and gap >= 3:
+        stars = "★★★★☆"
+    elif axis.score.ability_index >= 85 and gap >= 1:
+        stars = "★★★☆☆"
+    elif axis.score.ability_index >= 78:
+        stars = "★★☆☆☆"
+    else:
+        stars = "★☆☆☆☆"
+
+    selected_indices = [horse.score.ability_index for horse in selected]
+    spread = max(selected_indices) - min(selected_indices) if selected_indices else 0
+
+    if gap >= 6 and spread >= 18:
+        difficulty = "本命寄り"
+    elif gap >= 3 and spread >= 12:
+        difficulty = "やや荒れ"
+    elif spread >= 8:
+        difficulty = "混戦"
+    else:
+        difficulty = "大混戦"
+
+    return stars, difficulty, gap
 
 
 # =========================================================
@@ -961,7 +1042,7 @@ def result_dataframe(selected: List[Horse]) -> pd.DataFrame:
                 "人気": "-" if horse.popularity == 99 else horse.popularity,
                 "オッズ": "-" if horse.odds <= 0 else horse.odds,
                 "推定脚質": horse.running_style,
-                "総合": horse.score.total,
+                "能力指数": horse.score.ability_index,
                 "近走内容": horse.score.recent_form,
                 "レースレベル": horse.score.race_level,
                 "条件適性": horse.score.suitability,
@@ -984,7 +1065,8 @@ def diagnostic_dataframe(horses: Dict[int, Horse]) -> pd.DataFrame:
                 "人気": horse.popularity,
                 "近走数": len(horse.records),
                 "推定脚質": horse.running_style,
-                "総合": horse.score.total,
+                "内部総合": horse.score.total,
+                "能力指数": horse.score.ability_index,
             }
             for horse in sorted(
                 horses.values(),
@@ -1004,9 +1086,9 @@ def clear_inputs():
     st.session_state["timeindex_input"] = ""
 
 
-st.title("🐎 競馬AI Next v0.1")
+st.title("🐎 競馬AI Next v0.2")
 st.caption(
-    "出走表＋馬柱＋タイム指数｜人気1～3位から◎｜印は計7頭"
+    "出走表＋馬柱＋タイム指数｜人気1～3位は必ず◎○▲｜人気4～8位から△☆注穴"
 )
 
 racecard_text = st.text_area(
@@ -1079,8 +1161,24 @@ if predict_clicked:
     )
 
     selected = select_marks(horses)
+    confidence_stars, race_difficulty, axis_gap = axis_confidence(selected)
 
     st.divider()
+
+    if selected:
+        axis = selected[0]
+        summary_col1, summary_col2, summary_col3 = st.columns(3)
+        with summary_col1:
+            st.metric(
+                "◎ 軸馬",
+                f"{axis.number}番 {axis.name}",
+                f"能力指数 {axis.score.ability_index}",
+            )
+        with summary_col2:
+            st.metric("軸信頼度", confidence_stars, f"2番手との差 {axis_gap:.0f}")
+        with summary_col3:
+            st.metric("レース難易度", race_difficulty)
+
     st.subheader("予想結果")
 
     st.dataframe(
