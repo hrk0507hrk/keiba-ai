@@ -121,10 +121,13 @@ class ScoreDetail:
     avg5_score: float = 50.0
     avg5_rank: int = 0
     same_condition_score: float = 50.0
+    same_condition_count: int = 0
     trend_score: float = 50.0
     stability_score: float = 0.0
     stable_axis_score: float = 0.0
     win_axis_score: float = 0.0
+    base_axis_score: float = 0.0
+    condition_boost: float = 0.0
     axis_index: float = 0.0
     axis_rank: int = 0
     axis_banned: bool = False
@@ -1092,46 +1095,60 @@ def score_suitability(
     horse: Horse,
     conditions: RaceConditions,
 ) -> float:
+    """
+    今回条件への純粋な適合度。
+
+    着順・着差は同条件近走で評価するため、ここでは重複させない。
+    対象レース数が少ない場合は50点へ縮める。
+    """
     if not horse.records:
         return 45.0
 
-    # 現在条件が一つも分からない時は、過去着差を「条件適性」として
-    # 重複評価せず、中立値に固定する。
     if not has_known_conditions(conditions):
         return 50.0
 
-    scores = []
+    scores: List[float] = []
 
-    for record in horse.records:
-        score = 45.0
+    for record in horse.records[:5]:
+        score = 50.0
+        compared = 0
 
         if conditions.surface and record.surface:
-            score += 18 if record.surface == conditions.surface else -15
+            compared += 1
+            score += 10 if record.surface == conditions.surface else -12
 
         if conditions.distance and record.distance:
+            compared += 1
             distance_diff = abs(record.distance - conditions.distance)
-
             if distance_diff == 0:
-                score += 22
-            elif distance_diff <= 200:
                 score += 14
+            elif distance_diff <= 200:
+                score += 10
             elif distance_diff <= 400:
-                score += 6
+                score += 4
             else:
-                score -= 6
+                score -= 5
 
         if conditions.venue and record.venue:
-            score += 8 if record.venue == conditions.venue else 0
+            compared += 1
+            score += 4 if record.venue == conditions.venue else 0
 
         if conditions.going and record.going:
-            score += 5 if record.going == conditions.going else 0
+            compared += 1
+            score += 2 if record.going == conditions.going else 0
 
-        # 着順が欠ける形式でも着差から条件実績を評価する。
-        score += (margin_performance_score(record.margin) - 50) * 0.18
-        scores.append(clamp(score))
+        if compared:
+            scores.append(clamp(score))
 
-    # 長期休養や馬体重増減は能力そのものではなく、軸危険度へ反映する。
-    return clamp(average(scores, 45.0))
+    if not scores:
+        return 50.0
+
+    raw = average(scores, 50.0)
+
+    # 1走だけなら35％、2走なら55％、3走なら75％、
+    # 4走以上で100％まで信頼する。
+    reliability = min(1.0, 0.15 + len(scores) * 0.20)
+    return clamp(50.0 + (raw - 50.0) * reliability)
 
 
 def score_running_style(horse: Horse, front_count: int) -> float:
@@ -1443,17 +1460,21 @@ def record_performance_score(record: RaceRecord) -> float:
 def score_same_condition_recent(
     horse: Horse,
     conditions: RaceConditions,
-) -> float:
+) -> Tuple[float, int]:
     """
-    今回に近い競馬場・距離・馬場・クラスの近走を優先評価する。
-    条件情報がない場合は中立50点。
+    今回に近い条件での実戦内容を評価する。
+
+    ・上位クラスから今回クラスへ下がる場合は減点しない
+    ・相手緩和は最大5点の小幅加点
+    ・1～2走だけの高評価は50点へ強く縮める
     """
     if not horse.records or not has_known_conditions(conditions):
-        return 50.0
+        return 50.0, 0
 
     recency_weights = [1.00, 0.90, 0.80, 0.70, 0.60]
     weighted_scores: List[float] = []
     used_weights: List[float] = []
+    used_count = 0
 
     current_class_score = (
         class_score(conditions.race_class)
@@ -1464,6 +1485,7 @@ def score_same_condition_recent(
     for index, record in enumerate(horse.records[:5]):
         similarity = 0.0
         possible = 0.0
+        class_relief_bonus = 0.0
 
         if conditions.surface:
             possible += 0.25
@@ -1498,15 +1520,21 @@ def score_same_condition_recent(
         if current_class_score is not None:
             possible += 0.15
             if record.race_class:
-                class_diff = abs(
-                    class_score(record.race_class) - current_class_score
-                )
-                if class_diff <= 3:
+                prior_class_score = class_score(record.race_class)
+                class_diff = prior_class_score - current_class_score
+
+                # 過去の方が上位クラスなら、クラス違いで減点しない。
+                if class_diff >= 0:
                     similarity += 0.15
-                elif class_diff <= 8:
-                    similarity += 0.10
-                elif class_diff <= 14:
-                    similarity += 0.05
+                    class_relief_bonus = min(5.0, class_diff * 0.20)
+                else:
+                    tougher_jump = abs(class_diff)
+                    if tougher_jump <= 3:
+                        similarity += 0.15
+                    elif tougher_jump <= 8:
+                        similarity += 0.10
+                    elif tougher_jump <= 14:
+                        similarity += 0.05
 
         if possible <= 0:
             continue
@@ -1516,21 +1544,42 @@ def score_same_condition_recent(
             continue
 
         performance = record_performance_score(record)
-        # 近い条件ほど実績を強く、少し離れる場合は中立へ寄せる。
-        adjusted = 50.0 + (
-            performance - 50.0
-        ) * (0.65 + normalized_similarity * 0.35)
+
+        # 条件が近いほど実績を反映するが、旧版より50点へ寄せる。
+        adjusted = (
+            50.0
+            + (performance - 50.0) * (
+                0.40 + normalized_similarity * 0.35
+            )
+            + class_relief_bonus
+        )
 
         weight = recency_weights[index] * (
-            0.40 + normalized_similarity * 0.60
+            0.35 + normalized_similarity * 0.65
         )
-        weighted_scores.append(adjusted * weight)
+        weighted_scores.append(clamp(adjusted) * weight)
         used_weights.append(weight)
+        used_count += 1
 
     if not used_weights:
-        return 50.0
+        return 50.0, 0
 
-    return clamp(sum(weighted_scores) / sum(used_weights))
+    raw = sum(weighted_scores) / sum(used_weights)
+
+    # 有効1走は35％、2走は60％、3走は80％、4走以上で100％。
+    reliability_by_count = {
+        1: 0.35,
+        2: 0.60,
+        3: 0.80,
+    }
+    reliability = reliability_by_count.get(used_count, 1.0)
+
+    # 類似度が低いレースばかりなら、さらに50点へ寄せる。
+    weight_reliability = min(1.0, sum(used_weights) / 2.5)
+    reliability *= max(0.55, weight_reliability)
+
+    score = 50.0 + (raw - 50.0) * reliability
+    return clamp(score), used_count
 
 
 def calculate_trend_score(horse: Horse) -> float:
@@ -1647,11 +1696,12 @@ def calculate_stable_axis_score(horse: Horse) -> float:
     """複勝圏へ崩れにくい馬を評価する安定軸指数。"""
     score = (
         horse.score.avg5_score * 0.25
-        + horse.score.same_condition_score * 0.25
-        + horse.score.stability_score * 0.25
-        + horse.score.recent_form * 0.10
-        + horse.score.suitability * 0.10
-        + horse.score.race_level * 0.05
+        + horse.score.same_condition_score * 0.10
+        + horse.score.stability_score * 0.30
+        + horse.score.recent_form * 0.15
+        + horse.score.suitability * 0.05
+        + horse.score.race_level * 0.10
+        + horse.score.trend_score * 0.05
         - horse.score.danger_score * 0.25
     )
     return clamp(score)
@@ -1672,21 +1722,41 @@ def calculate_win_axis_score(horse: Horse) -> float:
     return clamp(score)
 
 
+def calculate_base_axis_score(horse: Horse) -> float:
+    """
+    条件適性・同条件近走を中立50点にした基礎軸指数。
+    条件入力だけで何点上がったかを診断するために使う。
+    """
+    score = (
+        horse.score.avg5_score * 0.22
+        + 50.0 * 0.10
+        + horse.score.stability_score * 0.20
+        + horse.score.trend_score * 0.14
+        + horse.score.race_level * 0.12
+        + 50.0 * 0.05
+        + horse.score.ability_index * 0.12
+        + horse.score.recent_form * 0.05
+        - horse.score.danger_score * 0.25
+    )
+    return clamp(score)
+
+
 def calculate_axis_index(horse: Horse) -> float:
     """
     総合軸指数。
 
-    5走平均と同条件実績を土台にし、安定度・上昇度・相手レベルを合成。
-    軽斤量は軸指数へ直接加点しない。
+    条件系は合計15％に抑え、5走平均・安定度・上昇度・
+    相手レベルなど複数項目がそろった馬を優先する。
     """
     score = (
-        horse.score.avg5_score * 0.20
-        + horse.score.same_condition_score * 0.20
-        + horse.score.stability_score * 0.18
-        + horse.score.trend_score * 0.12
-        + horse.score.race_level * 0.10
-        + horse.score.suitability * 0.10
-        + horse.score.ability_index * 0.10
+        horse.score.avg5_score * 0.22
+        + horse.score.same_condition_score * 0.10
+        + horse.score.stability_score * 0.20
+        + horse.score.trend_score * 0.14
+        + horse.score.race_level * 0.12
+        + horse.score.suitability * 0.05
+        + horse.score.ability_index * 0.12
+        + horse.score.recent_form * 0.05
         - horse.score.danger_score * 0.25
     )
     return clamp(score)
@@ -1754,7 +1824,15 @@ def assign_axis_engine(horses: Dict[int, Horse]) -> None:
             calculate_win_axis_score(horse),
             1,
         )
+        horse.score.base_axis_score = round(
+            calculate_base_axis_score(horse),
+            1,
+        )
         horse.score.axis_index = round(calculate_axis_index(horse), 1)
+        horse.score.condition_boost = round(
+            horse.score.axis_index - horse.score.base_axis_score,
+            1,
+        )
         banned, reason = axis_ban_judgement(horse)
         horse.score.axis_banned = banned
         horse.score.axis_ban_reason = reason
@@ -1992,10 +2070,14 @@ def score_horses(
         horse.score.age_adjustment = round(age_adjustment(horse), 1)
         horse.score.weight_bonus = round(calculate_weight_bonus(horse), 1)
         horse.score.high_class_win_bonus = recent_high_class_win_bonus(horse)
+        same_condition_score, same_condition_count = (
+            score_same_condition_recent(horse, conditions)
+        )
         horse.score.same_condition_score = round(
-            score_same_condition_recent(horse, conditions),
+            same_condition_score,
             1,
         )
+        horse.score.same_condition_count = same_condition_count
         horse.score.trend_score = round(calculate_trend_score(horse), 1)
 
         raw_time_scores[horse.number] = score_time_index(horse, mode)
@@ -2324,16 +2406,34 @@ def axis_candidate_pool(horses: Dict[int, Horse]) -> List[Horse]:
     )
 
 
-def axis_support_ok(horse: Horse) -> bool:
-    """順位だけでなく、軸を支える実体があるか確認する。"""
-    return any((
-        horse.score.avg5_rank <= 3,
-        horse.score.avg5_score >= 76,
+def axis_support_count(horse: Horse) -> int:
+    """軸を裏付ける独立項目の数を数える。"""
+    signals = (
+        horse.score.avg5_rank <= 3 or horse.score.avg5_score >= 76,
         horse.score.recent_form >= 70,
-        horse.score.same_condition_score >= 68,
-        horse.score.stable_axis_score >= 78,
-        horse.score.win_axis_score >= 80,
+        horse.score.same_condition_score >= 68
+        and horse.score.same_condition_count >= 2,
+        horse.score.stability_score >= 75,
+        horse.score.trend_score >= 65,
+        horse.score.race_level >= 70,
+        horse.score.time_index >= 78,
+    )
+    return sum(bool(signal) for signal in signals)
+
+
+def axis_support_ok(horse: Horse) -> bool:
+    """
+    1項目だけ突出した馬を軸にしない。
+    独立した裏付けが3項目以上必要。
+    """
+    core_support = any((
+        horse.score.avg5_rank <= 3,
+        horse.score.recent_form >= 70,
+        horse.score.same_condition_score >= 68
+        and horse.score.same_condition_count >= 2,
+        horse.score.stability_score >= 75,
     ))
+    return core_support and axis_support_count(horse) >= 3
 
 
 def single_axis_eligible(candidates: List[Horse]) -> bool:
@@ -2354,6 +2454,7 @@ def single_axis_eligible(candidates: List[Horse]) -> bool:
         and first.score.stability_score >= 75
         and first.score.recent_form >= 70
         and first.score.danger_score < 20
+        and first.score.condition_boost < 10
         and axis_support_ok(first)
     )
 
@@ -2368,6 +2469,8 @@ def pair_axis_eligible(candidates: List[Horse]) -> bool:
         and second.score.axis_index >= 75
         and first.score.danger_score < 35
         and second.score.danger_score < 35
+        and first.score.condition_boost < 10
+        and second.score.condition_boost < 10
         and axis_support_ok(first)
         and axis_support_ok(second)
     )
@@ -2487,6 +2590,8 @@ def result_dataframe(selected: List[Horse]) -> pd.DataFrame:
                 "5走平均評価": horse.score.avg5_score,
                 "5走平均順位": horse.score.avg5_rank,
                 "同条件近走": horse.score.same_condition_score,
+                "同条件件数": horse.score.same_condition_count,
+                "条件上昇幅": horse.score.condition_boost,
                 "上昇度": horse.score.trend_score,
                 "直近3走ピーク": horse.score.recent_peak_score,
                 "安定度": horse.score.stability_score,
@@ -2533,6 +2638,9 @@ def diagnostic_dataframe(horses: Dict[int, Horse]) -> pd.DataFrame:
                 "5走平均評価": horse.score.avg5_score,
                 "5走平均順位": horse.score.avg5_rank,
                 "同条件近走": horse.score.same_condition_score,
+                "同条件件数": horse.score.same_condition_count,
+                "基礎軸指数": horse.score.base_axis_score,
+                "条件上昇幅": horse.score.condition_boost,
                 "上昇度": horse.score.trend_score,
                 "安定度": horse.score.stability_score,
                 "安定軸指数": horse.score.stable_axis_score,
@@ -2566,9 +2674,9 @@ def clear_inputs():
     st.session_state["timeindex_input"] = ""
 
 
-st.title("🐎 競馬AI Next v0.6.7 軸精度強化版")
+st.title("🐎 競馬AI Next v0.6.8 条件補正抑制版")
 st.caption(
-    "地方クラス誤読を修正｜軸に絶対基準を追加｜安定軸・勝負軸・同条件近走を分離"
+    "条件系の軸配点を30％から15％へ圧縮｜降級を正評価｜少数サンプルを50点へ縮小"
 )
 
 conditions_text = st.text_input(
