@@ -68,6 +68,7 @@ class RaceConditions:
     surface: str = ""
     distance: int = 0
     going: str = ""
+    race_class: str = ""
 
 
 @dataclass
@@ -117,7 +118,13 @@ class ScoreDetail:
     weight_bonus: float = 0.0
     high_class_win_bonus: float = 0.0
     selection_score: float = 0.0
+    avg5_score: float = 50.0
+    avg5_rank: int = 0
+    same_condition_score: float = 50.0
+    trend_score: float = 50.0
     stability_score: float = 0.0
+    stable_axis_score: float = 0.0
+    win_axis_score: float = 0.0
     axis_index: float = 0.0
     axis_rank: int = 0
     axis_banned: bool = False
@@ -192,6 +199,64 @@ def average(values: List[float], default: float = 0.0) -> float:
 # Race conditions parser
 # =========================================================
 
+def parse_race_class_label(text: str) -> str:
+    """
+    レース名・条件文からクラス表記を安全に取得する。
+
+    B14組をB1、C10組をC1として途中一致させない。
+    単独の(A)(B)(C)、BC、B1B2混などにも対応する。
+    """
+    normalized = normalize_text(text)
+
+    for pattern in (
+        r"(JpnIII|JpnII|JpnI|Jpn3|Jpn2|Jpn1|GIII|GII|GI|G3|G2|G1)",
+        r"(重賞)",
+        r"(3勝|2勝|1勝|未勝利|新馬|OP|オープン|リステッド)",
+    ):
+        match = re.search(pattern, normalized, re.I)
+        if match:
+            label = match.group(1)
+            return label.upper() if label != "重賞" else label
+
+    # B1B2混、B2B3、A2B1などの混合条件。
+    mixed = re.search(
+        r"(?<![A-Z0-9])((?:A|B|C)\d{1,2}(?:A|B|C)\d{1,2})(?:混)?(?!\d)",
+        normalized,
+        re.I,
+    )
+    if mixed:
+        return mixed.group(1).upper()
+
+    # B14組、C10組など。組番号を丸ごと保持する。
+    group = re.search(
+        r"(?<![A-Z0-9])([ABC])(\d{1,2})組",
+        normalized,
+        re.I,
+    )
+    if group:
+        return f"{group.group(1).upper()}{safe_int(group.group(2))}"
+
+    # A1、B2、C3など。後ろに数字が続く場合は一致させない。
+    exact = re.search(
+        r"(?<![A-Z0-9])([ABC])(\d{1,2})(?!\d)",
+        normalized,
+        re.I,
+    )
+    if exact:
+        return f"{exact.group(1).upper()}{safe_int(exact.group(2))}"
+
+    # (BC)、BC級。
+    if re.search(r"\(BC\)|BC級", normalized, re.I):
+        return "BC"
+
+    # (A)(B)(C)、A級・B級・C級。
+    generic = re.search(r"\(([ABC])\)|([ABC])級", normalized, re.I)
+    if generic:
+        return (generic.group(1) or generic.group(2)).upper()
+
+    return ""
+
+
 def parse_conditions(text: str) -> RaceConditions:
     normalized = normalize_text(text).replace("ダート", "ダ")
 
@@ -229,6 +294,7 @@ def parse_conditions(text: str) -> RaceConditions:
         surface=surface,
         distance=distance,
         going=going,
+        race_class=parse_race_class_label(normalized),
     )
 
 
@@ -248,6 +314,7 @@ def merge_conditions(
         surface=explicit.surface or fallback.surface,
         distance=explicit.distance or fallback.distance,
         going=explicit.going or fallback.going,
+        race_class=explicit.race_class or fallback.race_class,
     )
 
 
@@ -257,6 +324,7 @@ def has_known_conditions(conditions: RaceConditions) -> bool:
         conditions.surface,
         conditions.distance,
         conditions.going,
+        conditions.race_class,
     ))
 
 
@@ -468,19 +536,7 @@ def parse_record_conditions(lines: List[str]):
     if match:
         going = match.group(1)
 
-    race_class = ""
-    for pattern in (
-        # 長い表記を先に並べ、JpnIIIをJpnIとして途中一致させない。
-        r"(JpnIII|JpnII|JpnI|Jpn3|Jpn2|Jpn1|GIII|GII|GI|G3|G2|G1)",
-        r"(重賞)",
-        r"(A1|A2|B1|B2|B3|C1|C2|C3)",
-        r"(3勝|2勝|1勝|未勝利|新馬|OP|オープン|リステッド)",
-    ):
-        match = re.search(pattern, joined, re.I)
-        if match:
-            label = match.group(1)
-            race_class = label.upper() if label != "重賞" else label
-            break
+    race_class = parse_race_class_label(joined)
 
     return date, venue, surface, distance, going, race_class
 
@@ -731,11 +787,72 @@ def parse_time_index(
 # Scoring
 # =========================================================
 
+def local_group_class_score(letter: str, group_number: int) -> float:
+    """地方の組番号を、上位組ほど高く・下位組ほど低く評価する。"""
+    letter = letter.upper()
+    group_number = max(1, group_number)
+
+    if letter == "A":
+        if group_number == 1:
+            return 84.0
+        if group_number == 2:
+            return 80.0
+        return clamp(78.0 - (group_number - 3) * 1.5, 68.0, 78.0)
+
+    if letter == "B":
+        if group_number == 1:
+            return 76.0
+        if group_number == 2:
+            return 72.0
+        if group_number == 3:
+            return 68.0
+        return clamp(68.0 - (group_number - 3) * 1.2, 54.0, 68.0)
+
+    if letter == "C":
+        if group_number == 1:
+            return 64.0
+        if group_number == 2:
+            return 58.0
+        if group_number == 3:
+            return 52.0
+        return clamp(52.0 - (group_number - 3) * 1.0, 42.0, 52.0)
+
+    return 52.0
+
+
 def class_score(label: str) -> float:
     if not label:
         return 52.0
 
-    return float(CLASS_SCORES.get(label.upper(), 52.0))
+    upper = label.upper()
+    if upper in CLASS_SCORES:
+        return float(CLASS_SCORES[upper])
+
+    generic_scores = {
+        "A": 80.0,
+        "B": 66.0,
+        "C": 52.0,
+        "BC": 59.0,
+    }
+    if upper in generic_scores:
+        return generic_scores[upper]
+
+    # B1B2、B2B3、A2B1などは構成クラスの平均。
+    mixed_parts = re.findall(r"([ABC])(\d{1,2})", upper)
+    if len(mixed_parts) >= 2:
+        return average([
+            local_group_class_score(letter, safe_int(number, 1))
+            for letter, number in mixed_parts
+        ], 52.0)
+
+    single = re.fullmatch(r"([ABC])(\d{1,2})", upper)
+    if single:
+        return local_group_class_score(
+            single.group(1),
+            safe_int(single.group(2), 1),
+        )
+
+    return 52.0
 
 
 def recent_high_class_win_bonus(horse: Horse) -> float:
@@ -1308,6 +1425,142 @@ def recent_peak_score(horse: Horse) -> float:
     return clamp(time_index_to_score(max(values)))
 
 
+def record_performance_score(record: RaceRecord) -> float:
+    margin_score = margin_performance_score(record.margin)
+    position_score = position_content_score(record)
+
+    if record.finish_known and record.finish < 99:
+        finish_score = clamp(105 - record.finish * 9, 10, 100)
+        return clamp(
+            margin_score * 0.50
+            + finish_score * 0.35
+            + position_score * 0.15
+        )
+
+    return clamp(margin_score * 0.75 + position_score * 0.25)
+
+
+def score_same_condition_recent(
+    horse: Horse,
+    conditions: RaceConditions,
+) -> float:
+    """
+    今回に近い競馬場・距離・馬場・クラスの近走を優先評価する。
+    条件情報がない場合は中立50点。
+    """
+    if not horse.records or not has_known_conditions(conditions):
+        return 50.0
+
+    recency_weights = [1.00, 0.90, 0.80, 0.70, 0.60]
+    weighted_scores: List[float] = []
+    used_weights: List[float] = []
+
+    current_class_score = (
+        class_score(conditions.race_class)
+        if conditions.race_class
+        else None
+    )
+
+    for index, record in enumerate(horse.records[:5]):
+        similarity = 0.0
+        possible = 0.0
+
+        if conditions.surface:
+            possible += 0.25
+            if record.surface == conditions.surface:
+                similarity += 0.25
+            elif record.surface:
+                similarity -= 0.20
+
+        if conditions.distance:
+            possible += 0.35
+            if record.distance:
+                diff = abs(record.distance - conditions.distance)
+                if diff == 0:
+                    similarity += 0.35
+                elif diff <= 200:
+                    similarity += 0.27
+                elif diff <= 400:
+                    similarity += 0.14
+
+        if conditions.venue:
+            possible += 0.20
+            if record.venue == conditions.venue:
+                similarity += 0.20
+            elif record.venue:
+                similarity += 0.06
+
+        if conditions.going:
+            possible += 0.05
+            if record.going == conditions.going:
+                similarity += 0.05
+
+        if current_class_score is not None:
+            possible += 0.15
+            if record.race_class:
+                class_diff = abs(
+                    class_score(record.race_class) - current_class_score
+                )
+                if class_diff <= 3:
+                    similarity += 0.15
+                elif class_diff <= 8:
+                    similarity += 0.10
+                elif class_diff <= 14:
+                    similarity += 0.05
+
+        if possible <= 0:
+            continue
+
+        normalized_similarity = clamp(similarity / possible, 0.0, 1.0)
+        if normalized_similarity < 0.20:
+            continue
+
+        performance = record_performance_score(record)
+        # 近い条件ほど実績を強く、少し離れる場合は中立へ寄せる。
+        adjusted = 50.0 + (
+            performance - 50.0
+        ) * (0.65 + normalized_similarity * 0.35)
+
+        weight = recency_weights[index] * (
+            0.40 + normalized_similarity * 0.60
+        )
+        weighted_scores.append(adjusted * weight)
+        used_weights.append(weight)
+
+    if not used_weights:
+        return 50.0
+
+    return clamp(sum(weighted_scores) / sum(used_weights))
+
+
+def calculate_trend_score(horse: Horse) -> float:
+    """直近3走指数の上昇・下降を、安定度とは別に評価する。"""
+    values = recent_time_values(horse)
+    if not values:
+        return 50.0
+    if len(values) == 1:
+        return time_index_to_score(values[-1]) * 0.50 + 25.0
+
+    start = values[0]
+    end = values[-1]
+    improvement = end - start
+
+    recent_level = average(
+        [time_index_to_score(value) for value in values],
+        50.0,
+    )
+    trend_component = clamp(50.0 + improvement * 1.5, 15.0, 90.0)
+
+    # 前走が2走前より大幅に悪化した場合は下降を少し強めに反映。
+    if len(values) >= 2 and values[-1] <= values[-2] - 15:
+        trend_component -= 8.0
+
+    return clamp(
+        recent_level * 0.45
+        + trend_component * 0.55
+    )
+
+
 def calculate_stability_score(horse: Horse) -> float:
     """直近指数・着差・位置取りのブレから、軸向きの安定度を算出する。"""
     recent_values = recent_time_values(horse)
@@ -1390,22 +1643,51 @@ def calculate_stability_score(horse: Horse) -> float:
     return clamp(score)
 
 
+def calculate_stable_axis_score(horse: Horse) -> float:
+    """複勝圏へ崩れにくい馬を評価する安定軸指数。"""
+    score = (
+        horse.score.avg5_score * 0.25
+        + horse.score.same_condition_score * 0.25
+        + horse.score.stability_score * 0.25
+        + horse.score.recent_form * 0.10
+        + horse.score.suitability * 0.10
+        + horse.score.race_level * 0.05
+        - horse.score.danger_score * 0.25
+    )
+    return clamp(score)
+
+
+def calculate_win_axis_score(horse: Horse) -> float:
+    """一発の勝ち切り能力を評価する勝負軸指数。"""
+    score = (
+        horse.score.time_index * 0.20
+        + horse.score.avg5_score * 0.18
+        + horse.score.recent_form * 0.18
+        + horse.score.recent_peak_score * 0.15
+        + horse.score.ability_index * 0.14
+        + horse.score.running_style * 0.08
+        + horse.score.race_level * 0.07
+        - horse.score.danger_score * 0.20
+    )
+    return clamp(score)
+
+
 def calculate_axis_index(horse: Horse) -> float:
     """
-    軸専用指数。
+    総合軸指数。
 
-    安定度だけで勝ち切り型を落としすぎないよう、
-    安定度を25％へ下げ、タイム指数を20％へ上げる。
+    5走平均と同条件実績を土台にし、安定度・上昇度・相手レベルを合成。
+    軽斤量は軸指数へ直接加点しない。
     """
     score = (
-        horse.score.stability_score * 0.25
-        + horse.score.recent_form * 0.25
-        + horse.score.time_index * 0.20
-        + horse.score.ability_index * 0.10
+        horse.score.avg5_score * 0.20
+        + horse.score.same_condition_score * 0.20
+        + horse.score.stability_score * 0.18
+        + horse.score.trend_score * 0.12
         + horse.score.race_level * 0.10
         + horse.score.suitability * 0.10
-        + min(horse.score.weight_bonus, 2.0)
-        - horse.score.danger_score * 0.30
+        + horse.score.ability_index * 0.10
+        - horse.score.danger_score * 0.25
     )
     return clamp(score)
 
@@ -1446,19 +1728,32 @@ def axis_ban_judgement(horse: Horse) -> Tuple[bool, str]:
 
 
 def classify_axis_type(horse: Horse) -> str:
-    if 4 <= horse.popularity <= 6:
-        return "穴軸型"
-    if horse.score.stability_score >= 75 and horse.score.danger_score < 22:
-        return "安定型"
-    if horse.score.ability_index >= 85 and horse.score.recent_form >= 60:
-        return "能力型"
-    return "バランス型"
+    if horse.score.stable_axis_score >= horse.score.win_axis_score + 4:
+        base = "安定型"
+    elif horse.score.win_axis_score >= horse.score.stable_axis_score + 4:
+        base = "勝負型"
+    else:
+        base = "総合型"
+
+    if 4 <= horse.popularity <= 8:
+        return f"穴・{base}"
+    return base
 
 
 def assign_axis_engine(horses: Dict[int, Horse]) -> None:
-    """全頭へ安定度・軸指数・軸禁止・軸タイプを付与する。"""
+    """全頭へ安定軸・勝負軸・総合軸・軸禁止を付与する。"""
     for horse in horses.values():
         horse.score.stability_score = round(calculate_stability_score(horse), 1)
+
+    for horse in horses.values():
+        horse.score.stable_axis_score = round(
+            calculate_stable_axis_score(horse),
+            1,
+        )
+        horse.score.win_axis_score = round(
+            calculate_win_axis_score(horse),
+            1,
+        )
         horse.score.axis_index = round(calculate_axis_index(horse), 1)
         banned, reason = axis_ban_judgement(horse)
         horse.score.axis_banned = banned
@@ -1684,6 +1979,7 @@ def score_horses(
 
     raw_time_scores: Dict[int, float] = {}
     raw_peak_scores: Dict[int, float] = {}
+    raw_avg5_scores: Dict[int, float] = {}
 
     # 基礎項目とタイム指数の固定基準値を先に計算する。
     for horse in horses.values():
@@ -1696,9 +1992,17 @@ def score_horses(
         horse.score.age_adjustment = round(age_adjustment(horse), 1)
         horse.score.weight_bonus = round(calculate_weight_bonus(horse), 1)
         horse.score.high_class_win_bonus = recent_high_class_win_bonus(horse)
+        horse.score.same_condition_score = round(
+            score_same_condition_recent(horse, conditions),
+            1,
+        )
+        horse.score.trend_score = round(calculate_trend_score(horse), 1)
 
         raw_time_scores[horse.number] = score_time_index(horse, mode)
         raw_peak_scores[horse.number] = recent_peak_score(horse)
+        raw_avg5_scores[horse.number] = time_index_to_score(
+            horse.time_index.avg5
+        )
 
     # 固定基準65％＋レース内相対順位35％で、99～100点への張り付きを解消する。
     normalized_time_scores = blend_field_scores(
@@ -1713,10 +2017,17 @@ def score_horses(
         relative_high=90.0,
         absolute_weight=0.62,
     )
+    normalized_avg5_scores = blend_field_scores(
+        raw_avg5_scores,
+        relative_low=45.0,
+        relative_high=90.0,
+        absolute_weight=0.80,
+    )
 
     for horse in horses.values():
         horse.score.time_index = normalized_time_scores.get(horse.number, 50.0)
         horse.score.recent_peak_score = normalized_peak_scores.get(horse.number, 50.0)
+        horse.score.avg5_score = normalized_avg5_scores.get(horse.number, 50.0)
 
         total = (
             horse.score.recent_form * WEIGHTS["recent_form"]
@@ -1731,6 +2042,19 @@ def score_horses(
         total += horse.score.transition_bonus * 0.35
         total += horse.score.age_adjustment
         horse.score.total = round(clamp(total), 1)
+
+    avg5_ranked = sorted(
+        horses.values(),
+        key=lambda horse: (
+            horse.score.avg5_score,
+            horse.time_index.avg5
+            if horse.time_index.avg5 is not None
+            else -999,
+        ),
+        reverse=True,
+    )
+    for rank, horse in enumerate(avg5_ranked, start=1):
+        horse.score.avg5_rank = rank
 
     assign_fixed_ability_indices(horses)
 
@@ -1873,13 +2197,9 @@ def mark_order_key(horse: Horse):
 
 def select_marks(horses: Dict[int, Horse]) -> List[Horse]:
     """
-    軸候補と予想印を同じ選出結果へ統一する。
+    軸候補と予想印を一致させつつ、人気1～3位も必ず残す。
 
-    1. 上段の軸判定を先に取得
-    2. 軸候補2頭なら◎・○、単独候補なら◎
-    3. 人気1～3位は印から消さない
-    4. 人気4～8位から4頭を選ぶが、軸候補は必ず残す
-    5. 残りの印は能力・印選定指数・軸適性で決める
+    軸候補が9番人気以下でも、7頭枠を超過させずに確保する。
     """
     for horse in horses.values():
         horse.mark = ""
@@ -1894,92 +2214,72 @@ def select_marks(horses: Dict[int, Horse]) -> List[Horse]:
 
     actual_axes: List[Horse] = []
     if primary_axis is not None:
-        if axis_operation == "軸候補2頭":
-            actual_axes = axis_candidates[:2]
-        else:
-            actual_axes = axis_candidates[:1]
+        actual_axes = (
+            axis_candidates[:2]
+            if axis_operation == "軸候補2頭"
+            else axis_candidates[:1]
+        )
 
-    top_popular = [
-        horse
-        for horse in horses.values()
-        if 1 <= horse.popularity <= 3
-    ]
-    top_popular.sort(
-        key=lambda horse: (
-            -horse.popularity,
-            horse.score.ability_index,
-            horse.score.selection_score,
-        ),
-        reverse=True,
+    top_popular = sorted(
+        [
+            horse
+            for horse in horses.values()
+            if 1 <= horse.popularity <= 3
+        ],
+        key=lambda horse: horse.popularity,
     )
 
-    # 人気情報が不足した場合のみ総合上位で補う。
     if len(top_popular) < 3:
-        already = {horse.number for horse in top_popular}
+        existing = {horse.number for horse in top_popular}
         fallback = [
             horse
             for horse in sorted(horses.values(), key=ranking_key, reverse=True)
-            if horse.number not in already
+            if horse.number not in existing
         ]
         top_popular.extend(fallback[: 3 - len(top_popular)])
 
-    middle_popular = [
-        horse
-        for horse in horses.values()
-        if 4 <= horse.popularity <= 8
-    ]
-    middle_popular.sort(key=middle_selection_key, reverse=True)
-
-    # 軸候補が人気4～8位なら、印選定順位に関係なく必ず生存させる。
-    forced_middle = [
-        horse
-        for horse in actual_axes
-        if 4 <= horse.popularity <= 8
-    ]
-
-    selected_middle: List[Horse] = []
-    used_middle = set()
-    for horse in forced_middle + middle_popular:
-        if horse.number in used_middle:
+    mandatory: List[Horse] = []
+    mandatory_numbers = set()
+    for horse in actual_axes + top_popular[:3]:
+        if horse.number in mandatory_numbers:
             continue
-        selected_middle.append(horse)
-        used_middle.add(horse.number)
-        if len(selected_middle) >= 4:
-            break
+        mandatory.append(horse)
+        mandatory_numbers.add(horse.number)
 
-    # 基本の7頭枠：人気上位3頭＋人気4～8位の4頭。
-    base_pool: List[Horse] = []
-    used = set()
-    for horse in actual_axes + top_popular[:3] + selected_middle:
-        if horse.number in used:
-            continue
-        base_pool.append(horse)
-        used.add(horse.number)
+    remaining_slots = max(0, 7 - len(mandatory))
 
-    # データ不足などで7頭に満たない場合は総合順で補完。
+    middle_candidates = sorted(
+        [
+            horse
+            for horse in horses.values()
+            if 4 <= horse.popularity <= 8
+            and horse.number not in mandatory_numbers
+        ],
+        key=middle_selection_key,
+        reverse=True,
+    )
+
+    base_pool = mandatory + middle_candidates[:remaining_slots]
+    used = {horse.number for horse in base_pool}
+
     if len(base_pool) < 7:
         fallback = [
             horse
             for horse in sorted(horses.values(), key=mark_order_key, reverse=True)
             if horse.number not in used
         ]
-        for horse in fallback:
-            base_pool.append(horse)
-            used.add(horse.number)
-            if len(base_pool) >= 7:
-                break
+        base_pool.extend(fallback[: 7 - len(base_pool)])
 
-    # 軸候補以外を能力中心で並べる。
     actual_axis_numbers = {horse.number for horse in actual_axes}
     partners = [
-        horse for horse in base_pool
+        horse
+        for horse in base_pool
         if horse.number not in actual_axis_numbers
     ]
     partners.sort(key=mark_order_key, reverse=True)
 
     selected: List[Horse] = []
 
-    # 上段の軸候補と印を一致させる。
     if len(actual_axes) >= 2:
         mark_pairs = (("◎", actual_axes[0]), ("○", actual_axes[1]))
         remaining_marks = ("▲", "△", "☆", "注", "穴")
@@ -2004,33 +2304,101 @@ def select_marks(horses: Dict[int, Horse]) -> List[Horse]:
 
 
 def axis_candidate_pool(horses: Dict[int, Horse]) -> List[Horse]:
-    """人気1～3位と、軸指数68以上の4～6番人気を同じ候補プールで比較する。"""
+    """人気に制限せず、軸禁止でない全馬を総合軸指数で比較する。"""
     candidates = [
-        horse for horse in horses.values()
-        if (
-            (1 <= horse.popularity <= 3)
-            or (4 <= horse.popularity <= 6 and horse.score.axis_index >= 68)
-        )
-        and not horse.score.axis_banned
+        horse
+        for horse in horses.values()
+        if not horse.score.axis_banned
     ]
 
-    unique: List[Horse] = []
-    used = set()
-    for horse in candidates:
-        if horse.number in used:
-            continue
-        used.add(horse.number)
-        unique.append(horse)
-
     return sorted(
-        unique,
+        candidates,
         key=lambda horse: (
             horse.score.axis_index,
-            horse.score.stability_score,
-            horse.score.time_index,
+            horse.score.stable_axis_score,
+            horse.score.win_axis_score,
+            horse.score.avg5_score,
+            horse.score.same_condition_score,
         ),
         reverse=True,
     )
+
+
+def axis_support_ok(horse: Horse) -> bool:
+    """順位だけでなく、軸を支える実体があるか確認する。"""
+    return any((
+        horse.score.avg5_rank <= 3,
+        horse.score.avg5_score >= 76,
+        horse.score.recent_form >= 70,
+        horse.score.same_condition_score >= 68,
+        horse.score.stable_axis_score >= 78,
+        horse.score.win_axis_score >= 80,
+    ))
+
+
+def single_axis_eligible(candidates: List[Horse]) -> bool:
+    if not candidates:
+        return False
+
+    first = candidates[0]
+    second_score = (
+        candidates[1].score.axis_index
+        if len(candidates) >= 2
+        else first.score.axis_index - 10
+    )
+    gap = first.score.axis_index - second_score
+
+    return (
+        first.score.axis_index >= 82
+        and gap >= 4
+        and first.score.stability_score >= 75
+        and first.score.recent_form >= 70
+        and first.score.danger_score < 20
+        and axis_support_ok(first)
+    )
+
+
+def pair_axis_eligible(candidates: List[Horse]) -> bool:
+    if len(candidates) < 2:
+        return False
+
+    first, second = candidates[:2]
+    return (
+        first.score.axis_index >= 78
+        and second.score.axis_index >= 75
+        and first.score.danger_score < 35
+        and second.score.danger_score < 35
+        and axis_support_ok(first)
+        and axis_support_ok(second)
+    )
+
+
+def axis_specialists(
+    horses: Dict[int, Horse],
+) -> Tuple[Optional[Horse], Optional[Horse]]:
+    eligible = [
+        horse
+        for horse in horses.values()
+        if not horse.score.axis_banned
+    ]
+    if not eligible:
+        return None, None
+
+    stable_axis = max(
+        eligible,
+        key=lambda horse: (
+            horse.score.stable_axis_score,
+            horse.score.axis_index,
+        ),
+    )
+    win_axis = max(
+        eligible,
+        key=lambda horse: (
+            horse.score.win_axis_score,
+            horse.score.axis_index,
+        ),
+    )
+    return stable_axis, win_axis
 
 
 def axis_confidence(horses: Dict[int, Horse]) -> Tuple[str, str, float, List[Horse]]:
@@ -2039,33 +2407,28 @@ def axis_confidence(horses: Dict[int, Horse]) -> Tuple[str, str, float, List[Hor
         return "★☆☆☆☆", "大混戦", 0.0, []
 
     first = candidates[0]
-    second_score = candidates[1].score.axis_index if len(candidates) >= 2 else max(0.0, first.score.axis_index - 10.0)
+    second_score = (
+        candidates[1].score.axis_index
+        if len(candidates) >= 2
+        else max(0.0, first.score.axis_index - 10.0)
+    )
     gap = first.score.axis_index - second_score
 
-    if first.score.axis_index >= 85 and gap >= 7:
+    if single_axis_eligible(candidates):
         star_count = 5
-    elif first.score.axis_index >= 78 and gap >= 7:
-        star_count = 4
-    elif first.score.axis_index >= 72 and gap >= 4:
-        star_count = 3
-    elif first.score.axis_index >= 64:
+        difficulty = "本命寄り"
+    elif pair_axis_eligible(candidates):
+        star_count = 3 if first.score.axis_index >= 80 else 2
+        difficulty = "混戦"
+    elif first.score.axis_index >= 75:
         star_count = 2
+        difficulty = "大混戦"
     else:
         star_count = 1
-
-    if first.score.stability_score < 50:
-        star_count = min(star_count, 2)
-    if first.score.danger_score >= 22:
-        star_count = min(star_count, 3)
-
-    if first.score.axis_index < 60 or gap <= 3:
         difficulty = "大混戦"
-    elif gap <= 6:
-        difficulty = "混戦"
-    elif first.score.axis_index >= 80:
-        difficulty = "本命寄り"
-    else:
-        difficulty = "やや荒れ"
+
+    if first.score.danger_score >= 22:
+        star_count = min(star_count, 2)
 
     stars = "★" * star_count + "☆" * (5 - star_count)
     return stars, difficulty, gap, candidates
@@ -2076,28 +2439,26 @@ def axis_guidance(
     difficulty: str,
     stars: str,
 ) -> Tuple[str, str, Optional[Horse]]:
-    """適格馬不在だけを軸なしとし、上位差が小さい場合は軸候補2頭を表示する。"""
+    """
+    絶対基準を満たした場合だけ軸を出す。
+    弱い1位を無理に軸候補へしない。
+    """
     if not candidates:
         return "軸なし", "単独軸非推奨", None
 
-    first = candidates[0]
-    if first.score.axis_index < 60:
-        return "軸なし", "単独軸非推奨", None
+    if single_axis_eligible(candidates):
+        first = candidates[0]
+        return f"{first.number}番 {first.name}", "単独軸候補", first
 
-    star_count = stars.count("★")
-
-    if len(candidates) >= 2 and (
-        difficulty in ("大混戦", "混戦")
-        or star_count <= 2
-    ):
+    if pair_axis_eligible(candidates):
         pair = candidates[:2]
-        names = "・".join(f"{horse.number}番 {horse.name}" for horse in pair)
-        return names, "軸候補2頭", first
+        names = "・".join(
+            f"{horse.number}番 {horse.name}"
+            for horse in pair
+        )
+        return names, "軸候補2頭", pair[0]
 
-    if star_count <= 2:
-        return f"{first.number}番 {first.name}", "単独軸非推奨", first
-
-    return f"{first.number}番 {first.name}", "単独軸候補", first
+    return "軸なし", "単独軸非推奨", None
 
 
 
@@ -2123,8 +2484,14 @@ def result_dataframe(selected: List[Horse]) -> pd.DataFrame:
                 "脚質評価": horse.score.running_style,
                 "上がり3F": horse.score.closing_power,
                 "タイム指数": horse.score.time_index,
+                "5走平均評価": horse.score.avg5_score,
+                "5走平均順位": horse.score.avg5_rank,
+                "同条件近走": horse.score.same_condition_score,
+                "上昇度": horse.score.trend_score,
                 "直近3走ピーク": horse.score.recent_peak_score,
                 "安定度": horse.score.stability_score,
+                "安定軸指数": horse.score.stable_axis_score,
+                "勝負軸指数": horse.score.win_axis_score,
                 "軸指数": horse.score.axis_index,
                 "軸順位": horse.score.axis_rank,
                 "軸タイプ": horse.score.axis_type,
@@ -2163,7 +2530,13 @@ def diagnostic_dataframe(horses: Dict[int, Horse]) -> pd.DataFrame:
                 "休養週": horse.layoff_weeks,
                 "相手弱化": horse.score.transition_bonus,
                 "直近3走ピーク": horse.score.recent_peak_score,
+                "5走平均評価": horse.score.avg5_score,
+                "5走平均順位": horse.score.avg5_rank,
+                "同条件近走": horse.score.same_condition_score,
+                "上昇度": horse.score.trend_score,
                 "安定度": horse.score.stability_score,
+                "安定軸指数": horse.score.stable_axis_score,
+                "勝負軸指数": horse.score.win_axis_score,
                 "軸指数": horse.score.axis_index,
                 "軸順位": horse.score.axis_rank,
                 "軸タイプ": horse.score.axis_type,
@@ -2193,14 +2566,14 @@ def clear_inputs():
     st.session_state["timeindex_input"] = ""
 
 
-st.title("🐎 競馬AI Next v0.6.6 5走平均・軸印連動版")
+st.title("🐎 競馬AI Next v0.6.7 軸精度強化版")
 st.caption(
-    "地方指数は5走平均を最重視｜軸の安定偏重を緩和｜軸候補と◎○を完全連動"
+    "地方クラス誤読を修正｜軸に絶対基準を追加｜安定軸・勝負軸・同条件近走を分離"
 )
 
 conditions_text = st.text_input(
     "レース条件（任意）",
-    placeholder="例：中京 ダ1400 良　※分かる項目だけでもOK",
+    placeholder="例：名古屋 B級 ダ1500 良　※分かる項目だけでもOK",
     key="conditions_input",
 )
 
@@ -2314,6 +2687,35 @@ if predict_clicked:
         with summary_col4:
             st.metric("軸運用", axis_operation)
 
+        stable_axis, win_axis = axis_specialists(horses)
+        specialist_col1, specialist_col2 = st.columns(2)
+
+        with specialist_col1:
+            stable_name = (
+                f"{stable_axis.number}番 {stable_axis.name}"
+                if stable_axis
+                else "該当なし"
+            )
+            stable_delta = (
+                f"安定軸指数 {stable_axis.score.stable_axis_score:.1f}"
+                if stable_axis
+                else ""
+            )
+            st.metric("安定軸", stable_name, stable_delta)
+
+        with specialist_col2:
+            win_name = (
+                f"{win_axis.number}番 {win_axis.name}"
+                if win_axis
+                else "該当なし"
+            )
+            win_delta = (
+                f"勝負軸指数 {win_axis.score.win_axis_score:.1f}"
+                if win_axis
+                else ""
+            )
+            st.metric("勝負軸", win_name, win_delta)
+
         if axis_operation == "軸候補2頭":
             st.info(
                 "上位の軸指数差が小さいため2頭候補です。"
@@ -2325,7 +2727,9 @@ if predict_clicked:
             )
         else:
             st.info(
-                "単独軸向きではないため、上段の軸運用判定を優先してください。"
+                "軸指数の絶対基準を満たさないため軸なしです。"
+                "安定軸・勝負軸は参考候補として表示していますが、"
+                "馬券の固定軸には推奨しません。"
             )
 
     st.subheader("予想結果")
@@ -2347,7 +2751,8 @@ if predict_clicked:
             f"{conditions.venue or '不明'} "
             f"{conditions.surface or '不明'}"
             f"{conditions.distance or '不明'} "
-            f"{conditions.going or '不明'}"
+            f"{conditions.going or '不明'} "
+            f"{conditions.race_class or 'クラス不明'}"
         )
 
         st.dataframe(
