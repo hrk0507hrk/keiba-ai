@@ -1276,15 +1276,16 @@ def score_time_index(horse: Horse, mode: str) -> float:
             (ti.last1, 0.18),
         ])
 
-    # 地方は過去最高より近3走を重視。近走大幅マイナスを距離・コース値で隠さない。
+    # 地方7項目は5走平均を能力の土台として最重視。
+    # 前走で現在の状態、距離・2走前・コースで再現性を補う。
     return weighted_index_score([
         (ti.highest, 0.05),
-        (ti.avg5, 0.10),
-        (ti.distance, 0.08),
-        (ti.course, 0.07),
-        (ti.last3, 0.18),
-        (ti.last2, 0.22),
-        (ti.last1, 0.30),
+        (ti.avg5, 0.25),
+        (ti.distance, 0.15),
+        (ti.course, 0.10),
+        (ti.last3, 0.05),
+        (ti.last2, 0.15),
+        (ti.last1, 0.25),
     ])
 
 
@@ -1390,11 +1391,16 @@ def calculate_stability_score(horse: Horse) -> float:
 
 
 def calculate_axis_index(horse: Horse) -> float:
-    """能力ではなく『崩れにくさ』を重視した軸専用指数。"""
+    """
+    軸専用指数。
+
+    安定度だけで勝ち切り型を落としすぎないよう、
+    安定度を25％へ下げ、タイム指数を20％へ上げる。
+    """
     score = (
-        horse.score.stability_score * 0.30
+        horse.score.stability_score * 0.25
         + horse.score.recent_form * 0.25
-        + horse.score.time_index * 0.15
+        + horse.score.time_index * 0.20
         + horse.score.ability_index * 0.10
         + horse.score.race_level * 0.10
         + horse.score.suitability * 0.10
@@ -1867,16 +1873,31 @@ def mark_order_key(horse: Horse):
 
 def select_marks(horses: Dict[int, Horse]) -> List[Horse]:
     """
-    人気1～3位は必ず印に残すが、◎○▲へ固定しない。
+    軸候補と予想印を同じ選出結果へ統一する。
 
-    1. 人気1～3位の中から軸指数最上位を◎
-    2. 残りの人気上位2頭を必須候補にする
-    3. 人気4～8位から印選定指数上位4頭を選ぶ
-    4. 6頭を能力中心で並べ、○▲△☆注穴を付ける
+    1. 上段の軸判定を先に取得
+    2. 軸候補2頭なら◎・○、単独候補なら◎
+    3. 人気1～3位は印から消さない
+    4. 人気4～8位から4頭を選ぶが、軸候補は必ず残す
+    5. 残りの印は能力・印選定指数・軸適性で決める
     """
     for horse in horses.values():
         horse.mark = ""
         horse.comment = ""
+
+    confidence_stars, race_difficulty, _, axis_candidates = axis_confidence(horses)
+    _, axis_operation, primary_axis = axis_guidance(
+        axis_candidates,
+        race_difficulty,
+        confidence_stars,
+    )
+
+    actual_axes: List[Horse] = []
+    if primary_axis is not None:
+        if axis_operation == "軸候補2頭":
+            actual_axes = axis_candidates[:2]
+        else:
+            actual_axes = axis_candidates[:1]
 
     top_popular = [
         horse
@@ -1885,16 +1906,14 @@ def select_marks(horses: Dict[int, Horse]) -> List[Horse]:
     ]
     top_popular.sort(
         key=lambda horse: (
-            not horse.score.axis_banned,
-            horse.score.axis_index,
-            horse.score.stability_score,
+            -horse.popularity,
             horse.score.ability_index,
             horse.score.selection_score,
         ),
         reverse=True,
     )
 
-    # 人気情報が不足した時だけ総合上位で補完する。
+    # 人気情報が不足した場合のみ総合上位で補う。
     if len(top_popular) < 3:
         already = {horse.number for horse in top_popular}
         fallback = [
@@ -1904,51 +1923,84 @@ def select_marks(horses: Dict[int, Horse]) -> List[Horse]:
         ]
         top_popular.extend(fallback[: 3 - len(top_popular)])
 
-    if not top_popular:
-        return []
-
-    axis = top_popular[0]
-    axis.mark = "◎"
-    axis.comment = build_comment(axis)
-
-    mandatory_top = top_popular[1:3]
-    mandatory_numbers = {horse.number for horse in top_popular[:3]}
-
     middle_popular = [
         horse
         for horse in horses.values()
         if 4 <= horse.popularity <= 8
-        and horse.number not in mandatory_numbers
     ]
     middle_popular.sort(key=middle_selection_key, reverse=True)
 
-    # 人気4～8位は5頭中4頭を生存・印選定評価で残す。
-    selected_middle = middle_popular[:4]
+    # 軸候補が人気4～8位なら、印選定順位に関係なく必ず生存させる。
+    forced_middle = [
+        horse
+        for horse in actual_axes
+        if 4 <= horse.popularity <= 8
+    ]
 
-    partner_pool = mandatory_top + selected_middle
-    partner_pool.sort(key=mark_order_key, reverse=True)
+    selected_middle: List[Horse] = []
+    used_middle = set()
+    for horse in forced_middle + middle_popular:
+        if horse.number in used_middle:
+            continue
+        selected_middle.append(horse)
+        used_middle.add(horse.number)
+        if len(selected_middle) >= 4:
+            break
 
-    selected: List[Horse] = [axis]
-    for mark, horse in zip(("○", "▲", "△", "☆", "注", "穴"), partner_pool[:6]):
+    # 基本の7頭枠：人気上位3頭＋人気4～8位の4頭。
+    base_pool: List[Horse] = []
+    used = set()
+    for horse in actual_axes + top_popular[:3] + selected_middle:
+        if horse.number in used:
+            continue
+        base_pool.append(horse)
+        used.add(horse.number)
+
+    # データ不足などで7頭に満たない場合は総合順で補完。
+    if len(base_pool) < 7:
+        fallback = [
+            horse
+            for horse in sorted(horses.values(), key=mark_order_key, reverse=True)
+            if horse.number not in used
+        ]
+        for horse in fallback:
+            base_pool.append(horse)
+            used.add(horse.number)
+            if len(base_pool) >= 7:
+                break
+
+    # 軸候補以外を能力中心で並べる。
+    actual_axis_numbers = {horse.number for horse in actual_axes}
+    partners = [
+        horse for horse in base_pool
+        if horse.number not in actual_axis_numbers
+    ]
+    partners.sort(key=mark_order_key, reverse=True)
+
+    selected: List[Horse] = []
+
+    # 上段の軸候補と印を一致させる。
+    if len(actual_axes) >= 2:
+        mark_pairs = (("◎", actual_axes[0]), ("○", actual_axes[1]))
+        remaining_marks = ("▲", "△", "☆", "注", "穴")
+    elif len(actual_axes) == 1:
+        mark_pairs = (("◎", actual_axes[0]),)
+        remaining_marks = ("○", "▲", "△", "☆", "注", "穴")
+    else:
+        mark_pairs = ()
+        remaining_marks = MARKS
+
+    for mark, horse in mark_pairs:
         horse.mark = mark
         horse.comment = build_comment(horse)
         selected.append(horse)
 
-    # データ不足時の保険。既選出馬以外を能力順で7頭まで補う。
-    if len(selected) < 7:
-        selected_numbers = {horse.number for horse in selected}
-        fallback = [
-            horse
-            for horse in sorted(horses.values(), key=mark_order_key, reverse=True)
-            if horse.number not in selected_numbers
-        ]
-        remaining_marks = list(MARKS[len(selected):])
-        for mark, horse in zip(remaining_marks, fallback[: 7 - len(selected)]):
-            horse.mark = mark
-            horse.comment = build_comment(horse)
-            selected.append(horse)
+    for mark, horse in zip(remaining_marks, partners):
+        horse.mark = mark
+        horse.comment = build_comment(horse)
+        selected.append(horse)
 
-    return selected
+    return selected[:7]
 
 
 def axis_candidate_pool(horses: Dict[int, Horse]) -> List[Horse]:
@@ -2141,9 +2193,9 @@ def clear_inputs():
     st.session_state["timeindex_input"] = ""
 
 
-st.title("🐎 競馬AI Next v0.6.5 直近高格勝利補正版")
+st.title("🐎 競馬AI Next v0.6.6 5走平均・軸印連動版")
 st.caption(
-    "前走・2走前の高格レース勝利を印選定と生存判定へ追加｜軸指数は変更なし"
+    "地方指数は5走平均を最重視｜軸の安定偏重を緩和｜軸候補と◎○を完全連動"
 )
 
 conditions_text = st.text_input(
@@ -2264,13 +2316,16 @@ if predict_clicked:
 
         if axis_operation == "軸候補2頭":
             st.info(
-                "適格な軸候補はいますが、上位の軸指数差が小さいため2頭候補です。"
-                "◎は予想上位印であり、実際の軸運用は上段判定を優先してください。"
+                "上位の軸指数差が小さいため2頭候補です。"
+                "予想結果では軸候補1位を◎、2位を○で表示しています。"
             )
-        elif axis_operation != "単独軸候補":
+        elif axis_operation == "単独軸候補":
             st.info(
-                "◎は予想上位印です。実際の軸運用は上段の"
-                "『軸候補・軸運用』判定を優先してください。"
+                "上段の単独軸候補を、予想結果でも◎として表示しています。"
+            )
+        else:
+            st.info(
+                "単独軸向きではないため、上段の軸運用判定を優先してください。"
             )
 
     st.subheader("予想結果")
