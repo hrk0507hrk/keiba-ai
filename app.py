@@ -2703,12 +2703,15 @@ def first_place_support_count(horse: Horse) -> int:
 
 
 def first_place_axis_analysis(
-    selected: List[Horse],
+    candidates: List[Horse],
 ) -> Tuple[str, str, str, float, List[Horse], Optional[Horse]]:
     """
-    選ばれた7頭の中だけで、1着期待指数による単独軸を判定する。
+    出走全頭から、1着期待指数による単独軸を判定する。
+
+    相手7頭の選定条件とは独立させ、選定外に本当の1着期待1位が
+    いる場合も軸候補として拾う。
     """
-    ranked = sorted(selected, key=first_place_order_key, reverse=True)
+    ranked = sorted(candidates, key=first_place_order_key, reverse=True)
     if not ranked:
         return "★☆☆☆☆", "大混戦", "単独軸非推奨", 0.0, [], None
 
@@ -2756,20 +2759,26 @@ def first_place_axis_analysis(
 
 def select_marks(horses: Dict[int, Horse]) -> List[Horse]:
     """
-    7頭の顔ぶれはv0.6.8のまま維持し、印の役割だけ変更する。
+    相手7頭の顔ぶれはv0.6.8の条件のまま維持する。
 
-    ◎：選定7頭内の1着期待指数1位
-    ○以下：軸以外を馬券内期待指数順
+    ◎：出走全頭の1着期待指数1位
+    ○以下：従来条件で選んだ相手7頭を馬券内期待指数順
+
+    ◎が相手7頭の中にいれば合計7頭。
+    ◎が選定外なら、◎を追加して「軸1頭＋相手7頭」の合計8頭で表示する。
     """
     for horse in horses.values():
         horse.mark = ""
         horse.comment = ""
 
     base_pool = select_mark_pool(horses)
-    if not base_pool:
+    if not base_pool or not horses:
         return []
 
-    first_choice = max(base_pool, key=first_place_order_key)
+    # 軸・参考本命は、相手選定に制限せず全頭から決める。
+    first_choice = max(horses.values(), key=first_place_order_key)
+    base_numbers = {horse.number for horse in base_pool}
+
     partners = [
         horse
         for horse in base_pool
@@ -2783,12 +2792,19 @@ def select_marks(horses: Dict[int, Horse]) -> List[Horse]:
     first_choice.comment = build_comment(first_choice)
     selected.append(first_choice)
 
-    for mark, horse in zip(("○", "▲", "△", "☆", "注", "穴"), partners):
+    # ◎が7頭選定内なら相手は6頭、選定外なら相手7頭。
+    partner_marks = (
+        ("○", "▲", "△", "☆", "注", "穴")
+        if first_choice.number in base_numbers
+        else ("○", "▲", "△", "☆", "注", "穴", "抑")
+    )
+
+    for mark, horse in zip(partner_marks, partners):
         horse.mark = mark
         horse.comment = build_comment(horse)
         selected.append(horse)
 
-    return selected[:7]
+    return selected
 
 
 def axis_candidate_pool(horses: Dict[int, Horse]) -> List[Horse]:
@@ -3099,9 +3115,9 @@ def clear_inputs():
     st.session_state["timeindex_input"] = ""
 
 
-st.title("🐎 競馬AI Next v0.6.9 役割別印版")
+st.title("🐎 競馬AI Next v0.6.10 全頭軸判定版")
 st.caption(
-    "7頭選定条件はv0.6.8のまま｜◎は1着期待｜○以下は馬券内期待順"
+    "相手7頭の選定条件は維持｜◎と軸候補だけ全頭の1着期待指数から判定"
 )
 
 conditions_text = st.text_input(
@@ -3190,6 +3206,10 @@ if predict_clicked:
         time_mode,
     )
 
+    # 相手7頭は従来条件のまま固定。
+    opponent_pool = select_mark_pool(horses)
+
+    # ◎・軸判定だけは出走全頭から決める。
     selected = select_marks(horses)
     (
         confidence_stars,
@@ -3198,16 +3218,18 @@ if predict_clicked:
         axis_gap,
         first_place_candidates,
         primary_axis,
-    ) = first_place_axis_analysis(selected)
+    ) = first_place_axis_analysis(list(horses.values()))
 
     first_place_leader = (
         first_place_candidates[0]
         if first_place_candidates
         else None
     )
+
+    # 相手期待1位は従来選定7頭の中から表示する。
     partner_candidates = [
         horse
-        for horse in selected
+        for horse in opponent_pool
         if (
             first_place_leader is None
             or horse.number != first_place_leader.number
@@ -3215,6 +3237,12 @@ if predict_clicked:
     ]
     partner_candidates.sort(key=in_money_order_key, reverse=True)
     best_partner = partner_candidates[0] if partner_candidates else None
+
+    opponent_numbers = {horse.number for horse in opponent_pool}
+    leader_added_from_outside = (
+        first_place_leader is not None
+        and first_place_leader.number not in opponent_numbers
+    )
 
     axis_names = (
         f"{primary_axis.number}番 {primary_axis.name}"
@@ -3264,22 +3292,42 @@ if predict_clicked:
             st.metric("軸運用", axis_operation)
 
         if primary_axis is not None:
+            outside_note = (
+                " 従来の相手7頭選定外から追加しています。"
+                if primary_axis.number not in opponent_numbers
+                else ""
+            )
             st.success(
                 f"単独軸候補は{primary_axis.number}番 "
                 f"{primary_axis.name}。"
-                "○以下は馬券内期待指数順です。"
+                f"{outside_note}"
+                " ○以下は従来条件で選んだ相手を馬券内期待指数順に表示しています。"
             )
         else:
+            outside_note = (
+                " 従来の相手7頭選定外から追加しています。"
+                if leader_added_from_outside
+                else ""
+            )
             st.info(
                 "単独軸の絶対基準を満たさないため軸なしです。"
-                "◎は選定7頭内の1着期待指数1位を示す参考本命で、"
-                "固定軸推奨ではありません。"
+                "◎は出走全頭の1着期待指数1位を示す参考本命で、"
+                f"固定軸推奨ではありません。{outside_note}"
             )
 
 
 
 
-    st.subheader("予想結果")
+    if leader_added_from_outside:
+        st.subheader("予想結果（◎＋相手7頭）")
+        st.caption(
+            "◎は全頭の1着期待1位。○～抑は従来条件で選定した相手7頭です。"
+        )
+    else:
+        st.subheader("予想結果")
+        st.caption(
+            "◎は全頭の1着期待1位。○以下は従来条件で選定した相手です。"
+        )
 
     st.dataframe(
         result_dataframe(selected),
