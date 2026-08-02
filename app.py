@@ -170,6 +170,9 @@ class ScoreDetail:
     upset_boundary_rule: str = ""
     in_money_score: float = 0.0
     in_money_rank: int = 0
+    reserve_retention_score: float = 0.0
+    reserve_protected: bool = False
+    reserve_protection_reason: str = ""
     axis_banned: bool = False
     axis_ban_reason: str = ""
     axis_type: str = ""
@@ -3708,20 +3711,257 @@ def select_marks_full(
     return selected
 
 
+RESERVE_RETENTION_IN_MONEY_WEIGHT = 0.60
+RESERVE_RETENTION_FIRST_WEIGHT = 0.25
+RESERVE_RETENTION_ABILITY_WEIGHT = 0.15
+RESERVE_RETENTION_TIE_GAP = 0.5
+
+
+def calculate_reserve_retention_score(horse: Horse) -> float:
+    """
+    内部7頭から、実際に馬券対象へ残す6頭を決めるための指数。
+
+    馬券内期待を最重視しつつ、1着期待と能力指数を加える。
+    印の並びだけで予備へ落ちる事故を防ぐ。
+    """
+    score = (
+        horse.score.in_money_score
+        * RESERVE_RETENTION_IN_MONEY_WEIGHT
+        + horse.score.first_place_score
+        * RESERVE_RETENTION_FIRST_WEIGHT
+        + horse.score.ability_index
+        * RESERVE_RETENTION_ABILITY_WEIGHT
+    )
+    return round(score, 1)
+
+
+def actual_axis_protected_numbers(
+    horses: Dict[int, Horse],
+) -> set:
+    """絶対基準を満たした軸候補を、予備落ちから保護する。"""
+    protected = set()
+
+    (
+        confidence_stars,
+        race_difficulty,
+        _,
+        axis_candidates,
+    ) = axis_confidence(horses)
+
+    _, axis_operation, primary_axis = axis_guidance(
+        axis_candidates,
+        race_difficulty,
+        confidence_stars,
+    )
+
+    if primary_axis is not None:
+        axis_count = 2 if axis_operation == "軸候補2頭" else 1
+        protected.update(
+            horse.number
+            for horse in axis_candidates[:axis_count]
+        )
+
+    (
+        _,
+        _,
+        _,
+        _,
+        _,
+        first_place_primary_axis,
+    ) = first_place_axis_analysis(list(horses.values()))
+
+    if first_place_primary_axis is not None:
+        protected.add(first_place_primary_axis.number)
+
+    return protected
+
+
+def set_reserve_protection_flags(
+    full_selected: List[Horse],
+    horses: Dict[int, Horse],
+) -> set:
+    """
+    予備へ落とさない馬を決める。
+
+      ・◎
+      ・絶対基準を満たした軸候補
+      ・1着期待順位と馬券内期待順位が両方5位以内
+    """
+    for horse in horses.values():
+        horse.score.reserve_retention_score = (
+            calculate_reserve_retention_score(horse)
+        )
+        horse.score.reserve_protected = False
+        horse.score.reserve_protection_reason = ""
+
+    axis_numbers = actual_axis_protected_numbers(horses)
+    protected_numbers = set()
+
+    for horse in full_selected:
+        reasons = []
+
+        if horse.mark == "◎":
+            reasons.append("◎")
+
+        if horse.number in axis_numbers:
+            reasons.append("軸候補")
+
+        if (
+            1 <= horse.score.first_place_rank <= 5
+            and 1 <= horse.score.in_money_rank <= 5
+        ):
+            reasons.append("1着・馬券内とも5位以内")
+
+        if reasons:
+            horse.score.reserve_protected = True
+            horse.score.reserve_protection_reason = "・".join(reasons)
+            protected_numbers.add(horse.number)
+
+    return protected_numbers
+
+
+def choose_reserve_horse(
+    full_selected: List[Horse],
+    horses: Dict[int, Horse],
+) -> Optional[Horse]:
+    """
+    内部7頭のうち、6頭残留指数が最も低い馬を予備へ回す。
+
+    指数差0.5以内は同点圏として、能力指数が低い馬を先に予備へ回す。
+    保護馬しか残らない例外時は、◎以外から最低指数馬を選ぶ。
+    """
+    if len(full_selected) <= 1:
+        return None
+
+    protected_numbers = set_reserve_protection_flags(
+        full_selected,
+        horses,
+    )
+
+    candidates = [
+        horse
+        for horse in full_selected
+        if horse.mark != "◎"
+        and horse.number not in protected_numbers
+    ]
+
+    # 保護条件が多すぎて候補がなくなった場合も、◎だけは必ず残す。
+    if not candidates:
+        candidates = [
+            horse
+            for horse in full_selected
+            if horse.mark != "◎"
+        ]
+
+    if not candidates:
+        return None
+
+    lowest_score = min(
+        horse.score.reserve_retention_score
+        for horse in candidates
+    )
+
+    close_candidates = [
+        horse
+        for horse in candidates
+        if horse.score.reserve_retention_score
+        <= lowest_score + RESERVE_RETENTION_TIE_GAP
+    ]
+
+    return min(
+        close_candidates,
+        key=lambda horse: (
+            horse.score.ability_index,
+            horse.score.reserve_retention_score,
+            horse.score.in_money_score,
+            horse.score.first_place_score,
+            -horse.popularity,
+            horse.number,
+        ),
+    )
+
+
+def apply_reserve_reselection(
+    full_selected: List[Horse],
+    horses: Dict[int, Horse],
+) -> Tuple[List[Horse], Optional[Horse]]:
+    """
+    予備を再選定し、残った馬へ表示印を振り直す。
+
+    通常7頭→6頭:
+      ◎・○・▲・△・注・穴
+
+    選定外の強い単独軸追加で8頭→7頭:
+      ◎・○・▲・△・☆・注・穴
+    """
+    reserve = choose_reserve_horse(
+        full_selected,
+        horses,
+    )
+    if reserve is None:
+        return full_selected, None
+
+    first_choice = next(
+        (horse for horse in full_selected if horse.mark == "◎"),
+        full_selected[0],
+    )
+
+    visible_partners = [
+        horse
+        for horse in full_selected
+        if horse.number not in {
+            first_choice.number,
+            reserve.number,
+        }
+    ]
+    visible_partners.sort(
+        key=in_money_order_key,
+        reverse=True,
+    )
+
+    partner_marks = (
+        ("○", "▲", "△", "☆", "注", "穴")
+        if len(visible_partners) >= 6
+        else ("○", "▲", "△", "注", "穴")
+    )
+
+    first_choice.mark = "◎"
+    first_choice.comment = build_comment(first_choice)
+
+    for mark, horse in zip(partner_marks, visible_partners):
+        horse.mark = mark
+        horse.comment = build_comment(horse)
+
+    reserve_score = reserve.score.reserve_retention_score
+    reserve.mark = "予備"
+    reserve_base_comment = build_comment(reserve)
+    reserve.comment = (
+        f"6頭残留指数{reserve_score:.1f}で予備"
+        + (
+            f"・{reserve_base_comment}"
+            if reserve_base_comment
+            else ""
+        )
+    )
+
+    visible = [first_choice] + visible_partners
+    return visible, reserve
+
+
 def select_marks_with_reserve(
     horses: Dict[int, Horse],
     upset_mode: bool = False,
 ) -> Tuple[List[Horse], Optional[Horse]]:
     """
-    内部の7頭選定は変えず、旧☆の1頭だけを予備へ回す。
+    内部7頭選定は維持し、最後に6頭残留指数で予備を再選定する。
 
     通常表示:
       ◎・○・▲・△・注・穴 = 6頭
-      予備 = 旧☆
+      予備 = 残留指数最下位の非保護馬
 
     選定外の強い単独軸を追加した例外時:
       ◎＋相手6頭 = 7頭表示
-      予備 = 旧☆
+      予備 = 残留指数最下位の非保護馬
     """
     full_selected = select_marks_full(
         horses,
@@ -3732,37 +3972,23 @@ def select_marks_with_reserve(
 
     # 荒れモードは境界再判定後の7頭をすべて馬券対象にする。
     if upset_mode:
+        set_reserve_protection_flags(
+            full_selected,
+            horses,
+        )
         return full_selected[:7], None
 
-    reserve = next(
-        (horse for horse in full_selected if horse.mark == "☆"),
-        None,
+    return apply_reserve_reselection(
+        full_selected,
+        horses,
     )
-
-    if reserve is None:
-        return full_selected, None
-
-    visible = [
-        horse
-        for horse in full_selected
-        if horse.number != reserve.number
-    ]
-
-    reserve.mark = "予備"
-    reserve.comment = (
-        "6頭版の予備・" + reserve.comment
-        if reserve.comment
-        else "6頭版の予備"
-    )
-
-    return visible, reserve
 
 
 def select_marks(
     horses: Dict[int, Horse],
     upset_mode: bool = False,
 ) -> List[Horse]:
-    """互換用。馬券対象として表示する6頭（例外時は7頭）を返す。"""
+    """互換用。残留指数で選んだ馬券対象6頭（例外時は7頭）を返す。"""
     visible, _ = select_marks_with_reserve(
         horses,
         upset_mode=upset_mode,
@@ -3986,6 +4212,8 @@ def result_dataframe(selected: List[Horse]) -> pd.DataFrame:
                 "上級僅差力": horse.score.high_class_close_score,
                 "馬券内期待順位": horse.score.in_money_rank,
                 "馬券内期待指数": horse.score.in_money_score,
+                "6頭残留指数": horse.score.reserve_retention_score,
+                "予備保護": horse.score.reserve_protection_reason,
                 "直近5走勝率": round(horse.score.recent_win_rate, 1),
                 "直近5走連対率": round(horse.score.recent_top2_rate, 1),
                 "直近5走複勝率": round(horse.score.recent_top3_rate, 1),
@@ -4059,6 +4287,8 @@ def diagnostic_dataframe(horses: Dict[int, Horse]) -> pd.DataFrame:
                 "上級僅差力": horse.score.high_class_close_score,
                 "馬券内期待指数": horse.score.in_money_score,
                 "馬券内期待順位": horse.score.in_money_rank,
+                "6頭残留指数": horse.score.reserve_retention_score,
+                "予備保護": horse.score.reserve_protection_reason,
                 "直近5走勝率": round(horse.score.recent_win_rate, 1),
                 "直近5走連対率": round(horse.score.recent_top2_rate, 1),
                 "直近5走複勝率": round(horse.score.recent_top3_rate, 1),
@@ -4117,9 +4347,9 @@ def clear_inputs():
     st.session_state["upset_mode"] = False
 
 
-st.title("🐎 競馬AI Next v0.6.20 3歳休養明け成長救済版")
+st.title("🐎 競馬AI Next v0.6.21 予備再選定版")
 st.caption(
-    "通常6頭＋予備1頭｜3歳の休養明け＋馬体増＋現級善戦を相手評価で救済"
+    "通常6頭＋予備1頭｜馬券内60％・1着25％・能力15％で予備を再選定"
 )
 
 conditions_text = st.text_input(
@@ -4249,7 +4479,7 @@ if predict_clicked:
         else None
     )
 
-    # 表示印を作る。内部7頭のうち旧☆を予備へ回し、通常6頭表示。
+    # 表示印を作る。内部7頭から6頭残留指数で予備を再選定する。
     selected, reserve_horse = select_marks_with_reserve(
         horses,
         upset_mode=upset_mode,
@@ -4276,10 +4506,10 @@ if predict_clicked:
         and not leader_added_from_outside
     )
 
-    # 相手期待1位は従来選定7頭の中から表示◎を除いて選ぶ。
+    # 相手期待1位は、実際に馬券対象として残った馬から選ぶ。
     partner_candidates = [
         horse
-        for horse in opponent_pool
+        for horse in selected
         if (
             displayed_first_choice is None
             or horse.number != displayed_first_choice.number
@@ -4385,7 +4615,7 @@ if predict_clicked:
                 + (
                     " 荒れモードのため、境界再判定後の7頭をすべて表示しています。"
                     if upset_mode
-                    else " ○以下は内部7頭から旧☆を予備へ回した馬券対象です。"
+                    else " ○以下は内部7頭から6頭残留指数で選び直した馬券対象です。"
                 )
             )
         elif outside_leader_not_added:
@@ -4423,20 +4653,22 @@ if predict_clicked:
         st.subheader("予想結果（◎＋相手6頭／予備1頭）")
         st.caption(
             "選定外の強い単独軸を◎として追加した例外表示です。"
-            "内部相手7頭のうち旧☆を予備へ回し、馬券対象は◎＋相手6頭です。"
+            "内部相手7頭を6頭残留指数で再判定し、馬券対象は◎＋相手6頭です。"
         )
     elif outside_leader_not_added:
         st.subheader("予想結果（6頭／予備1頭）")
         st.caption(
             "全頭1着期待1位は軸基準未達のため追加していません。"
-            "内部7頭選定は維持し、旧☆の1頭だけを予備へ回しています。"
+            "内部7頭選定は維持し、6頭残留指数が最も低い非保護馬を予備へ回しています。"
             " 指数差1.5以内では3項目の僅差最終判定を適用します。"
         )
     else:
         st.subheader("予想結果（6頭／予備1頭）")
         st.caption(
-            "内部7頭選定はこれまでどおり維持し、旧☆だけを予備へ回しています。"
+            "内部7頭選定はこれまでどおり維持し、最後に6頭残留指数で予備を再選定します。"
             "馬券対象は◎・○・▲・△・注・穴の6頭です。"
+            " 残留指数は馬券内期待60％・1着期待25％・能力指数15％。"
+            "両期待順位が5位以内の馬と軸候補は予備から保護します。"
             " 1着期待指数差1.5以内では、上級僅差力・レースレベル・"
             "5走平均順位の3項目をすべて上回る馬を最終的に優先します。"
         )
@@ -4448,10 +4680,11 @@ if predict_clicked:
     )
 
     if reserve_horse is not None:
-        with st.expander("予備馬（旧☆・馬券対象外）", expanded=False):
+        with st.expander("予備馬（6頭残留指数で再選定・馬券対象外）", expanded=False):
             st.caption(
-                "内部7頭には残していますが、6頭版の検証では馬券対象から外します。"
-                "予備馬が馬券内に来た回数も記録してください。"
+                "内部7頭には残していますが、馬券内期待60％・1着期待25％・"
+                "能力指数15％の残留指数で予備へ回しています。"
+                "◎・軸候補・1着期待と馬券内期待が両方5位以内の馬は保護します。"
             )
             st.dataframe(
                 result_dataframe([reserve_horse]),
