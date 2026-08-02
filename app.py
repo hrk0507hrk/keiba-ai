@@ -3311,6 +3311,8 @@ def build_comment(horse: Horse) -> str:
     if horse.score.upset_boundary_promoted:
         if horse.score.upset_boundary_rule == "特殊コース実績昇格":
             reasons.append("特殊コース実績で優先昇格")
+        elif horse.score.upset_boundary_rule == "3歳同条件昇級昇格":
+            reasons.append("3歳同条件昇級成長で優先昇格")
         elif horse.score.upset_boundary_rule == "相手特化昇格":
             reasons.append("荒れ相手特化判定で昇格")
         else:
@@ -3430,6 +3432,7 @@ UPSET_BOUNDARY_TOTAL_GAP = 1.5
 UPSET_BOUNDARY_MAX_REPLACEMENTS = 2
 UPSET_PARTNER_IN_MONEY_GAIN = 3
 UPSET_PARTNER_FIRST_DEFICIT = 2
+UPSET_YOUNG_STEP_UP_MAX_PROMOTIONS = 1
 
 
 def special_course_promotion_key(horse: Horse):
@@ -3457,6 +3460,49 @@ def special_course_replacement_key(horse: Horse):
     )
 
 
+def young_step_up_promotion_key(horse: Horse):
+    """
+    3歳同条件昇級馬の優先順位。
+
+    昇級初戦で勝ち切る型なので、1着期待を最優先する。
+    """
+    return (
+        horse.score.young_same_course_step_up_bonus,
+        horse.score.first_place_score,
+        horse.score.selection_score,
+        horse.score.in_money_score,
+        horse.score.total,
+        -horse.popularity,
+        -horse.number,
+    )
+
+
+def young_step_up_replacement_key(horse: Horse):
+    """
+    3歳同条件昇級馬を入れる際の降格候補。
+
+    1着期待順位が最も低い馬を優先して外す。
+    同順位なら1着期待指数、馬券内期待、選定指数が低い馬を外す。
+    """
+    return (
+        horse.score.first_place_rank,
+        -horse.score.first_place_score,
+        -horse.score.in_money_score,
+        -horse.score.selection_score,
+        -horse.score.total,
+        horse.popularity,
+        horse.number,
+    )
+
+
+def count_upset_promotions(horses: Dict[int, Horse]) -> int:
+    return sum(
+        1
+        for horse in horses.values()
+        if horse.score.upset_boundary_promoted
+    )
+
+
 def apply_upset_boundary_rerank(
     base_pool: List[Horse],
     horses: Dict[int, Horse],
@@ -3467,11 +3513,21 @@ def apply_upset_boundary_rerank(
     """
     荒れレースモード専用の境界再判定。
 
-    最初に「特殊コース実績昇格」を最大2頭まで優先する。
-    今回が新潟芝1000mで、直近3走以内に同条件・3勝クラス以上・
-    0.2秒差以内の実績がある選定外馬を救済する。
+    優先順位:
+      1. 特殊コース実績昇格
+      2. 3歳同条件昇級成長昇格（最大1頭）
+      3. 従来の通常昇格・相手特化昇格
 
-    残りの入れ替え枠がある場合だけ、従来の判定を行う。
+    特殊コース実績昇格:
+      ・新潟芝1000m
+      ・直近3走以内に同条件・3勝クラス以上
+      ・0.2秒差以内
+
+    3歳同条件昇級成長昇格:
+      ・3歳同条件昇級補正が5点
+      ・選定外なら通常境界判定より先に最大1頭救済
+      ・上位3人気と既存軸候補を保護
+      ・降格馬は1着期待順位が最も低い馬
 
     通常昇格:
       ・内部総合差1.5以内
@@ -3483,7 +3539,7 @@ def apply_upset_boundary_rerank(
       ・馬券内期待順位が3順位以上上
       ・1着期待順位は選定馬より2順位以内の下まで許容
 
-    上位3人気と既存軸候補は保護し、入れ替え総数は最大2頭。
+    全ルールを合わせた入れ替え総数は最大2頭。
     """
     for horse in horses.values():
         horse.score.upset_boundary_promoted = False
@@ -3513,7 +3569,7 @@ def apply_upset_boundary_rerank(
         reverse=True,
     )
 
-    # すでに選定内にいる特殊コース実績馬は通常判定で落とさない。
+    # すでに選定内にいる特殊コース実績馬は後続判定で落とさない。
     special_selected_numbers = {
         horse.number
         for horse in selected
@@ -3522,11 +3578,7 @@ def apply_upset_boundary_rerank(
     promoted_numbers.update(special_selected_numbers)
 
     for outsider in special_outsiders:
-        if len([
-            horse
-            for horse in horses.values()
-            if horse.score.upset_boundary_promoted
-        ]) >= max_replacements:
+        if count_upset_promotions(horses) >= max_replacements:
             break
 
         replaceable = [
@@ -3559,15 +3611,74 @@ def apply_upset_boundary_rerank(
         outsider.score.upset_boundary_rule = "特殊コース実績昇格"
         insider.score.upset_boundary_demoted = True
 
-    replacements_used = sum(
-        1
-        for horse in horses.values()
-        if horse.score.upset_boundary_promoted
+    # -----------------------------------------------------
+    # 2. 3歳同条件昇級成長馬を最大1頭、優先昇格
+    # -----------------------------------------------------
+    young_selected_numbers = {
+        horse.number
+        for horse in selected
+        if horse.score.young_same_course_step_up_bonus >= 5
+    }
+    promoted_numbers.update(young_selected_numbers)
+
+    young_outsiders = sorted(
+        [
+            horse
+            for horse in original_outsiders
+            if (
+                horse.number not in selected_numbers
+                and horse.score.young_same_course_step_up_bonus >= 5
+            )
+        ],
+        key=young_step_up_promotion_key,
+        reverse=True,
     )
+
+    young_promotions = 0
+
+    for outsider in young_outsiders:
+        if count_upset_promotions(horses) >= max_replacements:
+            break
+
+        if young_promotions >= UPSET_YOUNG_STEP_UP_MAX_PROMOTIONS:
+            break
+
+        replaceable = [
+            horse
+            for horse in selected
+            if horse.number not in protected_numbers
+            and horse.number not in promoted_numbers
+            and horse.score.young_same_course_step_up_bonus < 5
+        ]
+        if not replaceable:
+            break
+
+        insider = max(
+            replaceable,
+            key=young_step_up_replacement_key,
+        )
+
+        replace_index = next(
+            index
+            for index, horse in enumerate(selected)
+            if horse.number == insider.number
+        )
+        selected[replace_index] = outsider
+
+        selected_numbers.remove(insider.number)
+        selected_numbers.add(outsider.number)
+        promoted_numbers.add(outsider.number)
+
+        outsider.score.upset_boundary_promoted = True
+        outsider.score.upset_boundary_rule = "3歳同条件昇級昇格"
+        insider.score.upset_boundary_demoted = True
+        young_promotions += 1
+
+    replacements_used = count_upset_promotions(horses)
     remaining_replacements = max(0, max_replacements - replacements_used)
 
     # -----------------------------------------------------
-    # 2. 残り枠だけ従来の境界判定
+    # 3. 残り枠だけ従来の境界判定
     # -----------------------------------------------------
     for _ in range(remaining_replacements):
         qualifying_pairs = []
@@ -4653,9 +4764,9 @@ def clear_inputs():
     st.session_state["upset_mode"] = False
 
 
-st.title("🐎 競馬AI Next v0.6.23 3歳同条件昇級成長版")
+st.title("🐎 競馬AI Next v0.6.24 3歳同条件昇級優先昇格版")
 st.caption(
-    "3歳53kg以下の同一コース未勝利快勝＋休養成長を1着・選定で救済"
+    "荒れモードで3歳同条件昇級成長馬を最大1頭、通常境界より先に昇格"
 )
 
 conditions_text = st.text_input(
@@ -4670,16 +4781,17 @@ upset_mode = st.checkbox(
     key="upset_mode",
     help=(
         "ONにすると、通常は原則除外している9番人気以下も"
-        "7頭選定の候補に含めます。内部総合差1.5以内では、"
-        "期待順位が両方上の馬に加え、馬券内期待が3順位以上上で"
-        "1着期待が2順位以内の下までの馬も最大2頭まで救済します。"
+        "7頭選定の候補に含めます。特殊コース実績、"
+        "3歳同条件昇級成長の順で優先昇格し、残り枠では"
+        "従来の通常昇格・相手特化昇格を行います。入れ替えは最大2頭です。"
     ),
 )
 
 if upset_mode:
     st.warning(
         "荒れレースモード適用中：9番人気以下の消しを解除しています。"
-        "境界再判定を行い、選定した7頭をすべて馬券対象にします。"
+        "特殊コース実績と3歳同条件昇級成長を優先して境界再判定し、"
+        "選定した7頭をすべて馬券対象にします。"
     )
 
 racecard_text = st.text_area(
@@ -4835,8 +4947,9 @@ if predict_clicked:
     if upset_mode:
         st.warning(
             "この予想は荒れレースモードです。"
-            "9番人気以下も候補に含め、特殊コース実績を最優先した"
-            "境界再判定後の7頭をすべて馬券対象として表示しています。"
+            "9番人気以下も候補に含め、特殊コース実績と"
+            "3歳同条件昇級成長を優先した境界再判定後の7頭を"
+            "すべて馬券対象として表示しています。"
         )
 
         promoted_horses = [
