@@ -3087,15 +3087,15 @@ def first_place_axis_analysis(
     return stars, difficulty, operation, gap, ranked, axis
 
 
-def select_marks(horses: Dict[int, Horse]) -> List[Horse]:
+def select_marks_full(horses: Dict[int, Horse]) -> List[Horse]:
     """
-    相手7頭の顔ぶれはv0.6.8の条件のまま維持する。
+    v0.6.13までと同じ印付けを行い、内部では7頭選定を維持する。
 
-    ・全頭1着期待1位が相手7頭内なら、その馬を◎にして合計7頭
-    ・全頭1着期待1位が選定外でも、単独軸基準を満たす場合だけ追加
-    ・選定外かつ軸基準未達なら追加せず、相手7頭内の1着期待最上位を◎
+    通常:
+      ◎・○・▲・△・☆・注・穴 = 7頭
 
-    選定外の弱い参考1位を無条件に8頭目として増やさない。
+    選定外の強い単独軸を追加する例外時:
+      ◎・○・▲・△・☆・注・穴・抑 = 8頭
     """
     for horse in horses.values():
         horse.mark = ""
@@ -3155,6 +3155,54 @@ def select_marks(horses: Dict[int, Horse]) -> List[Horse]:
         selected.append(horse)
 
     return selected
+
+
+def select_marks_with_reserve(
+    horses: Dict[int, Horse],
+) -> Tuple[List[Horse], Optional[Horse]]:
+    """
+    内部の7頭選定は変えず、旧☆の1頭だけを予備へ回す。
+
+    通常表示:
+      ◎・○・▲・△・注・穴 = 6頭
+      予備 = 旧☆
+
+    選定外の強い単独軸を追加した例外時:
+      ◎＋相手6頭 = 7頭表示
+      予備 = 旧☆
+    """
+    full_selected = select_marks_full(horses)
+    if not full_selected:
+        return [], None
+
+    reserve = next(
+        (horse for horse in full_selected if horse.mark == "☆"),
+        None,
+    )
+
+    if reserve is None:
+        return full_selected, None
+
+    visible = [
+        horse
+        for horse in full_selected
+        if horse.number != reserve.number
+    ]
+
+    reserve.mark = "予備"
+    reserve.comment = (
+        "6頭版の予備・" + reserve.comment
+        if reserve.comment
+        else "6頭版の予備"
+    )
+
+    return visible, reserve
+
+
+def select_marks(horses: Dict[int, Horse]) -> List[Horse]:
+    """互換用。馬券対象として表示する6頭（例外時は7頭）を返す。"""
+    visible, _ = select_marks_with_reserve(horses)
+    return visible
 
 
 def axis_candidate_pool(horses: Dict[int, Horse]) -> List[Horse]:
@@ -3479,9 +3527,9 @@ def clear_inputs():
     st.session_state["timeindex_input"] = ""
 
 
-st.title("🐎 競馬AI Next v0.6.13 僅差決着補正版")
+st.title("🐎 競馬AI Next v0.6.14 6頭検証版")
 st.caption(
-    "相手7頭の選定条件は維持｜1着期待差1.5以内は上級僅差力・レースレベル・5走平均で最終判定"
+    "内部7頭選定は維持｜旧☆を予備へ回し、通常は6頭で検証"
 )
 
 conditions_text = st.text_input(
@@ -3590,8 +3638,8 @@ if predict_clicked:
         else None
     )
 
-    # 表示印を作る。選定外馬は単独軸基準クリア時だけ追加される。
-    selected = select_marks(horses)
+    # 表示印を作る。内部7頭のうち旧☆を予備へ回し、通常6頭表示。
+    selected, reserve_horse = select_marks_with_reserve(horses)
     displayed_first_choice = next(
         (horse for horse in selected if horse.mark == "◎"),
         None,
@@ -3683,7 +3731,7 @@ if predict_clicked:
                 f"単独軸候補は{primary_axis.number}番 "
                 f"{primary_axis.name}。"
                 f"{outside_note}"
-                " ○以下は従来条件で選んだ相手を馬券内期待指数順に表示しています。"
+                " ○以下は内部7頭から旧☆を予備へ回した馬券対象です。"
             )
         elif outside_leader_not_added:
             displayed_text = (
@@ -3709,22 +3757,23 @@ if predict_clicked:
 
 
     if leader_added_from_outside:
-        st.subheader("予想結果（◎＋相手7頭）")
+        st.subheader("予想結果（◎＋相手6頭／予備1頭）")
         st.caption(
-            "◎は軸基準を満たした全頭1着期待1位。"
-            "○～抑は従来条件で選定した相手7頭です。"
+            "選定外の強い単独軸を◎として追加した例外表示です。"
+            "内部相手7頭のうち旧☆を予備へ回し、馬券対象は◎＋相手6頭です。"
         )
     elif outside_leader_not_added:
-        st.subheader("予想結果（相手7頭）")
+        st.subheader("予想結果（6頭／予備1頭）")
         st.caption(
             "全頭1着期待1位は軸基準未達のため追加していません。"
-            "◎は相手7頭内の1着期待最上位です。"
+            "内部7頭選定は維持し、旧☆の1頭だけを予備へ回しています。"
             " 指数差1.5以内では3項目の僅差最終判定を適用します。"
         )
     else:
-        st.subheader("予想結果")
+        st.subheader("予想結果（6頭／予備1頭）")
         st.caption(
-            "◎は全頭1着期待1位。○以下は従来条件で選定した相手です。"
+            "内部7頭選定はこれまでどおり維持し、旧☆だけを予備へ回しています。"
+            "馬券対象は◎・○・▲・△・注・穴の6頭です。"
             " 1着期待指数差1.5以内では、上級僅差力・レースレベル・"
             "5走平均順位の3項目をすべて上回る馬を最終的に優先します。"
         )
@@ -3734,6 +3783,18 @@ if predict_clicked:
         use_container_width=True,
         hide_index=True,
     )
+
+    if reserve_horse is not None:
+        with st.expander("予備馬（旧☆・馬券対象外）", expanded=False):
+            st.caption(
+                "内部7頭には残していますが、6頭版の検証では馬券対象から外します。"
+                "予備馬が馬券内に来た回数も記録してください。"
+            )
+            st.dataframe(
+                result_dataframe([reserve_horse]),
+                use_container_width=True,
+                hide_index=True,
+            )
 
     with st.expander("読み取り・採点確認"):
         st.write(
