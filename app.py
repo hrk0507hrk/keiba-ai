@@ -143,6 +143,8 @@ class ScoreDetail:
     first_place_score: float = 0.0
     first_place_rank: int = 0
     first_place_tiebreak_promoted: bool = False
+    upset_boundary_promoted: bool = False
+    upset_boundary_demoted: bool = False
     in_money_score: float = 0.0
     in_money_rank: int = 0
     axis_banned: bool = False
@@ -2757,6 +2759,9 @@ def middle_selection_key(horse: Horse):
 def build_comment(horse: Horse) -> str:
     reasons = []
 
+    if horse.score.upset_boundary_promoted:
+        reasons.append("荒れ境界再判定で昇格")
+
     if horse.mark == "◎":
         if horse.score.first_place_tiebreak_promoted:
             reasons.append("僅差最終判定で1着期待1位")
@@ -2844,6 +2849,121 @@ def mark_order_key(horse: Horse):
         -horse.popularity,
         -horse.number,
     )
+
+
+UPSET_BOUNDARY_TOTAL_GAP = 1.5
+UPSET_BOUNDARY_MAX_REPLACEMENTS = 2
+
+
+def apply_upset_boundary_rerank(
+    base_pool: List[Horse],
+    horses: Dict[int, Horse],
+    protected_numbers: set,
+    max_replacements: int = UPSET_BOUNDARY_MAX_REPLACEMENTS,
+    total_gap: float = UPSET_BOUNDARY_TOTAL_GAP,
+) -> List[Horse]:
+    """
+    荒れレースモード専用の境界再判定。
+
+    選定外馬が次をすべて満たす場合、選定内の境界馬と入れ替える。
+      ・内部総合差が1.5以内
+      ・1着期待順位が上
+      ・馬券内期待順位も上
+
+    上位3人気と既存軸候補は保護し、入れ替えは最大2頭。
+    一度昇格した馬は同じ判定内では再び落とさない。
+    """
+    for horse in horses.values():
+        horse.score.upset_boundary_promoted = False
+        horse.score.upset_boundary_demoted = False
+
+    selected = list(base_pool)
+    selected_numbers = {horse.number for horse in selected}
+    original_outsiders = [
+        horse
+        for horse in horses.values()
+        if horse.number not in selected_numbers
+    ]
+
+    promoted_numbers = set()
+
+    for _ in range(max_replacements):
+        qualifying_pairs = []
+
+        replaceable = [
+            horse
+            for horse in selected
+            if horse.number not in protected_numbers
+            and horse.number not in promoted_numbers
+        ]
+
+        for outsider in original_outsiders:
+            if outsider.number in selected_numbers:
+                continue
+
+            for insider in replaceable:
+                internal_gap = (
+                    insider.score.total
+                    - outsider.score.total
+                )
+
+                if internal_gap > total_gap:
+                    continue
+
+                if not (
+                    outsider.score.first_place_rank
+                    < insider.score.first_place_rank
+                    and outsider.score.in_money_rank
+                    < insider.score.in_money_rank
+                ):
+                    continue
+
+                first_gain = (
+                    insider.score.first_place_rank
+                    - outsider.score.first_place_rank
+                )
+                in_money_gain = (
+                    insider.score.in_money_rank
+                    - outsider.score.in_money_rank
+                )
+
+                qualifying_pairs.append(
+                    (
+                        outsider.score.total,
+                        outsider.score.selection_score,
+                        first_gain + in_money_gain,
+                        -abs(internal_gap),
+                        -outsider.popularity,
+                        -outsider.number,
+                        outsider,
+                        insider,
+                    )
+                )
+
+        if not qualifying_pairs:
+            break
+
+        # 内部総合が高い選定外馬を優先。
+        # 同点付近では期待順位の改善幅と総合差の小ささで決める。
+        qualifying_pairs.sort(reverse=True, key=lambda row: row[:6])
+        outsider = qualifying_pairs[0][-2]
+        insider = qualifying_pairs[0][-1]
+
+        replace_index = next(
+            index
+            for index, horse in enumerate(selected)
+            if horse.number == insider.number
+        )
+        selected[replace_index] = outsider
+
+        selected_numbers.remove(insider.number)
+        selected_numbers.add(outsider.number)
+        promoted_numbers.add(outsider.number)
+
+        outsider.score.upset_boundary_promoted = True
+        insider.score.upset_boundary_demoted = True
+
+    return selected
 
 
 def select_mark_pool(
@@ -2934,6 +3054,15 @@ def select_mark_pool(
             if horse.number not in used
         ]
         base_pool.extend(fallback[: 7 - len(base_pool)])
+
+    base_pool = base_pool[:7]
+
+    if upset_mode:
+        base_pool = apply_upset_boundary_rerank(
+            base_pool,
+            horses,
+            protected_numbers=mandatory_numbers,
+        )
 
     return base_pool[:7]
 
@@ -3139,7 +3268,8 @@ def select_marks_full(
 
     full_leader = full_ranked[0] if full_ranked else None
     add_outside_axis = (
-        full_leader is not None
+        not upset_mode
+        and full_leader is not None
         and full_leader.number not in base_numbers
         and full_primary_axis is not None
         and full_primary_axis.number == full_leader.number
@@ -3198,6 +3328,10 @@ def select_marks_with_reserve(
     )
     if not full_selected:
         return [], None
+
+    # 荒れモードは境界再判定後の7頭をすべて馬券対象にする。
+    if upset_mode:
+        return full_selected[:7], None
 
     reserve = next(
         (horse for horse in full_selected if horse.mark == "☆"),
@@ -3438,6 +3572,11 @@ def result_dataframe(selected: List[Horse]) -> pd.DataFrame:
                     if horse.score.first_place_tiebreak_promoted
                     else ""
                 ),
+                "荒れ境界": (
+                    "昇格"
+                    if horse.score.upset_boundary_promoted
+                    else ""
+                ),
                 "格補正勝ち切り": horse.score.class_adjusted_win_score,
                 "上級僅差力": horse.score.high_class_close_score,
                 "馬券内期待順位": horse.score.in_money_rank,
@@ -3495,6 +3634,15 @@ def diagnostic_dataframe(horses: Dict[int, Horse]) -> pd.DataFrame:
                     "昇格"
                     if horse.score.first_place_tiebreak_promoted
                     else ""
+                ),
+                "荒れ境界": (
+                    "昇格"
+                    if horse.score.upset_boundary_promoted
+                    else (
+                        "降格"
+                        if horse.score.upset_boundary_demoted
+                        else ""
+                    )
                 ),
                 "格補正勝ち切り": horse.score.class_adjusted_win_score,
                 "上級僅差力": horse.score.high_class_close_score,
@@ -3558,9 +3706,9 @@ def clear_inputs():
     st.session_state["upset_mode"] = False
 
 
-st.title("🐎 競馬AI Next v0.6.15 荒れモード追加版")
+st.title("🐎 競馬AI Next v0.6.16 荒れ境界再判定版")
 st.caption(
-    "通常6頭＋予備1頭｜手動の荒れレースモードで9番人気以下の消しを解除"
+    "通常6頭＋予備1頭｜荒れモードは境界再判定後の7頭を全採用"
 )
 
 conditions_text = st.text_input(
@@ -3575,15 +3723,16 @@ upset_mode = st.checkbox(
     key="upset_mode",
     help=(
         "ONにすると、通常は原則除外している9番人気以下も"
-        "7頭選定の候補に含めます。高知ファイナルなど、"
-        "人気薄まで広く比較したいレースで使用してください。"
+        "7頭選定の候補に含めます。選定境界では内部総合差1.5以内かつ"
+        "1着期待・馬券内期待順位が両方上の馬へ最大2頭まで入れ替え、"
+        "7頭すべてを馬券対象として表示します。"
     ),
 )
 
 if upset_mode:
     st.warning(
         "荒れレースモード適用中：9番人気以下の消しを解除しています。"
-        "人気だけで加点はせず、能力・指数・近走内容で選定します。"
+        "境界再判定を行い、選定した7頭をすべて馬券対象にします。"
     )
 
 racecard_text = st.text_area(
@@ -3739,8 +3888,38 @@ if predict_clicked:
     if upset_mode:
         st.warning(
             "この予想は荒れレースモードです。"
-            "9番人気以下も選定候補として比較しています。"
+            "9番人気以下も候補に含め、境界再判定後の7頭を"
+            "すべて馬券対象として表示しています。"
         )
+
+        promoted_horses = [
+            horse
+            for horse in horses.values()
+            if horse.score.upset_boundary_promoted
+        ]
+        demoted_horses = [
+            horse
+            for horse in horses.values()
+            if horse.score.upset_boundary_demoted
+        ]
+
+        if promoted_horses:
+            promoted_text = "、".join(
+                f"{horse.number}番 {horse.name}"
+                for horse in promoted_horses
+            )
+            demoted_text = "、".join(
+                f"{horse.number}番 {horse.name}"
+                for horse in demoted_horses
+            )
+            st.caption(
+                f"荒れ境界再判定：昇格 {promoted_text}"
+                + (
+                    f"／降格 {demoted_text}"
+                    if demoted_text
+                    else ""
+                )
+            )
 
     if selected:
         summary_col1, summary_col2, summary_col3, summary_col4 = st.columns(4)
@@ -3791,7 +3970,11 @@ if predict_clicked:
                 f"単独軸候補は{primary_axis.number}番 "
                 f"{primary_axis.name}。"
                 f"{outside_note}"
-                " ○以下は内部7頭から旧☆を予備へ回した馬券対象です。"
+                + (
+                    " 荒れモードのため、境界再判定後の7頭をすべて表示しています。"
+                    if upset_mode
+                    else " ○以下は内部7頭から旧☆を予備へ回した馬券対象です。"
+                )
             )
         elif outside_leader_not_added:
             displayed_text = (
@@ -3816,7 +3999,14 @@ if predict_clicked:
 
 
 
-    if leader_added_from_outside:
+    if upset_mode:
+        st.subheader("予想結果（荒れモード7頭）")
+        st.caption(
+            "人気薄の消しを解除し、内部総合差1.5以内では"
+            "1着期待順位と馬券内期待順位が両方上の選定外馬へ"
+            "最大2頭まで入れ替えます。予備へは落としません。"
+        )
+    elif leader_added_from_outside:
         st.subheader("予想結果（◎＋相手6頭／予備1頭）")
         st.caption(
             "選定外の強い単独軸を◎として追加した例外表示です。"
