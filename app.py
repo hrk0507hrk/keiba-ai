@@ -142,6 +142,7 @@ class ScoreDetail:
     high_class_close_score: float = 50.0
     first_place_score: float = 0.0
     first_place_rank: int = 0
+    first_place_tiebreak_promoted: bool = False
     in_money_score: float = 0.0
     in_money_rank: int = 0
     axis_banned: bool = False
@@ -2286,16 +2287,15 @@ def assign_expectancy_engine(
             50.0,
         )
 
-    first_ranked = sorted(
-        horses.values(),
-        key=lambda horse: (
-            horse.score.first_place_score,
-            horse.score.last2_form_score,
-            horse.score.time_index,
-            horse.score.ability_index,
-        ),
-        reverse=True,
+    for horse in horses.values():
+        horse.score.first_place_tiebreak_promoted = False
+
+    first_ranked, promoted = first_place_tiebreak_decision(
+        list(horses.values())
     )
+    if promoted is not None:
+        promoted.score.first_place_tiebreak_promoted = True
+
     for rank, horse in enumerate(first_ranked, start=1):
         horse.score.first_place_rank = rank
 
@@ -2758,7 +2758,9 @@ def build_comment(horse: Horse) -> str:
     reasons = []
 
     if horse.mark == "◎":
-        if horse.score.first_place_rank == 1:
+        if horse.score.first_place_tiebreak_promoted:
+            reasons.append("僅差最終判定で1着期待1位")
+        elif horse.score.first_place_rank == 1:
             reasons.append("全頭1着期待指数1位")
         else:
             reasons.append("相手選定内1着期待最上位")
@@ -2919,6 +2921,9 @@ def select_mark_pool(horses: Dict[int, Horse]) -> List[Horse]:
     return base_pool[:7]
 
 
+FIRST_PLACE_TIEBREAK_GAP = 1.5
+
+
 def first_place_order_key(horse: Horse):
     return (
         horse.score.first_place_score,
@@ -2929,6 +2934,72 @@ def first_place_order_key(horse: Horse):
         -horse.popularity,
         -horse.number,
     )
+
+
+def wins_close_first_place_tiebreak(
+    challenger: Horse,
+    leader: Horse,
+) -> bool:
+    """
+    1着期待指数差が1.5以内のときだけ使う最終判定。
+
+    次の3項目すべてで挑戦馬が上なら、1着期待順位を逆転する。
+      ・上級僅差力
+      ・レースレベル
+      ・5走平均順位
+    """
+    gap = (
+        leader.score.first_place_score
+        - challenger.score.first_place_score
+    )
+    if gap < 0 or gap > FIRST_PLACE_TIEBREAK_GAP:
+        return False
+
+    return (
+        challenger.score.high_class_close_score
+        > leader.score.high_class_close_score
+        and challenger.score.race_level
+        > leader.score.race_level
+        and challenger.score.avg5_rank
+        < leader.score.avg5_rank
+    )
+
+
+def first_place_tiebreak_decision(
+    candidates: List[Horse],
+) -> Tuple[List[Horse], Optional[Horse]]:
+    """
+    通常は1着期待指数順。
+
+    上位2頭の指数差が1.5以内で、2位馬が指定3項目を
+    すべて上回る場合だけ1位と2位を入れ替える。
+    """
+    ranked = sorted(
+        candidates,
+        key=first_place_order_key,
+        reverse=True,
+    )
+    promoted: Optional[Horse] = None
+
+    if len(ranked) >= 2:
+        leader = ranked[0]
+        challenger = ranked[1]
+
+        if wins_close_first_place_tiebreak(
+            challenger,
+            leader,
+        ):
+            ranked[0], ranked[1] = challenger, leader
+            promoted = challenger
+
+    return ranked, promoted
+
+
+def rank_first_place_candidates(
+    candidates: List[Horse],
+) -> List[Horse]:
+    ranked, _ = first_place_tiebreak_decision(candidates)
+    return ranked
 
 
 def in_money_order_key(horse: Horse):
@@ -2969,7 +3040,7 @@ def first_place_axis_analysis(
     相手7頭の選定条件とは独立させ、選定外に本当の1着期待1位が
     いる場合も軸候補として拾う。
     """
-    ranked = sorted(candidates, key=first_place_order_key, reverse=True)
+    ranked = rank_first_place_candidates(candidates)
     if not ranked:
         return "★☆☆☆☆", "大混戦", "単独軸非推奨", 0.0, [], None
 
@@ -2979,7 +3050,8 @@ def first_place_axis_analysis(
         if len(ranked) >= 2
         else first.score.first_place_score - 10
     )
-    gap = first.score.first_place_score - second_score
+    # 僅差判定で順位が逆転した場合も、指数差は正の値で表示する。
+    gap = abs(first.score.first_place_score - second_score)
     support = first_place_support_count(first)
 
     eligible = (
@@ -3060,7 +3132,8 @@ def select_marks(horses: Dict[int, Horse]) -> List[Horse]:
         partner_marks = ("○", "▲", "△", "☆", "注", "穴", "抑")
     else:
         # 選定外1位が弱い場合は増やさず、従来7頭内から◎を決める。
-        first_choice = max(base_pool, key=first_place_order_key)
+        base_ranked = rank_first_place_candidates(base_pool)
+        first_choice = base_ranked[0]
         partners = [
             horse
             for horse in base_pool
@@ -3282,6 +3355,11 @@ def result_dataframe(selected: List[Horse]) -> pd.DataFrame:
                 "能力指数": horse.score.ability_index,
                 "1着期待順位": horse.score.first_place_rank,
                 "1着期待指数": horse.score.first_place_score,
+                "僅差判定": (
+                    "昇格"
+                    if horse.score.first_place_tiebreak_promoted
+                    else ""
+                ),
                 "格補正勝ち切り": horse.score.class_adjusted_win_score,
                 "上級僅差力": horse.score.high_class_close_score,
                 "馬券内期待順位": horse.score.in_money_rank,
@@ -3335,6 +3413,11 @@ def diagnostic_dataframe(horses: Dict[int, Horse]) -> pd.DataFrame:
                 "能力順位": horse.score.ability_rank,
                 "1着期待指数": horse.score.first_place_score,
                 "1着期待順位": horse.score.first_place_rank,
+                "僅差判定": (
+                    "昇格"
+                    if horse.score.first_place_tiebreak_promoted
+                    else ""
+                ),
                 "格補正勝ち切り": horse.score.class_adjusted_win_score,
                 "上級僅差力": horse.score.high_class_close_score,
                 "馬券内期待指数": horse.score.in_money_score,
@@ -3396,9 +3479,9 @@ def clear_inputs():
     st.session_state["timeindex_input"] = ""
 
 
-st.title("🐎 競馬AI Next v0.6.12 格補正1着期待版")
+st.title("🐎 競馬AI Next v0.6.13 僅差決着補正版")
 st.caption(
-    "相手7頭の選定条件は維持｜下級条件勝利を割引し、重賞僅差実績を1着期待へ反映"
+    "相手7頭の選定条件は維持｜1着期待差1.5以内は上級僅差力・レースレベル・5走平均で最終判定"
 )
 
 conditions_text = st.text_input(
@@ -3636,11 +3719,14 @@ if predict_clicked:
         st.caption(
             "全頭1着期待1位は軸基準未達のため追加していません。"
             "◎は相手7頭内の1着期待最上位です。"
+            " 指数差1.5以内では3項目の僅差最終判定を適用します。"
         )
     else:
         st.subheader("予想結果")
         st.caption(
             "◎は全頭1着期待1位。○以下は従来条件で選定した相手です。"
+            " 1着期待指数差1.5以内では、上級僅差力・レースレベル・"
+            "5走平均順位の3項目をすべて上回る馬を最終的に優先します。"
         )
 
     st.dataframe(
