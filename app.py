@@ -138,6 +138,8 @@ class ScoreDetail:
     same_condition_top3_rate: float = 0.0
     same_condition_rate_count: int = 0
     last2_form_score: float = 50.0
+    class_adjusted_win_score: float = 50.0
+    high_class_close_score: float = 50.0
     first_place_score: float = 0.0
     first_place_rank: int = 0
     in_money_score: float = 0.0
@@ -1910,17 +1912,250 @@ def calculate_last2_form_score(horse: Horse) -> float:
     return clamp(sum(weighted) / sum(used_weights))
 
 
+def win_class_credit(
+    record: RaceRecord,
+    conditions: RaceConditions,
+) -> float:
+    """
+    1着実績を今回クラスに合わせて補正する。
+
+    重賞が今回条件の場合の目安:
+      同格以上 100%
+      OP・L     70%
+      3勝       40%
+      2勝       20%
+    """
+    prior_level = class_score(record.race_class)
+
+    if conditions.race_class:
+        current_level = class_score(conditions.race_class)
+
+        if prior_level >= current_level - 3:
+            return 1.00
+
+        # 今回が重賞級のときは、下級条件勝利を明確に割り引く。
+        if current_level >= 86:
+            if prior_level >= 78:
+                return 0.70
+            if prior_level >= 74:
+                return 0.40
+            if prior_level >= 66:
+                return 0.20
+            if prior_level >= 58:
+                return 0.12
+            return 0.08
+
+        class_gap = current_level - prior_level
+        if class_gap <= 8:
+            return 0.75
+        if class_gap <= 14:
+            return 0.55
+        if class_gap <= 22:
+            return 0.35
+        return 0.18
+
+    # 今回クラスが未入力でも絶対的な格を使って補正する。
+    if prior_level >= 86:
+        return 1.00
+    if prior_level >= 78:
+        return 0.70
+    if prior_level >= 74:
+        return 0.40
+    if prior_level >= 66:
+        return 0.20
+    if prior_level >= 58:
+        return 0.12
+    return 0.08
+
+
+def calculate_class_adjusted_win_score(
+    horse: Horse,
+    conditions: RaceConditions,
+) -> float:
+    """
+    直近5走の勝利を、勝ったクラスに応じて評価する。
+
+    下級条件の連勝だけで重賞僅差馬を上回りにくくする一方、
+    同格以上の勝利は強く残す。
+    """
+    known = [
+        record
+        for record in horse.records[:5]
+        if record.finish_known and 1 <= record.finish < 99
+    ]
+    if not known:
+        return 50.0
+
+    recency_weights = [1.00, 0.90, 0.80, 0.70, 0.60]
+    weighted_credit = 0.0
+    exposure = 0.0
+
+    for index, record in enumerate(known):
+        weight = recency_weights[index]
+        exposure += weight
+
+        if record.finish == 1:
+            weighted_credit += weight * win_class_credit(
+                record,
+                conditions,
+            )
+
+    # 少数戦の1勝を過大評価しないよう、12%を事前値として平滑化。
+    prior_rate = 0.12
+    prior_weight = 2.5
+    adjusted_rate = (
+        weighted_credit + prior_rate * prior_weight
+    ) / (exposure + prior_weight) * 100.0
+
+    return rate_to_score(
+        adjusted_rate,
+        baseline=12.0,
+        sensitivity=1.35,
+    )
+
+
+def high_class_margin_base_score(record: RaceRecord) -> Optional[float]:
+    """重賞・OP級での僅差内容を0～100点へ変換する。"""
+    level = class_score(record.race_class)
+    if level < 78 or record.margin is None:
+        return None
+
+    margin = record.margin
+
+    if record.finish_known and record.finish == 1:
+        return 100.0
+    if margin < 0:
+        return 100.0
+
+    if level >= 100:
+        if margin <= 0.2:
+            return 100.0
+        if margin <= 0.5:
+            return 95.0
+        if margin <= 0.8:
+            return 85.0
+        if margin <= 1.0:
+            return 75.0
+        if margin <= 1.5:
+            return 62.0
+        return 45.0
+
+    if level >= 92:
+        if margin <= 0.2:
+            return 98.0
+        if margin <= 0.3:
+            return 94.0
+        if margin <= 0.5:
+            return 88.0
+        if margin <= 0.8:
+            return 78.0
+        if margin <= 1.0:
+            return 70.0
+        if margin <= 1.5:
+            return 58.0
+        return 43.0
+
+    if level >= 86:
+        if margin <= 0.2:
+            return 94.0
+        if margin <= 0.3:
+            return 90.0
+        if margin <= 0.5:
+            return 84.0
+        if margin <= 0.8:
+            return 74.0
+        if margin <= 1.0:
+            return 66.0
+        if margin <= 1.5:
+            return 55.0
+        return 40.0
+
+    # L・OP級。
+    if margin <= 0.2:
+        return 88.0
+    if margin <= 0.5:
+        return 80.0
+    if margin <= 0.8:
+        return 70.0
+    if margin <= 1.0:
+        return 62.0
+    if margin <= 1.5:
+        return 52.0
+    return 38.0
+
+
+def calculate_high_class_close_score(
+    horse: Horse,
+    conditions: RaceConditions,
+) -> float:
+    """
+    GI・GII・GIII・L・OPで、勝ち馬へどれだけ迫ったかを評価する。
+
+    1走だけの僅差は50点へ縮め、複数回続けて僅差だった馬を高くする。
+    """
+    recency_weights = [1.00, 0.90, 0.80, 0.70, 0.60]
+    weighted_scores = []
+    used_weights = []
+    raw_scores = []
+
+    current_level = (
+        class_score(conditions.race_class)
+        if conditions.race_class
+        else None
+    )
+
+    for index, record in enumerate(horse.records[:5]):
+        base = high_class_margin_base_score(record)
+        if base is None:
+            continue
+
+        prior_level = class_score(record.race_class)
+        adjusted = base
+
+        # 今回より下のクラスでの僅差は少し割り引く。
+        if current_level is not None and prior_level < current_level:
+            gap = current_level - prior_level
+            if gap <= 8:
+                factor = 0.85
+            elif gap <= 14:
+                factor = 0.65
+            else:
+                factor = 0.45
+            adjusted = 50.0 + (base - 50.0) * factor
+
+        weight = recency_weights[index]
+        weighted_scores.append(adjusted * weight)
+        used_weights.append(weight)
+        raw_scores.append(adjusted)
+
+    if not used_weights:
+        return 50.0
+
+    weighted_average = sum(weighted_scores) / sum(used_weights)
+    peak = max(raw_scores)
+
+    # 平均を中心にしつつ、GI級の強い一戦も少し残す。
+    raw = weighted_average * 0.78 + peak * 0.22
+
+    reliability = {
+        1: 0.45,
+        2: 0.70,
+        3: 0.85,
+    }.get(len(raw_scores), 1.00)
+
+    return clamp(50.0 + (raw - 50.0) * reliability)
+
+
 def calculate_first_place_raw_score(horse: Horse) -> float:
     """
     今回1着になる可能性を評価する指数。
 
-    能力順とは分離し、勝ち切り実績・直近2走・指数・展開を中心にする。
+    下級条件の勝利数だけでなく、
+    ・勝ったクラス
+    ・上位クラスでの僅差好走
+    ・5走平均、能力、相手レベル
+    を重視する。
     """
-    recent_win_score = rate_to_score(
-        horse.score.recent_win_rate,
-        baseline=15.0,
-        sensitivity=1.15,
-    )
     same_win_score = rate_to_score(
         horse.score.same_condition_win_rate,
         baseline=15.0,
@@ -1928,17 +2163,17 @@ def calculate_first_place_raw_score(horse: Horse) -> float:
     )
 
     score = (
-        recent_win_score * 0.18
-        + horse.score.last2_form_score * 0.12
+        horse.score.class_adjusted_win_score * 0.10
+        + horse.score.last2_form_score * 0.10
         + horse.score.time_index * 0.15
-        + horse.score.avg5_score * 0.12
-        + horse.score.ability_index * 0.12
-        + same_win_score * 0.08
+        + horse.score.avg5_score * 0.14
+        + horse.score.ability_index * 0.14
+        + same_win_score * 0.06
         + horse.score.recent_form * 0.08
-        + horse.score.running_style * 0.05
-        + horse.score.trend_score * 0.05
-        + horse.score.race_level * 0.05
-        + horse.score.high_class_win_bonus * 0.35
+        + horse.score.running_style * 0.04
+        + horse.score.trend_score * 0.04
+        + horse.score.race_level * 0.10
+        + horse.score.high_class_close_score * 0.05
         - horse.score.danger_score * 0.22
     )
     return clamp(score)
@@ -2007,6 +2242,20 @@ def assign_expectancy_engine(
 
         horse.score.last2_form_score = round(
             calculate_last2_form_score(horse),
+            1,
+        )
+        horse.score.class_adjusted_win_score = round(
+            calculate_class_adjusted_win_score(
+                horse,
+                conditions,
+            ),
+            1,
+        )
+        horse.score.high_class_close_score = round(
+            calculate_high_class_close_score(
+                horse,
+                conditions,
+            ),
             1,
         )
 
@@ -2558,6 +2807,11 @@ def build_comment(horse: Horse) -> str:
     if horse.score.recent_peak_score >= 85:
         reasons.append("直近3走内に高指数")
 
+    if horse.score.high_class_close_score >= 88:
+        reasons.append("上位クラスの僅差実績が強い")
+    elif horse.score.high_class_close_score >= 78:
+        reasons.append("重賞・OP級の僅差実績あり")
+
     if horse.score.high_class_win_bonus >= 6:
         reasons.append("直近の高格重賞勝利を評価")
     elif horse.score.high_class_win_bonus >= 4:
@@ -2692,7 +2946,8 @@ def in_money_order_key(horse: Horse):
 
 def first_place_support_count(horse: Horse) -> int:
     signals = (
-        horse.score.recent_win_rate >= 22,
+        horse.score.class_adjusted_win_score >= 56,
+        horse.score.high_class_close_score >= 80,
         horse.score.last2_form_score >= 70,
         horse.score.time_index >= 75,
         horse.score.avg5_score >= 72,
@@ -3027,6 +3282,8 @@ def result_dataframe(selected: List[Horse]) -> pd.DataFrame:
                 "能力指数": horse.score.ability_index,
                 "1着期待順位": horse.score.first_place_rank,
                 "1着期待指数": horse.score.first_place_score,
+                "格補正勝ち切り": horse.score.class_adjusted_win_score,
+                "上級僅差力": horse.score.high_class_close_score,
                 "馬券内期待順位": horse.score.in_money_rank,
                 "馬券内期待指数": horse.score.in_money_score,
                 "直近5走勝率": round(horse.score.recent_win_rate, 1),
@@ -3078,6 +3335,8 @@ def diagnostic_dataframe(horses: Dict[int, Horse]) -> pd.DataFrame:
                 "能力順位": horse.score.ability_rank,
                 "1着期待指数": horse.score.first_place_score,
                 "1着期待順位": horse.score.first_place_rank,
+                "格補正勝ち切り": horse.score.class_adjusted_win_score,
+                "上級僅差力": horse.score.high_class_close_score,
                 "馬券内期待指数": horse.score.in_money_score,
                 "馬券内期待順位": horse.score.in_money_rank,
                 "直近5走勝率": round(horse.score.recent_win_rate, 1),
@@ -3137,9 +3396,9 @@ def clear_inputs():
     st.session_state["timeindex_input"] = ""
 
 
-st.title("🐎 競馬AI Next v0.6.11 選定外軸ゲート版")
+st.title("🐎 競馬AI Next v0.6.12 格補正1着期待版")
 st.caption(
-    "相手7頭の選定条件は維持｜選定外の全頭1着期待1位は単独軸基準クリア時のみ追加"
+    "相手7頭の選定条件は維持｜下級条件勝利を割引し、重賞僅差実績を1着期待へ反映"
 )
 
 conditions_text = st.text_input(
