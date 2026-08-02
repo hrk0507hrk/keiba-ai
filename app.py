@@ -138,6 +138,7 @@ class ScoreDetail:
     high_class_win_bonus: float = 0.0
     young_condition_change_bonus: float = 0.0
     young_lightweight_current_class_bonus: float = 0.0
+    young_layoff_growth_bonus: float = 0.0
     selection_score: float = 0.0
     avg5_score: float = 50.0
     avg5_rank: int = 0
@@ -1220,6 +1221,71 @@ def calculate_young_lightweight_current_class_bonus(
         return 0.0
 
     # 1頭を救済するための固定4点。複数実績があっても過剰加点しない。
+    return 4.0
+
+
+def calculate_young_layoff_growth_bonus(
+    horse: Horse,
+    horses: Dict[int, Horse],
+    conditions: RaceConditions,
+) -> float:
+    """
+    3歳馬の休養明け成長を、選定と相手評価だけで小幅救済する。
+
+    対象条件:
+      ・3歳
+      ・古馬との混合戦
+      ・今回が1勝クラス、または出走構成から1勝クラス相当と推定
+      ・休養13週以上
+      ・今回の馬体重が前走比+8kg以上
+      ・直近3走以内に、今回と同じ馬場種別かつ距離差200m以内の
+        1勝クラスで1.0秒差以内
+
+    軸指数・1着期待・能力総合には加えず、
+    成長余地を理由に相手候補から落としすぎないための救済に限定する。
+    """
+    if horse.age != 3:
+        return 0.0
+
+    if not is_mixed_age_field(horses):
+        return 0.0
+
+    if not is_current_one_win_context(horses, conditions):
+        return 0.0
+
+    if horse.layoff_weeks < 13:
+        return 0.0
+
+    if horse.weight_change < 8:
+        return 0.0
+
+    qualifying = []
+    for record in horse.records[:3]:
+        if (record.race_class or "").upper() != "1勝":
+            continue
+
+        if record.margin is None or record.margin > 1.0:
+            continue
+
+        if (
+            conditions.surface
+            and record.surface
+            and record.surface != conditions.surface
+        ):
+            continue
+
+        if (
+            conditions.distance
+            and record.distance
+            and abs(record.distance - conditions.distance) > 200
+        ):
+            continue
+
+        qualifying.append(record)
+
+    if not qualifying:
+        return 0.0
+
     return 4.0
 
 
@@ -2469,6 +2535,7 @@ def calculate_in_money_raw_score(horse: Horse) -> float:
         + horse.score.suitability * 0.05
         + horse.score.survival_score * 0.05
         + horse.score.young_lightweight_current_class_bonus * 0.50
+        + horse.score.young_layoff_growth_bonus * 0.50
         - horse.score.danger_score * 0.18
     )
     return clamp(score)
@@ -2798,6 +2865,7 @@ def calculate_survival_score(horse: Horse, conditions: RaceConditions) -> float:
     score += horse.score.weight_bonus
     score += horse.score.young_condition_change_bonus * 0.55
     score += horse.score.young_lightweight_current_class_bonus
+    score += horse.score.young_layoff_growth_bonus * 0.75
 
     # 高格レース勝利は平均値に埋もれないよう、生存判定にも小幅反映する。
     # 軸指数には入れず、相手候補を落としすぎないための救済用途に限定。
@@ -2895,6 +2963,14 @@ def score_horses(
             ),
             1,
         )
+        horse.score.young_layoff_growth_bonus = round(
+            calculate_young_layoff_growth_bonus(
+                horse,
+                horses,
+                conditions,
+            ),
+            1,
+        )
         same_condition_score, same_condition_count = (
             score_same_condition_recent(horse, conditions)
         )
@@ -2971,9 +3047,10 @@ def score_horses(
     for horse in horses.values():
         horse.score.danger_score = round(calculate_danger_score(horse), 1)
 
-        # 危険度が極端に高い馬は、軽斤量だけで救済しない。
+        # 危険度が極端に高い馬は、救済項目だけで残さない。
         if horse.score.danger_score >= 45:
             horse.score.young_lightweight_current_class_bonus = 0.0
+            horse.score.young_layoff_growth_bonus = 0.0
 
         raw_survival_scores[horse.number] = calculate_survival_score(horse, conditions)
 
@@ -2992,6 +3069,7 @@ def score_horses(
             + horse.score.high_class_win_bonus
             + horse.score.young_condition_change_bonus * 0.70
             + horse.score.young_lightweight_current_class_bonus
+            + horse.score.young_layoff_growth_bonus
             - horse.score.danger_score * 0.18,
             0,
             100,
@@ -3102,6 +3180,9 @@ def build_comment(horse: Horse) -> str:
 
     if horse.score.young_lightweight_current_class_bonus >= 4:
         reasons.append("3歳軽斤量と現級善戦を評価")
+
+    if horse.score.young_layoff_growth_bonus >= 4:
+        reasons.append("3歳休養明けの成長を評価")
 
     if horse.score.recent_peak_score >= 85:
         reasons.append("直近3走内に高指数")
@@ -3901,6 +3982,7 @@ def result_dataframe(selected: List[Horse]) -> pd.DataFrame:
                 "格補正勝ち切り": horse.score.class_adjusted_win_score,
                 "3歳条件替わり": horse.score.young_condition_change_bonus,
                 "3歳軽斤量現級": horse.score.young_lightweight_current_class_bonus,
+                "3歳休養成長": horse.score.young_layoff_growth_bonus,
                 "上級僅差力": horse.score.high_class_close_score,
                 "馬券内期待順位": horse.score.in_money_rank,
                 "馬券内期待指数": horse.score.in_money_score,
@@ -3929,6 +4011,7 @@ def result_dataframe(selected: List[Horse]) -> pd.DataFrame:
                 "軸判定": "軸禁止" if horse.score.axis_banned else "候補可",
                 "軽斤量補正": horse.score.weight_bonus,
                 "3歳軽斤量現級": horse.score.young_lightweight_current_class_bonus,
+                "3歳休養成長": horse.score.young_layoff_growth_bonus,
                 "高格勝利補正": horse.score.high_class_win_bonus,
                 "印選定指数": horse.score.selection_score,
                 "生存指数": horse.score.survival_score,
@@ -3972,6 +4055,7 @@ def diagnostic_dataframe(horses: Dict[int, Horse]) -> pd.DataFrame:
                 "格補正勝ち切り": horse.score.class_adjusted_win_score,
                 "3歳条件替わり": horse.score.young_condition_change_bonus,
                 "3歳軽斤量現級": horse.score.young_lightweight_current_class_bonus,
+                "3歳休養成長": horse.score.young_layoff_growth_bonus,
                 "上級僅差力": horse.score.high_class_close_score,
                 "馬券内期待指数": horse.score.in_money_score,
                 "馬券内期待順位": horse.score.in_money_rank,
@@ -4033,9 +4117,9 @@ def clear_inputs():
     st.session_state["upset_mode"] = False
 
 
-st.title("🐎 競馬AI Next v0.6.19 3歳軽斤量・現級善戦救済版")
+st.title("🐎 競馬AI Next v0.6.20 3歳休養明け成長救済版")
 st.caption(
-    "通常6頭＋予備1頭｜3歳52kg以下＋現級善戦馬を選定・相手評価で救済"
+    "通常6頭＋予備1頭｜3歳の休養明け＋馬体増＋現級善戦を相手評価で救済"
 )
 
 conditions_text = st.text_input(
