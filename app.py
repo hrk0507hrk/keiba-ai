@@ -2846,12 +2846,20 @@ def mark_order_key(horse: Horse):
     )
 
 
-def select_mark_pool(horses: Dict[int, Horse]) -> List[Horse]:
+def select_mark_pool(
+    horses: Dict[int, Horse],
+    upset_mode: bool = False,
+) -> List[Horse]:
     """
     v0.6.8と同じ条件で7頭を選ぶ。
 
-    この関数では新しい1着期待・馬券内期待を一切使わず、
-    これまで高かった馬券内カバー率を維持する。
+    通常モード:
+      4～8番人気を相手候補の中心にし、9番人気以下は原則除外。
+
+    荒れレースモード:
+      人気薄の消しを解除し、4番人気以下をすべて相手候補にする。
+
+    上位3人気を残す基本方針と、7頭の選定数は変更しない。
     """
     confidence_stars, race_difficulty, _, axis_candidates = axis_confidence(horses)
     _, axis_operation, primary_axis = axis_guidance(
@@ -2900,7 +2908,16 @@ def select_mark_pool(horses: Dict[int, Horse]) -> List[Horse]:
         [
             horse
             for horse in horses.values()
-            if 4 <= horse.popularity <= 8
+            if (
+                (
+                    upset_mode
+                    and horse.popularity >= 4
+                )
+                or (
+                    not upset_mode
+                    and 4 <= horse.popularity <= 8
+                )
+            )
             and horse.number not in mandatory_numbers
         ],
         key=middle_selection_key,
@@ -3087,7 +3104,10 @@ def first_place_axis_analysis(
     return stars, difficulty, operation, gap, ranked, axis
 
 
-def select_marks_full(horses: Dict[int, Horse]) -> List[Horse]:
+def select_marks_full(
+    horses: Dict[int, Horse],
+    upset_mode: bool = False,
+) -> List[Horse]:
     """
     v0.6.13までと同じ印付けを行い、内部では7頭選定を維持する。
 
@@ -3101,7 +3121,7 @@ def select_marks_full(horses: Dict[int, Horse]) -> List[Horse]:
         horse.mark = ""
         horse.comment = ""
 
-    base_pool = select_mark_pool(horses)
+    base_pool = select_mark_pool(horses, upset_mode=upset_mode)
     if not base_pool or not horses:
         return []
 
@@ -3159,6 +3179,7 @@ def select_marks_full(horses: Dict[int, Horse]) -> List[Horse]:
 
 def select_marks_with_reserve(
     horses: Dict[int, Horse],
+    upset_mode: bool = False,
 ) -> Tuple[List[Horse], Optional[Horse]]:
     """
     内部の7頭選定は変えず、旧☆の1頭だけを予備へ回す。
@@ -3171,7 +3192,10 @@ def select_marks_with_reserve(
       ◎＋相手6頭 = 7頭表示
       予備 = 旧☆
     """
-    full_selected = select_marks_full(horses)
+    full_selected = select_marks_full(
+        horses,
+        upset_mode=upset_mode,
+    )
     if not full_selected:
         return [], None
 
@@ -3199,9 +3223,15 @@ def select_marks_with_reserve(
     return visible, reserve
 
 
-def select_marks(horses: Dict[int, Horse]) -> List[Horse]:
+def select_marks(
+    horses: Dict[int, Horse],
+    upset_mode: bool = False,
+) -> List[Horse]:
     """互換用。馬券対象として表示する6頭（例外時は7頭）を返す。"""
-    visible, _ = select_marks_with_reserve(horses)
+    visible, _ = select_marks_with_reserve(
+        horses,
+        upset_mode=upset_mode,
+    )
     return visible
 
 
@@ -3525,11 +3555,12 @@ def clear_inputs():
     st.session_state["racecard_input"] = ""
     st.session_state["past_input"] = ""
     st.session_state["timeindex_input"] = ""
+    st.session_state["upset_mode"] = False
 
 
-st.title("🐎 競馬AI Next v0.6.14 6頭検証版")
+st.title("🐎 競馬AI Next v0.6.15 荒れモード追加版")
 st.caption(
-    "内部7頭選定は維持｜旧☆を予備へ回し、通常は6頭で検証"
+    "通常6頭＋予備1頭｜手動の荒れレースモードで9番人気以下の消しを解除"
 )
 
 conditions_text = st.text_input(
@@ -3537,6 +3568,23 @@ conditions_text = st.text_input(
     placeholder="例：名古屋 B級 ダ1500 良　※分かる項目だけでもOK",
     key="conditions_input",
 )
+
+upset_mode = st.checkbox(
+    "荒れレースモード",
+    value=False,
+    key="upset_mode",
+    help=(
+        "ONにすると、通常は原則除外している9番人気以下も"
+        "7頭選定の候補に含めます。高知ファイナルなど、"
+        "人気薄まで広く比較したいレースで使用してください。"
+    ),
+)
+
+if upset_mode:
+    st.warning(
+        "荒れレースモード適用中：9番人気以下の消しを解除しています。"
+        "人気だけで加点はせず、能力・指数・近走内容で選定します。"
+    )
 
 racecard_text = st.text_area(
     "① 出走表",
@@ -3619,7 +3667,10 @@ if predict_clicked:
     )
 
     # 相手7頭は従来条件のまま固定。
-    opponent_pool = select_mark_pool(horses)
+    opponent_pool = select_mark_pool(
+        horses,
+        upset_mode=upset_mode,
+    )
     opponent_numbers = {horse.number for horse in opponent_pool}
 
     # 全頭1着期待1位と軸基準を確認する。
@@ -3639,7 +3690,10 @@ if predict_clicked:
     )
 
     # 表示印を作る。内部7頭のうち旧☆を予備へ回し、通常6頭表示。
-    selected, reserve_horse = select_marks_with_reserve(horses)
+    selected, reserve_horse = select_marks_with_reserve(
+        horses,
+        upset_mode=upset_mode,
+    )
     displayed_first_choice = next(
         (horse for horse in selected if horse.mark == "◎"),
         None,
@@ -3681,6 +3735,12 @@ if predict_clicked:
     )
 
     st.divider()
+
+    if upset_mode:
+        st.warning(
+            "この予想は荒れレースモードです。"
+            "9番人気以下も選定候補として比較しています。"
+        )
 
     if selected:
         summary_col1, summary_col2, summary_col3, summary_col4 = st.columns(4)
