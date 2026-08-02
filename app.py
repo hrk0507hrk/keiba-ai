@@ -139,6 +139,7 @@ class ScoreDetail:
     young_condition_change_bonus: float = 0.0
     young_lightweight_current_class_bonus: float = 0.0
     young_layoff_growth_bonus: float = 0.0
+    special_course_experience_bonus: float = 0.0
     selection_score: float = 0.0
     avg5_score: float = 50.0
     avg5_rank: int = 0
@@ -1038,6 +1039,68 @@ def record_forward_position(record: RaceRecord) -> bool:
         positions[0] <= 4
         or positions[-1] <= 3
     )
+
+
+SPECIAL_COURSE_SURVIVAL_BONUS = 3.0
+SPECIAL_COURSE_IN_MONEY_BONUS = 3.0
+
+
+def calculate_special_course_experience_bonus(
+    horse: Horse,
+    conditions: RaceConditions,
+) -> float:
+    """
+    新潟芝1000mの特殊適性を、実戦結果から直接評価する。
+
+    対象:
+      ・今回が新潟芝1000m
+      ・直近3走以内に同じ新潟芝1000m
+      ・3勝クラス以上
+      ・着差0.2秒以内
+
+    加点:
+      0.0秒差以内 +6
+      0.1秒差以内 +5
+      0.2秒差以内 +4
+
+    能力指数・総合点・軸指数・1着期待には加えない。
+    印選定、生存、馬券内期待、荒れモードの優先昇格だけに使う。
+    """
+    if not (
+        conditions.venue == "新潟"
+        and conditions.surface == "芝"
+        and conditions.distance == 1000
+    ):
+        return 0.0
+
+    qualifying_margins: List[float] = []
+
+    for record in horse.records[:3]:
+        if not (
+            record.venue == "新潟"
+            and record.surface == "芝"
+            and record.distance == 1000
+        ):
+            continue
+
+        if class_score(record.race_class) < class_score("3勝"):
+            continue
+
+        if record.margin is None or record.margin > 0.2:
+            continue
+
+        qualifying_margins.append(record.margin)
+
+    if not qualifying_margins:
+        return 0.0
+
+    best_margin = min(qualifying_margins)
+
+    if best_margin <= 0.0:
+        return 6.0
+    if best_margin <= 0.1:
+        return 5.0
+    return 4.0
 
 
 def calculate_young_condition_change_bonus(
@@ -2539,6 +2602,11 @@ def calculate_in_money_raw_score(horse: Horse) -> float:
         + horse.score.survival_score * 0.05
         + horse.score.young_lightweight_current_class_bonus * 0.50
         + horse.score.young_layoff_growth_bonus * 0.50
+        + (
+            SPECIAL_COURSE_IN_MONEY_BONUS
+            if horse.score.special_course_experience_bonus > 0
+            else 0.0
+        )
         - horse.score.danger_score * 0.18
     )
     return clamp(score)
@@ -2869,6 +2937,8 @@ def calculate_survival_score(horse: Horse, conditions: RaceConditions) -> float:
     score += horse.score.young_condition_change_bonus * 0.55
     score += horse.score.young_lightweight_current_class_bonus
     score += horse.score.young_layoff_growth_bonus * 0.75
+    if horse.score.special_course_experience_bonus > 0:
+        score += SPECIAL_COURSE_SURVIVAL_BONUS
 
     # 高格レース勝利は平均値に埋もれないよう、生存判定にも小幅反映する。
     # 軸指数には入れず、相手候補を落としすぎないための救済用途に限定。
@@ -2974,6 +3044,13 @@ def score_horses(
             ),
             1,
         )
+        horse.score.special_course_experience_bonus = round(
+            calculate_special_course_experience_bonus(
+                horse,
+                conditions,
+            ),
+            1,
+        )
         same_condition_score, same_condition_count = (
             score_same_condition_recent(horse, conditions)
         )
@@ -3073,6 +3150,7 @@ def score_horses(
             + horse.score.young_condition_change_bonus * 0.70
             + horse.score.young_lightweight_current_class_bonus
             + horse.score.young_layoff_growth_bonus
+            + horse.score.special_course_experience_bonus
             - horse.score.danger_score * 0.18,
             0,
             100,
@@ -3122,7 +3200,9 @@ def build_comment(horse: Horse) -> str:
     reasons = []
 
     if horse.score.upset_boundary_promoted:
-        if horse.score.upset_boundary_rule == "相手特化昇格":
+        if horse.score.upset_boundary_rule == "特殊コース実績昇格":
+            reasons.append("特殊コース実績で優先昇格")
+        elif horse.score.upset_boundary_rule == "相手特化昇格":
             reasons.append("荒れ相手特化判定で昇格")
         else:
             reasons.append("荒れ境界再判定で昇格")
@@ -3187,6 +3267,13 @@ def build_comment(horse: Horse) -> str:
     if horse.score.young_layoff_growth_bonus >= 4:
         reasons.append("3歳休養明けの成長を評価")
 
+    if horse.score.special_course_experience_bonus >= 6:
+        reasons.append("新潟芝1000mで0.0秒差以内")
+    elif horse.score.special_course_experience_bonus >= 5:
+        reasons.append("新潟芝1000mで0.1秒差以内")
+    elif horse.score.special_course_experience_bonus >= 4:
+        reasons.append("新潟芝1000mで0.2秒差以内")
+
     if horse.score.recent_peak_score >= 85:
         reasons.append("直近3走内に高指数")
 
@@ -3233,6 +3320,31 @@ UPSET_PARTNER_IN_MONEY_GAIN = 3
 UPSET_PARTNER_FIRST_DEFICIT = 2
 
 
+def special_course_promotion_key(horse: Horse):
+    """特殊コース実績馬の優先順位。僅差実績を最優先する。"""
+    return (
+        horse.score.special_course_experience_bonus,
+        horse.score.selection_score,
+        horse.score.in_money_score,
+        horse.score.total,
+        -horse.popularity,
+        -horse.number,
+    )
+
+
+def special_course_replacement_key(horse: Horse):
+    """特殊コース実績馬を入れる際、外す候補の弱い順。"""
+    return (
+        horse.score.special_course_experience_bonus > 0,
+        horse.score.in_money_score,
+        horse.score.selection_score,
+        horse.score.total,
+        horse.score.ability_index,
+        -horse.popularity,
+        -horse.number,
+    )
+
+
 def apply_upset_boundary_rerank(
     base_pool: List[Horse],
     horses: Dict[int, Horse],
@@ -3243,18 +3355,23 @@ def apply_upset_boundary_rerank(
     """
     荒れレースモード専用の境界再判定。
 
-    内部総合差が1.5以内の選定外馬を、次のどちらかで救済する。
+    最初に「特殊コース実績昇格」を最大2頭まで優先する。
+    今回が新潟芝1000mで、直近3走以内に同条件・3勝クラス以上・
+    0.2秒差以内の実績がある選定外馬を救済する。
+
+    残りの入れ替え枠がある場合だけ、従来の判定を行う。
 
     通常昇格:
+      ・内部総合差1.5以内
       ・1着期待順位が上
       ・馬券内期待順位も上
 
     相手特化昇格:
+      ・内部総合差1.5以内
       ・馬券内期待順位が3順位以上上
       ・1着期待順位は選定馬より2順位以内の下まで許容
 
-    上位3人気と既存軸候補は保護し、入れ替えは最大2頭。
-    一度昇格した馬は同じ判定内では再び落とさない。
+    上位3人気と既存軸候補は保護し、入れ替え総数は最大2頭。
     """
     for horse in horses.values():
         horse.score.upset_boundary_promoted = False
@@ -3271,7 +3388,76 @@ def apply_upset_boundary_rerank(
 
     promoted_numbers = set()
 
-    for _ in range(max_replacements):
+    # -----------------------------------------------------
+    # 1. 特殊コース実績を最優先で昇格
+    # -----------------------------------------------------
+    special_outsiders = sorted(
+        [
+            horse
+            for horse in original_outsiders
+            if horse.score.special_course_experience_bonus > 0
+        ],
+        key=special_course_promotion_key,
+        reverse=True,
+    )
+
+    # すでに選定内にいる特殊コース実績馬は通常判定で落とさない。
+    special_selected_numbers = {
+        horse.number
+        for horse in selected
+        if horse.score.special_course_experience_bonus > 0
+    }
+    promoted_numbers.update(special_selected_numbers)
+
+    for outsider in special_outsiders:
+        if len([
+            horse
+            for horse in horses.values()
+            if horse.score.upset_boundary_promoted
+        ]) >= max_replacements:
+            break
+
+        replaceable = [
+            horse
+            for horse in selected
+            if horse.number not in protected_numbers
+            and horse.number not in promoted_numbers
+            and horse.score.special_course_experience_bonus <= 0
+        ]
+        if not replaceable:
+            break
+
+        insider = min(
+            replaceable,
+            key=special_course_replacement_key,
+        )
+
+        replace_index = next(
+            index
+            for index, horse in enumerate(selected)
+            if horse.number == insider.number
+        )
+        selected[replace_index] = outsider
+
+        selected_numbers.remove(insider.number)
+        selected_numbers.add(outsider.number)
+        promoted_numbers.add(outsider.number)
+
+        outsider.score.upset_boundary_promoted = True
+        outsider.score.upset_boundary_rule = "特殊コース実績昇格"
+        insider.score.upset_boundary_demoted = True
+
+    replacements_used = sum(
+        1
+        for horse in horses.values()
+        if horse.score.upset_boundary_promoted
+    )
+    remaining_replacements = max(0, max_replacements - replacements_used)
+
+    # -----------------------------------------------------
+    # 2. 残り枠だけ従来の境界判定
+    # -----------------------------------------------------
+    for _ in range(remaining_replacements):
         qualifying_pairs = []
 
         replaceable = [
@@ -3344,9 +3530,10 @@ def apply_upset_boundary_rerank(
         if not qualifying_pairs:
             break
 
-        # 内部総合が高い選定外馬を優先。
-        # 同点付近では通常昇格、馬券内順位の改善幅、総合差で決める。
-        qualifying_pairs.sort(reverse=True, key=lambda row: row[:8])
+        qualifying_pairs.sort(
+            reverse=True,
+            key=lambda row: row[:8],
+        )
         rule_name = qualifying_pairs[0][-3]
         outsider = qualifying_pairs[0][-2]
         insider = qualifying_pairs[0][-1]
@@ -3367,6 +3554,7 @@ def apply_upset_boundary_rerank(
         insider.score.upset_boundary_demoted = True
 
     return selected
+
 
 
 def select_mark_pool(
@@ -4209,6 +4397,7 @@ def result_dataframe(selected: List[Horse]) -> pd.DataFrame:
                 "3歳条件替わり": horse.score.young_condition_change_bonus,
                 "3歳軽斤量現級": horse.score.young_lightweight_current_class_bonus,
                 "3歳休養成長": horse.score.young_layoff_growth_bonus,
+                "特殊コース実績": horse.score.special_course_experience_bonus,
                 "上級僅差力": horse.score.high_class_close_score,
                 "馬券内期待順位": horse.score.in_money_rank,
                 "馬券内期待指数": horse.score.in_money_score,
@@ -4240,6 +4429,7 @@ def result_dataframe(selected: List[Horse]) -> pd.DataFrame:
                 "軽斤量補正": horse.score.weight_bonus,
                 "3歳軽斤量現級": horse.score.young_lightweight_current_class_bonus,
                 "3歳休養成長": horse.score.young_layoff_growth_bonus,
+                "特殊コース実績": horse.score.special_course_experience_bonus,
                 "高格勝利補正": horse.score.high_class_win_bonus,
                 "印選定指数": horse.score.selection_score,
                 "生存指数": horse.score.survival_score,
@@ -4284,6 +4474,7 @@ def diagnostic_dataframe(horses: Dict[int, Horse]) -> pd.DataFrame:
                 "3歳条件替わり": horse.score.young_condition_change_bonus,
                 "3歳軽斤量現級": horse.score.young_lightweight_current_class_bonus,
                 "3歳休養成長": horse.score.young_layoff_growth_bonus,
+                "特殊コース実績": horse.score.special_course_experience_bonus,
                 "上級僅差力": horse.score.high_class_close_score,
                 "馬券内期待指数": horse.score.in_money_score,
                 "馬券内期待順位": horse.score.in_money_rank,
@@ -4347,9 +4538,9 @@ def clear_inputs():
     st.session_state["upset_mode"] = False
 
 
-st.title("🐎 競馬AI Next v0.6.21 予備再選定版")
+st.title("🐎 競馬AI Next v0.6.22 特殊コース実績優先版")
 st.caption(
-    "通常6頭＋予備1頭｜馬券内60％・1着25％・能力15％で予備を再選定"
+    "新潟芝1000mの同条件僅差実績を選定・相手評価・荒れ昇格で優先"
 )
 
 conditions_text = st.text_input(
@@ -4529,8 +4720,8 @@ if predict_clicked:
     if upset_mode:
         st.warning(
             "この予想は荒れレースモードです。"
-            "9番人気以下も候補に含め、境界再判定後の7頭を"
-            "すべて馬券対象として表示しています。"
+            "9番人気以下も候補に含め、特殊コース実績を最優先した"
+            "境界再判定後の7頭をすべて馬券対象として表示しています。"
         )
 
         promoted_horses = [
