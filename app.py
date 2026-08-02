@@ -139,6 +139,7 @@ class ScoreDetail:
     young_condition_change_bonus: float = 0.0
     young_lightweight_current_class_bonus: float = 0.0
     young_layoff_growth_bonus: float = 0.0
+    young_same_course_step_up_bonus: float = 0.0
     special_course_experience_bonus: float = 0.0
     selection_score: float = 0.0
     avg5_score: float = 50.0
@@ -1288,6 +1289,92 @@ def calculate_young_lightweight_current_class_bonus(
 
     # 1頭を救済するための固定4点。複数実績があっても過剰加点しない。
     return 4.0
+
+
+YOUNG_SAME_COURSE_STEP_UP_BONUS = 5.0
+YOUNG_SAME_COURSE_STEP_UP_FIRST_WEIGHT = 0.60
+YOUNG_SAME_COURSE_STEP_UP_SURVIVAL_WEIGHT = 0.40
+YOUNG_SAME_COURSE_STEP_UP_IN_MONEY_WEIGHT = 0.40
+
+
+def calculate_young_same_course_step_up_bonus(
+    horse: Horse,
+    horses: Dict[int, Horse],
+    conditions: RaceConditions,
+) -> float:
+    """
+    3歳馬が、今回と同一コース・同距離の未勝利戦を快勝し、
+    成長を挟んで古馬混合1勝クラスへ昇級する型を救済する。
+
+    対象条件:
+      ・3歳
+      ・古馬との混合戦
+      ・今回が1勝クラス、または出走構成から1勝クラス相当と推定
+      ・今回53kg以下
+      ・前走が未勝利戦1着
+      ・前走と今回の競馬場・芝ダート・距離が完全一致
+      ・前走を0.2秒差以上で勝利
+      ・休養8～12週
+      ・今回の馬体重が前走比+6kg以上
+
+    反映:
+      ・印選定 +5
+      ・1着期待 +3
+      ・生存指数 +2
+      ・馬券内期待 +2
+
+    能力指数・内部総合・軸指数には加えない。
+    """
+    if horse.age != 3:
+        return 0.0
+
+    if horse.carried_weight <= 0 or horse.carried_weight > 53.0:
+        return 0.0
+
+    if not is_mixed_age_field(horses):
+        return 0.0
+
+    if not is_current_one_win_context(horses, conditions):
+        return 0.0
+
+    if not (8 <= horse.layoff_weeks <= 12):
+        return 0.0
+
+    if horse.weight_change < 6:
+        return 0.0
+
+    if not horse.records:
+        return 0.0
+
+    latest = horse.records[0]
+
+    if (latest.race_class or "").upper() != "未勝利":
+        return 0.0
+
+    if latest.finish != 1:
+        return 0.0
+
+    if latest.margin is None or latest.margin > -0.2:
+        return 0.0
+
+    # 条件が未入力の時に誤作動させない。
+    if not (
+        conditions.venue
+        and conditions.surface
+        and conditions.distance
+    ):
+        return 0.0
+
+    if latest.venue != conditions.venue:
+        return 0.0
+
+    if latest.surface != conditions.surface:
+        return 0.0
+
+    if latest.distance != conditions.distance:
+        return 0.0
+
+    return YOUNG_SAME_COURSE_STEP_UP_BONUS
 
 
 def calculate_young_layoff_growth_bonus(
@@ -2563,6 +2650,10 @@ def calculate_first_place_raw_score(horse: Horse) -> float:
         + horse.score.race_level * 0.10
         + horse.score.high_class_close_score * 0.05
         + horse.score.young_condition_change_bonus * 0.55
+        + (
+            horse.score.young_same_course_step_up_bonus
+            * YOUNG_SAME_COURSE_STEP_UP_FIRST_WEIGHT
+        )
         - horse.score.danger_score * 0.22
     )
     return clamp(score)
@@ -2602,6 +2693,10 @@ def calculate_in_money_raw_score(horse: Horse) -> float:
         + horse.score.survival_score * 0.05
         + horse.score.young_lightweight_current_class_bonus * 0.50
         + horse.score.young_layoff_growth_bonus * 0.50
+        + (
+            horse.score.young_same_course_step_up_bonus
+            * YOUNG_SAME_COURSE_STEP_UP_IN_MONEY_WEIGHT
+        )
         + (
             SPECIAL_COURSE_IN_MONEY_BONUS
             if horse.score.special_course_experience_bonus > 0
@@ -2937,6 +3032,10 @@ def calculate_survival_score(horse: Horse, conditions: RaceConditions) -> float:
     score += horse.score.young_condition_change_bonus * 0.55
     score += horse.score.young_lightweight_current_class_bonus
     score += horse.score.young_layoff_growth_bonus * 0.75
+    score += (
+        horse.score.young_same_course_step_up_bonus
+        * YOUNG_SAME_COURSE_STEP_UP_SURVIVAL_WEIGHT
+    )
     if horse.score.special_course_experience_bonus > 0:
         score += SPECIAL_COURSE_SURVIVAL_BONUS
 
@@ -3044,6 +3143,14 @@ def score_horses(
             ),
             1,
         )
+        horse.score.young_same_course_step_up_bonus = round(
+            calculate_young_same_course_step_up_bonus(
+                horse,
+                horses,
+                conditions,
+            ),
+            1,
+        )
         horse.score.special_course_experience_bonus = round(
             calculate_special_course_experience_bonus(
                 horse,
@@ -3131,6 +3238,7 @@ def score_horses(
         if horse.score.danger_score >= 45:
             horse.score.young_lightweight_current_class_bonus = 0.0
             horse.score.young_layoff_growth_bonus = 0.0
+            horse.score.young_same_course_step_up_bonus = 0.0
 
         raw_survival_scores[horse.number] = calculate_survival_score(horse, conditions)
 
@@ -3150,6 +3258,7 @@ def score_horses(
             + horse.score.young_condition_change_bonus * 0.70
             + horse.score.young_lightweight_current_class_bonus
             + horse.score.young_layoff_growth_bonus
+            + horse.score.young_same_course_step_up_bonus
             + horse.score.special_course_experience_bonus
             - horse.score.danger_score * 0.18,
             0,
@@ -3266,6 +3375,9 @@ def build_comment(horse: Horse) -> str:
 
     if horse.score.young_layoff_growth_bonus >= 4:
         reasons.append("3歳休養明けの成長を評価")
+
+    if horse.score.young_same_course_step_up_bonus >= 5:
+        reasons.append("3歳同条件快勝からの昇級成長を評価")
 
     if horse.score.special_course_experience_bonus >= 6:
         reasons.append("新潟芝1000mで0.0秒差以内")
@@ -4397,6 +4509,7 @@ def result_dataframe(selected: List[Horse]) -> pd.DataFrame:
                 "3歳条件替わり": horse.score.young_condition_change_bonus,
                 "3歳軽斤量現級": horse.score.young_lightweight_current_class_bonus,
                 "3歳休養成長": horse.score.young_layoff_growth_bonus,
+                "3歳同条件昇級": horse.score.young_same_course_step_up_bonus,
                 "特殊コース実績": horse.score.special_course_experience_bonus,
                 "上級僅差力": horse.score.high_class_close_score,
                 "馬券内期待順位": horse.score.in_money_rank,
@@ -4429,6 +4542,7 @@ def result_dataframe(selected: List[Horse]) -> pd.DataFrame:
                 "軽斤量補正": horse.score.weight_bonus,
                 "3歳軽斤量現級": horse.score.young_lightweight_current_class_bonus,
                 "3歳休養成長": horse.score.young_layoff_growth_bonus,
+                "3歳同条件昇級": horse.score.young_same_course_step_up_bonus,
                 "特殊コース実績": horse.score.special_course_experience_bonus,
                 "高格勝利補正": horse.score.high_class_win_bonus,
                 "印選定指数": horse.score.selection_score,
@@ -4474,6 +4588,7 @@ def diagnostic_dataframe(horses: Dict[int, Horse]) -> pd.DataFrame:
                 "3歳条件替わり": horse.score.young_condition_change_bonus,
                 "3歳軽斤量現級": horse.score.young_lightweight_current_class_bonus,
                 "3歳休養成長": horse.score.young_layoff_growth_bonus,
+                "3歳同条件昇級": horse.score.young_same_course_step_up_bonus,
                 "特殊コース実績": horse.score.special_course_experience_bonus,
                 "上級僅差力": horse.score.high_class_close_score,
                 "馬券内期待指数": horse.score.in_money_score,
@@ -4538,9 +4653,9 @@ def clear_inputs():
     st.session_state["upset_mode"] = False
 
 
-st.title("🐎 競馬AI Next v0.6.22 特殊コース実績優先版")
+st.title("🐎 競馬AI Next v0.6.23 3歳同条件昇級成長版")
 st.caption(
-    "新潟芝1000mの同条件僅差実績を選定・相手評価・荒れ昇格で優先"
+    "3歳53kg以下の同一コース未勝利快勝＋休養成長を1着・選定で救済"
 )
 
 conditions_text = st.text_input(
