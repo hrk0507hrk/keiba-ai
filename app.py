@@ -47,6 +47,25 @@ CLASS_SCORES = {
     "未勝利": 45, "新馬": 40,
 }
 
+TURF_SPRINT_SIRES = {
+    "ロードカナロア",
+    "ダイワメジャー",
+    "ビッグアーサー",
+    "キンシャサノキセキ",
+    "ファインニードル",
+    "ミッキーアイル",
+    "アドマイヤムーン",
+    "サクラバクシンオー",
+    "モーリス",
+    "カレンブラックヒル",
+    "Dark Angel",
+    "Invincible Spirit",
+    "Kingman",
+    "No Nay Never",
+    "Siyouni",
+}
+
+
 WEIGHTS = {
     # 検証1件目を反映した暫定配分。数レース蓄積後に再調整する。
     "recent_form": 0.28,
@@ -117,6 +136,7 @@ class ScoreDetail:
     recent_peak_score: float = 0.0
     weight_bonus: float = 0.0
     high_class_win_bonus: float = 0.0
+    young_condition_change_bonus: float = 0.0
     selection_score: float = 0.0
     avg5_score: float = 50.0
     avg5_rank: int = 0
@@ -165,6 +185,7 @@ class Horse:
     odds: float = 0.0
     popularity: int = 99
     sex_age: str = ""
+    sire: str = ""
     records: List[RaceRecord] = field(default_factory=list)
     time_index: TimeIndex = field(default_factory=TimeIndex)
     running_style: str = ""
@@ -617,6 +638,7 @@ def parse_past_performances(
     lines = normalize_lines(text)
     current: Optional[Horse] = None
     block: List[str] = []
+    expect_sire = False
 
     def flush():
         nonlocal block
@@ -638,6 +660,7 @@ def parse_past_performances(
                 number,
                 Horse(number=number, name=f"{number}番"),
             )
+            expect_sire = False
             continue
 
         # 別形式: 6番 馬名
@@ -652,6 +675,7 @@ def parse_past_performances(
                     name=match.group(2) or f"{number}番",
                 ),
             )
+            expect_sire = False
             continue
 
         # 馬名で紐づけ
@@ -662,6 +686,16 @@ def parse_past_performances(
                     break
 
         if current is None:
+            continue
+
+        # netkeiba馬柱では「--」直後の行が父名。
+        if not block and line in {"--", "－", "―"}:
+            expect_sire = True
+            continue
+
+        if expect_sire and not block:
+            current.sire = line
+            expect_sire = False
             continue
 
         # 年齢と今回の馬体重増減を取得する。
@@ -970,6 +1004,111 @@ def age_adjustment(horse: Horse) -> float:
     if horse.age >= 8:
         return -0.5
     return 0.0
+
+
+def is_turf_sprint_sire(sire: str) -> bool:
+    if not sire:
+        return False
+
+    normalized = normalize_text(sire)
+    return any(
+        normalized.casefold() == candidate.casefold()
+        for candidate in TURF_SPRINT_SIRES
+    )
+
+
+def record_forward_position(record: RaceRecord) -> bool:
+    if not record.passing:
+        return False
+
+    try:
+        positions = [
+            int(value)
+            for value in record.passing.split("-")
+        ]
+    except (TypeError, ValueError):
+        return False
+
+    return bool(positions) and (
+        positions[0] <= 4
+        or positions[-1] <= 3
+    )
+
+
+def calculate_young_condition_change_bonus(
+    horse: Horse,
+    conditions: RaceConditions,
+) -> float:
+    """
+    3歳馬が未勝利の短距離戦を先行して勝ち、
+    1勝クラスでダートから芝短距離へ替わる場合の上昇余地を評価する。
+
+    過去実績の少ない若馬を無条件で上げず、以下がそろう場合だけ加点。
+      ・3歳
+      ・今回1勝クラス
+      ・今回芝1000～1400m
+      ・前走が未勝利または新馬の短距離勝ち
+      ・前走ダートから今回芝への条件替わり
+
+    父が代表的な芝短距離型で、今回に近い芝短距離実績がまだない場合は
+    「未知の適性」を小幅に追加評価する。
+    """
+    if horse.age != 3 or not horse.records:
+        return 0.0
+
+    current_class = (conditions.race_class or "").upper()
+    if current_class != "1勝":
+        return 0.0
+
+    if (
+        conditions.surface != "芝"
+        or not 1000 <= conditions.distance <= 1400
+    ):
+        return 0.0
+
+    latest = horse.records[0]
+    latest_class = (latest.race_class or "").upper()
+
+    if (
+        latest_class not in {"未勝利", "新馬"}
+        or not latest.finish_known
+        or latest.finish != 1
+        or latest.surface != "ダ"
+        or not 1000 <= latest.distance <= 1400
+    ):
+        return 0.0
+
+    bonus = 2.0
+    bonus += 1.5  # ダート短距離→芝短距離
+
+    distance_diff = abs(
+        conditions.distance - latest.distance
+    )
+    if distance_diff <= 100:
+        bonus += 1.0
+    elif distance_diff <= 200:
+        bonus += 0.6
+
+    if record_forward_position(latest):
+        bonus += 1.5
+
+    if latest.margin is not None and latest.margin <= 0.3:
+        bonus += 0.5
+
+    prior_similar_turf = any(
+        record.surface == "芝"
+        and 1000 <= record.distance <= 1400
+        and abs(record.distance - conditions.distance) <= 200
+        for record in horse.records[1:5]
+    )
+
+    if (
+        not prior_similar_turf
+        and is_turf_sprint_sire(horse.sire)
+    ):
+        bonus += 1.5
+
+    return round(clamp(bonus, 0.0, 8.0), 1)
 
 
 def infer_running_style(horse: Horse) -> str:
@@ -1735,6 +1874,7 @@ def calculate_win_axis_score(horse: Horse) -> float:
         + horse.score.ability_index * 0.14
         + horse.score.running_style * 0.08
         + horse.score.race_level * 0.07
+        + horse.score.young_condition_change_bonus * 0.25
         - horse.score.danger_score * 0.20
     )
     return clamp(score)
@@ -2178,6 +2318,7 @@ def calculate_first_place_raw_score(horse: Horse) -> float:
         + horse.score.trend_score * 0.04
         + horse.score.race_level * 0.10
         + horse.score.high_class_close_score * 0.05
+        + horse.score.young_condition_change_bonus * 0.55
         - horse.score.danger_score * 0.22
     )
     return clamp(score)
@@ -2542,6 +2683,7 @@ def calculate_survival_score(horse: Horse, conditions: RaceConditions) -> float:
     score += (horse.score.recent_peak_score - 50) * 0.12
     score += class_relief_bonus(horse, conditions) * 0.55
     score += horse.score.weight_bonus
+    score += horse.score.young_condition_change_bonus * 0.55
 
     # 高格レース勝利は平均値に埋もれないよう、生存判定にも小幅反映する。
     # 軸指数には入れず、相手候補を落としすぎないための救済用途に限定。
@@ -2624,6 +2766,13 @@ def score_horses(
         horse.score.age_adjustment = round(age_adjustment(horse), 1)
         horse.score.weight_bonus = round(calculate_weight_bonus(horse), 1)
         horse.score.high_class_win_bonus = recent_high_class_win_bonus(horse)
+        horse.score.young_condition_change_bonus = round(
+            calculate_young_condition_change_bonus(
+                horse,
+                conditions,
+            ),
+            1,
+        )
         same_condition_score, same_condition_count = (
             score_same_condition_recent(horse, conditions)
         )
@@ -2677,6 +2826,8 @@ def score_horses(
         # 転入・相手弱化と年齢は、各項目に埋もれない小幅な直接補正にする。
         total += horse.score.transition_bonus * 0.35
         total += horse.score.age_adjustment
+        # 未知の条件替わりは能力そのものではないため、総合点には小幅だけ反映。
+        total += horse.score.young_condition_change_bonus * 0.20
         horse.score.total = round(clamp(total), 1)
 
     avg5_ranked = sorted(
@@ -2712,6 +2863,7 @@ def score_horses(
             + horse.score.recent_peak_score * 0.10
             + horse.score.weight_bonus
             + horse.score.high_class_win_bonus
+            + horse.score.young_condition_change_bonus * 0.70
             - horse.score.danger_score * 0.18,
             0,
             100,
@@ -2814,6 +2966,11 @@ def build_comment(horse: Horse) -> str:
         reasons.append("軽斤量と先行力を評価")
     elif horse.score.weight_bonus >= 2:
         reasons.append("軽斤量を評価")
+
+    if horse.score.young_condition_change_bonus >= 6:
+        reasons.append("3歳の芝短距離替わりを強く評価")
+    elif horse.score.young_condition_change_bonus >= 3:
+        reasons.append("3歳の条件替わり上昇を評価")
 
     if horse.score.recent_peak_score >= 85:
         reasons.append("直近3走内に高指数")
@@ -3196,6 +3353,7 @@ def first_place_support_count(horse: Horse) -> int:
     signals = (
         horse.score.class_adjusted_win_score >= 56,
         horse.score.high_class_close_score >= 80,
+        horse.score.young_condition_change_bonus >= 6,
         horse.score.last2_form_score >= 70,
         horse.score.time_index >= 75,
         horse.score.avg5_score >= 72,
@@ -3591,6 +3749,7 @@ def result_dataframe(selected: List[Horse]) -> pd.DataFrame:
                 "印": horse.mark,
                 "馬番": horse.number,
                 "馬名": horse.name,
+                "父": horse.sire,
                 "人気": "-" if horse.popularity == 99 else horse.popularity,
                 "オッズ": "-" if horse.odds <= 0 else horse.odds,
                 "推定脚質": horse.running_style,
@@ -3609,6 +3768,7 @@ def result_dataframe(selected: List[Horse]) -> pd.DataFrame:
                     else ""
                 ),
                 "格補正勝ち切り": horse.score.class_adjusted_win_score,
+                "3歳条件替わり": horse.score.young_condition_change_bonus,
                 "上級僅差力": horse.score.high_class_close_score,
                 "馬券内期待順位": horse.score.in_money_rank,
                 "馬券内期待指数": horse.score.in_money_score,
@@ -3653,6 +3813,7 @@ def diagnostic_dataframe(horses: Dict[int, Horse]) -> pd.DataFrame:
             {
                 "馬番": horse.number,
                 "馬名": horse.name,
+                "父": horse.sire,
                 "人気": horse.popularity,
                 "近走数": len(horse.records),
                 "推定脚質": horse.running_style,
@@ -3676,6 +3837,7 @@ def diagnostic_dataframe(horses: Dict[int, Horse]) -> pd.DataFrame:
                     )
                 ),
                 "格補正勝ち切り": horse.score.class_adjusted_win_score,
+                "3歳条件替わり": horse.score.young_condition_change_bonus,
                 "上級僅差力": horse.score.high_class_close_score,
                 "馬券内期待指数": horse.score.in_money_score,
                 "馬券内期待順位": horse.score.in_money_rank,
@@ -3737,9 +3899,9 @@ def clear_inputs():
     st.session_state["upset_mode"] = False
 
 
-st.title("🐎 競馬AI Next v0.6.17 荒れ相手特化救済版")
+st.title("🐎 競馬AI Next v0.6.18 3歳条件替わり補正版")
 st.caption(
-    "通常6頭＋予備1頭｜荒れモードは相手特化救済を含む7頭全採用"
+    "通常6頭＋予備1頭｜3歳の未勝利短距離勝ちから芝替わりを小幅救済"
 )
 
 conditions_text = st.text_input(
