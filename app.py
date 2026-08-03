@@ -66,14 +66,13 @@ TURF_SPRINT_SIRES = {
 }
 
 
-WEIGHTS = {
-    # 検証1件目を反映した暫定配分。数レース蓄積後に再調整する。
-    "recent_form": 0.28,
-    "race_level": 0.28,
-    "suitability": 0.16,
-    "running_style": 0.08,
-    "closing_power": 0.08,
-    "time_index": 0.12,
+CORE_WEIGHTS = {
+    # v0.7.0: 同じ情報の二重評価を避け、5つの独立グループへ整理する。
+    "base_ability": 0.25,
+    "condition_performance": 0.25,
+    "current_form": 0.25,
+    "time_index": 0.15,
+    "pace_style": 0.10,
 }
 
 
@@ -129,6 +128,12 @@ class ScoreDetail:
     running_style: float = 0.0
     closing_power: float = 0.0
     time_index: float = 0.0
+    base_ability_score: float = 50.0
+    condition_performance_score: float = 50.0
+    same_condition_peak_score: float = 50.0
+    current_form_score: float = 50.0
+    pace_style_score: float = 50.0
+    core_selection_score: float = 50.0
     transition_bonus: float = 0.0
     age_adjustment: float = 0.0
     survival_score: float = 0.0
@@ -1882,34 +1887,24 @@ def blend_survival_scores(raw_scores: Dict[int, float]) -> Dict[int, float]:
 
 
 def score_time_index(horse: Horse, mode: str) -> float:
+    """
+    v0.7.0のタイム指数。
+
+    5走平均へ寄りすぎず、前走と直近2走を中心にする。
+      前走 40％ / 2走前 25％ / 3走前 10％
+      5走平均 15％ / 距離 6％ / コース 4％
+
+    中央・地方で同じ考え方を使い、欠損項目は利用可能項目へ再配分する。
+    """
     ti = horse.time_index
-
-    if mode == "central":
-        return weighted_index_score([
-            (ti.overall, 0.08),
-            (ti.start, 0.05),
-            (ti.chase, 0.06),
-            (ti.closing, 0.08),
-            (ti.avg5, 0.10),
-            (ti.distance, 0.08),
-            (ti.course, 0.07),
-            (ti.last3, 0.14),
-            (ti.last2, 0.16),
-            (ti.last1, 0.18),
-        ])
-
-    # 地方7項目は5走平均を能力の土台として最重視。
-    # 前走で現在の状態、距離・2走前・コースで再現性を補う。
     return weighted_index_score([
-        (ti.highest, 0.05),
-        (ti.avg5, 0.25),
-        (ti.distance, 0.15),
-        (ti.course, 0.10),
-        (ti.last3, 0.05),
-        (ti.last2, 0.15),
-        (ti.last1, 0.25),
+        (ti.last1, 0.40),
+        (ti.last2, 0.25),
+        (ti.last3, 0.10),
+        (ti.avg5, 0.15),
+        (ti.distance, 0.06),
+        (ti.course, 0.04),
     ])
-
 
 def recent_time_values(horse: Horse) -> List[int]:
     return [
@@ -2181,75 +2176,41 @@ def calculate_stability_score(horse: Horse) -> float:
 
 
 def calculate_stable_axis_score(horse: Horse) -> float:
-    """複勝圏へ崩れにくい馬を評価する安定軸指数。"""
-    score = (
-        horse.score.avg5_score * 0.25
-        + horse.score.same_condition_score * 0.10
-        + horse.score.stability_score * 0.30
-        + horse.score.recent_form * 0.15
-        + horse.score.suitability * 0.05
-        + horse.score.race_level * 0.10
-        + horse.score.trend_score * 0.05
-        - horse.score.danger_score * 0.25
+    """馬券内期待・安定度・今回条件だけで作る安定軸指数。"""
+    return clamp(
+        horse.score.in_money_score * 0.45
+        + horse.score.stability_score * 0.35
+        + horse.score.condition_performance_score * 0.20
+        - horse.score.danger_score * 0.10
     )
-    return clamp(score)
-
 
 def calculate_win_axis_score(horse: Horse) -> float:
-    """一発の勝ち切り能力を評価する勝負軸指数。"""
-    score = (
-        horse.score.time_index * 0.20
-        + horse.score.avg5_score * 0.18
-        + horse.score.recent_form * 0.18
-        + horse.score.recent_peak_score * 0.15
-        + horse.score.ability_index * 0.14
-        + horse.score.running_style * 0.08
-        + horse.score.race_level * 0.07
-        + horse.score.young_condition_change_bonus * 0.25
-        - horse.score.danger_score * 0.20
+    """1着期待・基礎能力・直近状態・展開で作る勝負軸指数。"""
+    return clamp(
+        horse.score.first_place_score * 0.50
+        + horse.score.base_ability_score * 0.20
+        + horse.score.current_form_score * 0.20
+        + horse.score.pace_style_score * 0.10
+        - horse.score.danger_score * 0.10
     )
-    return clamp(score)
-
 
 def calculate_base_axis_score(horse: Horse) -> float:
-    """
-    条件適性・同条件近走を中立50点にした基礎軸指数。
-    条件入力だけで何点上がったかを診断するために使う。
-    """
-    score = (
-        horse.score.avg5_score * 0.22
-        + 50.0 * 0.10
-        + horse.score.stability_score * 0.20
-        + horse.score.trend_score * 0.14
-        + horse.score.race_level * 0.12
-        + 50.0 * 0.05
-        + horse.score.ability_index * 0.12
-        + horse.score.recent_form * 0.05
-        - horse.score.danger_score * 0.25
+    """今回条件を中立50点に置いた比較用軸指数。"""
+    stable_base = (
+        horse.score.in_money_score * 0.45
+        + horse.score.stability_score * 0.35
+        + 50.0 * 0.20
+        - horse.score.danger_score * 0.10
     )
-    return clamp(score)
-
+    win_score = calculate_win_axis_score(horse)
+    return clamp(stable_base * 0.60 + win_score * 0.40)
 
 def calculate_axis_index(horse: Horse) -> float:
-    """
-    総合軸指数。
-
-    条件系は合計15％に抑え、5走平均・安定度・上昇度・
-    相手レベルなど複数項目がそろった馬を優先する。
-    """
-    score = (
-        horse.score.avg5_score * 0.22
-        + horse.score.same_condition_score * 0.10
-        + horse.score.stability_score * 0.20
-        + horse.score.trend_score * 0.14
-        + horse.score.race_level * 0.12
-        + horse.score.suitability * 0.05
-        + horse.score.ability_index * 0.12
-        + horse.score.recent_form * 0.05
-        - horse.score.danger_score * 0.25
+    """安定軸60％＋勝負軸40％の総合軸指数。"""
+    return clamp(
+        horse.score.stable_axis_score * 0.60
+        + horse.score.win_axis_score * 0.40
     )
-    return clamp(score)
-
 
 def smoothed_finish_rate(
     successes: int,
@@ -2621,55 +2582,124 @@ def calculate_high_class_close_score(
     return clamp(50.0 + (raw - 50.0) * reliability)
 
 
-def calculate_first_place_raw_score(horse: Horse) -> float:
-    """
-    今回1着になる可能性を評価する指数。
+def calculate_same_condition_peak_score(
+    horse: Horse,
+    conditions: RaceConditions,
+) -> float:
+    """今回に近い条件での「最も強い1走」を評価する。"""
+    if not horse.records or not has_known_conditions(conditions):
+        return 50.0
 
-    下級条件の勝利数だけでなく、
-    ・勝ったクラス
-    ・上位クラスでの僅差好走
-    ・5走平均、能力、相手レベル
-    を重視する。
-    """
-    same_win_score = rate_to_score(
-        horse.score.same_condition_win_rate,
-        baseline=15.0,
-        sensitivity=0.90,
+    current_level = (
+        class_score(conditions.race_class)
+        if conditions.race_class
+        else None
+    )
+    candidates: List[float] = []
+
+    for record in horse.records[:5]:
+        if conditions.surface and record.surface and record.surface != conditions.surface:
+            continue
+
+        if conditions.distance and record.distance:
+            distance_diff = abs(record.distance - conditions.distance)
+            if distance_diff > 400:
+                continue
+        else:
+            distance_diff = 9999
+
+        reliability = 0.62
+        if conditions.surface and record.surface == conditions.surface:
+            reliability += 0.10
+        if distance_diff == 0:
+            reliability += 0.18
+        elif distance_diff <= 200:
+            reliability += 0.12
+        elif distance_diff <= 400:
+            reliability += 0.05
+        if conditions.venue and record.venue == conditions.venue:
+            reliability += 0.10
+
+        performance = record_performance_score(record)
+
+        if current_level is not None and record.race_class:
+            prior_level = class_score(record.race_class)
+            if prior_level < current_level:
+                gap = current_level - prior_level
+                factor = 0.85 if gap <= 8 else 0.65 if gap <= 14 else 0.45
+                performance = 50.0 + (performance - 50.0) * factor
+            elif prior_level > current_level:
+                performance += min(5.0, (prior_level - current_level) * 0.20)
+
+        adjusted = 50.0 + (performance - 50.0) * min(1.0, reliability)
+        candidates.append(clamp(adjusted))
+
+    return max(candidates) if candidates else 50.0
+
+
+def calculate_base_ability_group(horse: Horse) -> float:
+    """格・上級僅差・格補正勝利だけで基礎能力を作る。"""
+    return clamp(
+        horse.score.race_level * 0.45
+        + horse.score.high_class_close_score * 0.35
+        + horse.score.class_adjusted_win_score * 0.20
     )
 
+
+def calculate_condition_performance_group(horse: Horse) -> float:
+    """今回条件での平均内容・最高内容・純適性をまとめる。"""
+    return clamp(
+        horse.score.same_condition_score * 0.45
+        + horse.score.same_condition_peak_score * 0.35
+        + horse.score.suitability * 0.20
+    )
+
+
+def calculate_current_form_group(horse: Horse) -> float:
+    """前走・2走前を中心に、上昇度と直近ピークを補助する。"""
+    return clamp(
+        horse.score.last2_form_score * 0.45
+        + horse.score.trend_score * 0.25
+        + horse.score.recent_peak_score * 0.15
+        + horse.score.recent_form * 0.15
+    )
+
+
+def calculate_pace_style_group(horse: Horse) -> float:
+    """脚質と末脚を一つの展開グループへまとめる。"""
+    return clamp(
+        horse.score.running_style * 0.55
+        + horse.score.closing_power * 0.45
+    )
+
+
+def calculate_core_selection_score(horse: Horse) -> float:
+    """重複を避けたv0.7.0の選定基本点。"""
+    return clamp(
+        horse.score.base_ability_score * CORE_WEIGHTS["base_ability"]
+        + horse.score.condition_performance_score * CORE_WEIGHTS["condition_performance"]
+        + horse.score.current_form_score * CORE_WEIGHTS["current_form"]
+        + horse.score.time_index * CORE_WEIGHTS["time_index"]
+        + horse.score.pace_style_score * CORE_WEIGHTS["pace_style"]
+    )
+
+
+def calculate_first_place_raw_score(horse: Horse) -> float:
+    """v0.7.0の1着期待。選定基本点を中心に、勝ち切り要素だけを足す。"""
     score = (
-        horse.score.class_adjusted_win_score * 0.10
-        + horse.score.last2_form_score * 0.10
-        + horse.score.time_index * 0.15
-        + horse.score.avg5_score * 0.14
-        + horse.score.ability_index * 0.14
-        + same_win_score * 0.06
-        + horse.score.recent_form * 0.08
-        + horse.score.running_style * 0.04
-        + horse.score.trend_score * 0.04
-        + horse.score.race_level * 0.10
-        + horse.score.high_class_close_score * 0.05
-        + horse.score.young_condition_change_bonus * 0.55
-        + (
-            horse.score.young_same_course_step_up_bonus
-            * YOUNG_SAME_COURSE_STEP_UP_FIRST_WEIGHT
-        )
-        - horse.score.danger_score * 0.22
+        horse.score.core_selection_score * 0.35
+        + horse.score.class_adjusted_win_score * 0.20
+        + horse.score.current_form_score * 0.20
+        + horse.score.same_condition_peak_score * 0.15
+        + horse.score.pace_style_score * 0.10
+        + horse.score.weight_bonus * 0.50
+        + horse.score.special_course_experience_bonus * 0.40
+        - horse.score.danger_score * 0.15
     )
     return clamp(score)
 
-
 def calculate_in_money_raw_score(horse: Horse) -> float:
-    """
-    1～3着へ入る可能性を評価する相手専用指数。
-
-    複勝率・連対率・安定度・着差・5走平均を中心にする。
-    """
-    recent_top2_score = rate_to_score(
-        horse.score.recent_top2_rate,
-        baseline=30.0,
-        sensitivity=0.90,
-    )
+    """v0.7.0の馬券内期待。安定・同条件・直近複勝率へ役割を限定する。"""
     recent_top3_score = rate_to_score(
         horse.score.recent_top3_rate,
         baseline=45.0,
@@ -2681,31 +2711,22 @@ def calculate_in_money_raw_score(horse: Horse) -> float:
         sensitivity=0.75,
     )
 
+    # 正の配点は90％。全項目50点なら50点になるよう中立5点を加える。
     score = (
-        recent_top3_score * 0.22
-        + recent_top2_score * 0.10
-        + same_top3_score * 0.10
-        + horse.score.stability_score * 0.18
-        + horse.score.avg5_score * 0.12
-        + horse.score.recent_form * 0.10
-        + horse.score.race_level * 0.08
-        + horse.score.suitability * 0.05
-        + horse.score.survival_score * 0.05
-        + horse.score.young_lightweight_current_class_bonus * 0.50
-        + horse.score.young_layoff_growth_bonus * 0.50
+        horse.score.core_selection_score * 0.30
+        + horse.score.stability_score * 0.25
+        + same_top3_score * 0.20
+        + recent_top3_score * 0.15
+        + 5.0
+        + horse.score.weight_bonus * 0.50
         + (
-            horse.score.young_same_course_step_up_bonus
-            * YOUNG_SAME_COURSE_STEP_UP_IN_MONEY_WEIGHT
-        )
-        + (
-            SPECIAL_COURSE_IN_MONEY_BONUS
+            2.0
             if horse.score.special_course_experience_bonus > 0
             else 0.0
         )
-        - horse.score.danger_score * 0.18
+        - horse.score.danger_score * 0.10
     )
     return clamp(score)
-
 
 def assign_expectancy_engine(
     horses: Dict[int, Horse],
@@ -3002,72 +3023,23 @@ def calculate_danger_score(horse: Horse) -> float:
 
 
 def calculate_survival_score(horse: Horse, conditions: RaceConditions) -> float:
-    """能力順位が低くても、近走上向き・軽斤量・相手弱化の馬を残す。"""
-    score = 48.0
-    recent_values = recent_time_values(horse)
-
-    if recent_values:
-        transformed = [time_index_to_score(value) for value in recent_values]
-        score += (average(transformed) - 50) * 0.50
-
-        # 3走前→2走前→前走で改善している馬を加点する。
-        if len(recent_values) == 3 and recent_values[0] < recent_values[1] < recent_values[2]:
-            score += 7
-        elif horse.time_index.last1 is not None and horse.time_index.last1 >= 0:
-            score += 3
-
-        # 平均だけで消さず、直近3走内の高指数も補助的に残す。
-        peak = max(recent_values)
-        if peak >= 30:
-            score += 7
-        elif peak >= 20:
-            score += 5
-        elif peak >= 10:
-            score += 3
-
-    score += (horse.score.time_index - 50) * 0.18
-    score += (horse.score.recent_peak_score - 50) * 0.12
-    score += class_relief_bonus(horse, conditions) * 0.55
-    score += horse.score.weight_bonus
-    score += horse.score.young_condition_change_bonus * 0.55
-    score += horse.score.young_lightweight_current_class_bonus
-    score += horse.score.young_layoff_growth_bonus * 0.75
-    score += (
-        horse.score.young_same_course_step_up_bonus
-        * YOUNG_SAME_COURSE_STEP_UP_SURVIVAL_WEIGHT
+    """v0.7.0の生存指数。専用補正の積み上げではなく5グループで判定する。"""
+    score = (
+        horse.score.current_form_score * 0.35
+        + horse.score.condition_performance_score * 0.25
+        + horse.score.time_index * 0.20
+        + horse.score.base_ability_score * 0.10
+        + horse.score.pace_style_score * 0.10
+        + horse.score.weight_bonus
+        + horse.score.transition_bonus * 0.20
+        + (
+            SPECIAL_COURSE_SURVIVAL_BONUS
+            if horse.score.special_course_experience_bonus > 0
+            else 0.0
+        )
+        - horse.score.danger_score * 0.25
     )
-    if horse.score.special_course_experience_bonus > 0:
-        score += SPECIAL_COURSE_SURVIVAL_BONUS
-
-    # 高格レース勝利は平均値に埋もれないよう、生存判定にも小幅反映する。
-    # 軸指数には入れず、相手候補を落としすぎないための救済用途に限定。
-    score += horse.score.high_class_win_bonus * 0.60
-
-    if horse.age and horse.age <= 5:
-        score += 4
-    elif horse.age >= 9 and horse.score.time_index < 55 and horse.score.weight_bonus < 2:
-        # 高齢減点は、指数や軽斤量の裏付けがない時だけ小さく使う。
-        score -= 1
-
-    if 4 <= horse.popularity <= 6:
-        score += 6
-    elif 7 <= horse.popularity <= 8:
-        score += 2
-
-    if horse.records and horse.records[0].margin is not None:
-        if horse.records[0].margin <= 0.5:
-            score += 5
-        elif horse.records[0].margin >= 3.0:
-            score -= 4
-
-    # 長期休養や大幅馬体変動は「消し」ではなく、わずかな抑制だけにする。
-    if horse.layoff_weeks >= 20:
-        score -= 3
-    if abs(horse.weight_change) >= 15:
-        score -= 2
-
-    return clamp(score, 0, 130)
-
+    return clamp(score, 0, 100)
 
 def assign_fixed_ability_indices(horses: Dict[int, Horse]) -> Dict[int, Horse]:
     """レース内順位ではなく、同じ総合点なら常に同じ指数になる固定基準。"""
@@ -3090,7 +3062,7 @@ def score_horses(
     conditions: RaceConditions,
     mode: str,
 ) -> Dict[int, Horse]:
-    # 先に全頭の脚質を確定し、逃げ・先行の競合数を出す。
+    """v0.7.0: 5グループへ整理した採点エンジン。"""
     for horse in horses.values():
         infer_running_style(horse)
 
@@ -3098,7 +3070,6 @@ def score_horses(
         1 for horse in horses.values()
         if horse.running_style in ("逃げ", "先行")
     )
-
     for horse in horses.values():
         horse.front_competitors = front_count
 
@@ -3109,7 +3080,6 @@ def score_horses(
     raw_peak_scores: Dict[int, float] = {}
     raw_avg5_scores: Dict[int, float] = {}
 
-    # 基礎項目とタイム指数の固定基準値を先に計算する。
     for horse in horses.values():
         horse.score.recent_form = round(score_recent_form(horse), 1)
         horse.score.race_level = round(score_race_level(horse, conditions), 1)
@@ -3119,62 +3089,37 @@ def score_horses(
         horse.score.transition_bonus = round(class_relief_bonus(horse, conditions), 1)
         horse.score.age_adjustment = round(age_adjustment(horse), 1)
         horse.score.weight_bonus = round(calculate_weight_bonus(horse), 1)
-        horse.score.high_class_win_bonus = recent_high_class_win_bonus(horse)
-        horse.score.young_condition_change_bonus = round(
-            calculate_young_condition_change_bonus(
-                horse,
-                conditions,
-            ),
-            1,
-        )
-        horse.score.young_lightweight_current_class_bonus = round(
-            calculate_young_lightweight_current_class_bonus(
-                horse,
-                horses,
-                conditions,
-            ),
-            1,
-        )
-        horse.score.young_layoff_growth_bonus = round(
-            calculate_young_layoff_growth_bonus(
-                horse,
-                horses,
-                conditions,
-            ),
-            1,
-        )
-        horse.score.young_same_course_step_up_bonus = round(
-            calculate_young_same_course_step_up_bonus(
-                horse,
-                horses,
-                conditions,
-            ),
-            1,
-        )
+
+        # v0.7.0では個別レース型の後付け補正を停止する。
+        # 同条件・成長・斤量は5グループの基本採点へ吸収する。
+        horse.score.high_class_win_bonus = 0.0
+        horse.score.young_condition_change_bonus = 0.0
+        horse.score.young_lightweight_current_class_bonus = 0.0
+        horse.score.young_layoff_growth_bonus = 0.0
+        horse.score.young_same_course_step_up_bonus = 0.0
         horse.score.special_course_experience_bonus = round(
-            calculate_special_course_experience_bonus(
-                horse,
-                conditions,
-            ),
-            1,
+            calculate_special_course_experience_bonus(horse, conditions), 1
         )
-        same_condition_score, same_condition_count = (
-            score_same_condition_recent(horse, conditions)
+
+        same_score, same_count = score_same_condition_recent(horse, conditions)
+        horse.score.same_condition_score = round(same_score, 1)
+        horse.score.same_condition_count = same_count
+        horse.score.same_condition_peak_score = round(
+            calculate_same_condition_peak_score(horse, conditions), 1
         )
-        horse.score.same_condition_score = round(
-            same_condition_score,
-            1,
-        )
-        horse.score.same_condition_count = same_condition_count
         horse.score.trend_score = round(calculate_trend_score(horse), 1)
+        horse.score.last2_form_score = round(calculate_last2_form_score(horse), 1)
+        horse.score.class_adjusted_win_score = round(
+            calculate_class_adjusted_win_score(horse, conditions), 1
+        )
+        horse.score.high_class_close_score = round(
+            calculate_high_class_close_score(horse, conditions), 1
+        )
 
         raw_time_scores[horse.number] = score_time_index(horse, mode)
         raw_peak_scores[horse.number] = recent_peak_score(horse)
-        raw_avg5_scores[horse.number] = time_index_to_score(
-            horse.time_index.avg5
-        )
+        raw_avg5_scores[horse.number] = time_index_to_score(horse.time_index.avg5)
 
-    # 固定基準65％＋レース内相対順位35％で、99～100点への張り付きを解消する。
     normalized_time_scores = blend_field_scores(
         raw_time_scores,
         relative_low=43.0,
@@ -3199,29 +3144,20 @@ def score_horses(
         horse.score.recent_peak_score = normalized_peak_scores.get(horse.number, 50.0)
         horse.score.avg5_score = normalized_avg5_scores.get(horse.number, 50.0)
 
-        total = (
-            horse.score.recent_form * WEIGHTS["recent_form"]
-            + horse.score.race_level * WEIGHTS["race_level"]
-            + horse.score.suitability * WEIGHTS["suitability"]
-            + horse.score.running_style * WEIGHTS["running_style"]
-            + horse.score.closing_power * WEIGHTS["closing_power"]
-            + horse.score.time_index * WEIGHTS["time_index"]
+        horse.score.base_ability_score = round(calculate_base_ability_group(horse), 1)
+        horse.score.condition_performance_score = round(
+            calculate_condition_performance_group(horse), 1
         )
-
-        # 転入・相手弱化と年齢は、各項目に埋もれない小幅な直接補正にする。
-        total += horse.score.transition_bonus * 0.35
-        total += horse.score.age_adjustment
-        # 未知の条件替わりは能力そのものではないため、総合点には小幅だけ反映。
-        total += horse.score.young_condition_change_bonus * 0.20
-        horse.score.total = round(clamp(total), 1)
+        horse.score.current_form_score = round(calculate_current_form_group(horse), 1)
+        horse.score.pace_style_score = round(calculate_pace_style_group(horse), 1)
+        horse.score.core_selection_score = round(calculate_core_selection_score(horse), 1)
+        horse.score.total = horse.score.core_selection_score
 
     avg5_ranked = sorted(
         horses.values(),
         key=lambda horse: (
             horse.score.avg5_score,
-            horse.time_index.avg5
-            if horse.time_index.avg5 is not None
-            else -999,
+            horse.time_index.avg5 if horse.time_index.avg5 is not None else -999,
         ),
         reverse=True,
     )
@@ -3230,49 +3166,33 @@ def score_horses(
 
     assign_fixed_ability_indices(horses)
 
-    raw_survival_scores: Dict[int, float] = {}
     for horse in horses.values():
         horse.score.danger_score = round(calculate_danger_score(horse), 1)
+        horse.score.stability_score = round(calculate_stability_score(horse), 1)
 
-        # 危険度が極端に高い馬は、救済項目だけで残さない。
-        if horse.score.danger_score >= 45:
-            horse.score.young_lightweight_current_class_bonus = 0.0
-            horse.score.young_layoff_growth_bonus = 0.0
-            horse.score.young_same_course_step_up_bonus = 0.0
-
-        raw_survival_scores[horse.number] = calculate_survival_score(horse, conditions)
-
+    raw_survival_scores = {
+        horse.number: calculate_survival_score(horse, conditions)
+        for horse in horses.values()
+    }
     normalized_survival_scores = blend_survival_scores(raw_survival_scores)
 
     for horse in horses.values():
         horse.score.survival_score = normalized_survival_scores.get(horse.number, 50.0)
-
-        # 印選定は能力だけでなく、生存・直近指数・軽斤量・危険度を合成する。
         horse.score.selection_score = round(clamp(
-            horse.score.ability_index * 0.38
-            + horse.score.survival_score * 0.27
-            + horse.score.time_index * 0.20
-            + horse.score.recent_peak_score * 0.10
+            horse.score.core_selection_score
             + horse.score.weight_bonus
-            + horse.score.high_class_win_bonus
-            + horse.score.young_condition_change_bonus * 0.70
-            + horse.score.young_lightweight_current_class_bonus
-            + horse.score.young_layoff_growth_bonus
-            + horse.score.young_same_course_step_up_bonus
+            + horse.score.transition_bonus * 0.20
             + horse.score.special_course_experience_bonus
-            - horse.score.danger_score * 0.18,
+            - horse.score.danger_score * 0.12,
             0,
             100,
         ), 1)
 
-    # 既存の7頭選定条件を守るため、従来の軸エンジンはそのまま残す。
+    # 期待指数を先に作り、その役割に沿って軸指数を算出する。
+    assign_expectancy_engine(horses, conditions)
     assign_axis_engine(horses)
 
-    # 印の役割分け専用。7頭の顔ぶれには影響させない。
-    assign_expectancy_engine(horses, conditions)
-
     return horses
-
 
 # =========================================================
 # Selection
@@ -3280,15 +3200,14 @@ def score_horses(
 
 def ranking_key(horse: Horse):
     return (
-        horse.score.ability_index,
-        horse.score.total,
-        horse.score.recent_form,
-        horse.score.race_level,
+        horse.score.core_selection_score,
+        horse.score.base_ability_score,
+        horse.score.condition_performance_score,
+        horse.score.current_form_score,
         horse.score.time_index,
         -horse.popularity,
         -horse.number,
     )
-
 
 def axis_selection_score(horse: Horse) -> float:
     """互換用。軸選定は独立した軸指数を利用する。"""
@@ -3298,12 +3217,12 @@ def axis_selection_score(horse: Horse) -> float:
 def middle_selection_key(horse: Horse):
     return (
         horse.score.selection_score,
+        horse.score.current_form_score,
+        horse.score.condition_performance_score,
         horse.score.survival_score,
-        horse.score.time_index,
-        horse.score.ability_index,
+        horse.score.base_ability_score,
         -horse.popularity,
     )
-
 
 def build_comment(horse: Horse) -> str:
     reasons = []
@@ -3311,8 +3230,6 @@ def build_comment(horse: Horse) -> str:
     if horse.score.upset_boundary_promoted:
         if horse.score.upset_boundary_rule == "特殊コース実績昇格":
             reasons.append("特殊コース実績で優先昇格")
-        elif horse.score.upset_boundary_rule == "3歳同条件昇級昇格":
-            reasons.append("3歳同条件昇級成長で優先昇格")
         elif horse.score.upset_boundary_rule == "相手特化昇格":
             reasons.append("荒れ相手特化判定で昇格")
         else:
@@ -3327,6 +3244,13 @@ def build_comment(horse: Horse) -> str:
             reasons.append("相手選定内1着期待最上位")
     elif horse.score.in_money_rank <= 3:
         reasons.append("馬券内期待指数上位")
+
+    if horse.score.condition_performance_score >= 75:
+        reasons.append("今回条件実績を高評価")
+    if horse.score.current_form_score >= 75:
+        reasons.append("直近状態が上向き")
+    if horse.score.base_ability_score >= 75:
+        reasons.append("基礎能力が上位")
 
     if horse.score.axis_banned and horse.popularity <= 3:
         reasons.append(f"軸禁止：{horse.score.axis_ban_reason}")
@@ -3367,20 +3291,6 @@ def build_comment(horse: Horse) -> str:
     elif horse.score.weight_bonus >= 2:
         reasons.append("軽斤量を評価")
 
-    if horse.score.young_condition_change_bonus >= 6:
-        reasons.append("3歳の芝短距離替わりを強く評価")
-    elif horse.score.young_condition_change_bonus >= 3:
-        reasons.append("3歳の条件替わり上昇を評価")
-
-    if horse.score.young_lightweight_current_class_bonus >= 4:
-        reasons.append("3歳軽斤量と現級善戦を評価")
-
-    if horse.score.young_layoff_growth_bonus >= 4:
-        reasons.append("3歳休養明けの成長を評価")
-
-    if horse.score.young_same_course_step_up_bonus >= 5:
-        reasons.append("3歳同条件快勝からの昇級成長を評価")
-
     if horse.score.special_course_experience_bonus >= 6:
         reasons.append("新潟芝1000mで0.0秒差以内")
     elif horse.score.special_course_experience_bonus >= 5:
@@ -3395,11 +3305,6 @@ def build_comment(horse: Horse) -> str:
         reasons.append("上位クラスの僅差実績が強い")
     elif horse.score.high_class_close_score >= 78:
         reasons.append("重賞・OP級の僅差実績あり")
-
-    if horse.score.high_class_win_bonus >= 6:
-        reasons.append("直近の高格重賞勝利を評価")
-    elif horse.score.high_class_win_bonus >= 4:
-        reasons.append("直近のOP級勝利を評価")
 
     if horse.score.danger_score >= 45:
         reasons.append("休養・指数面の危険あり")
@@ -3416,89 +3321,48 @@ def build_comment(horse: Horse) -> str:
 
 
 def mark_order_key(horse: Horse):
-    """旧版互換。7頭選定の不足枠を埋める順位には従来基準を使う。"""
     return (
-        horse.score.ability_index,
+        horse.score.core_selection_score,
         horse.score.selection_score,
         horse.score.axis_index,
-        horse.score.recent_form,
-        horse.score.time_index,
+        horse.score.condition_performance_score,
+        horse.score.current_form_score,
         -horse.popularity,
         -horse.number,
     )
-
 
 UPSET_BOUNDARY_TOTAL_GAP = 1.5
 UPSET_BOUNDARY_MAX_REPLACEMENTS = 2
 UPSET_PARTNER_IN_MONEY_GAIN = 3
 UPSET_PARTNER_FIRST_DEFICIT = 2
-UPSET_YOUNG_STEP_UP_MAX_PROMOTIONS = 1
 
 
 def special_course_promotion_key(horse: Horse):
-    """特殊コース実績馬の優先順位。僅差実績を最優先する。"""
     return (
         horse.score.special_course_experience_bonus,
         horse.score.selection_score,
         horse.score.in_money_score,
-        horse.score.total,
+        horse.score.core_selection_score,
         -horse.popularity,
         -horse.number,
     )
 
 
 def special_course_replacement_key(horse: Horse):
-    """特殊コース実績馬を入れる際、外す候補の弱い順。"""
     return (
         horse.score.special_course_experience_bonus > 0,
         horse.score.in_money_score,
         horse.score.selection_score,
-        horse.score.total,
+        horse.score.core_selection_score,
         horse.score.ability_index,
         -horse.popularity,
         -horse.number,
     )
 
 
-def young_step_up_promotion_key(horse: Horse):
-    """
-    3歳同条件昇級馬の優先順位。
-
-    昇級初戦で勝ち切る型なので、1着期待を最優先する。
-    """
-    return (
-        horse.score.young_same_course_step_up_bonus,
-        horse.score.first_place_score,
-        horse.score.selection_score,
-        horse.score.in_money_score,
-        horse.score.total,
-        -horse.popularity,
-        -horse.number,
-    )
-
-
-def young_step_up_replacement_key(horse: Horse):
-    """
-    3歳同条件昇級馬を入れる際の降格候補。
-
-    1着期待順位が最も低い馬を優先して外す。
-    同順位なら1着期待指数、馬券内期待、選定指数が低い馬を外す。
-    """
-    return (
-        horse.score.first_place_rank,
-        -horse.score.first_place_score,
-        -horse.score.in_money_score,
-        -horse.score.selection_score,
-        -horse.score.total,
-        horse.popularity,
-        horse.number,
-    )
-
-
 def count_upset_promotions(horses: Dict[int, Horse]) -> int:
     return sum(
-        1
-        for horse in horses.values()
+        1 for horse in horses.values()
         if horse.score.upset_boundary_promoted
     )
 
@@ -3511,35 +3375,10 @@ def apply_upset_boundary_rerank(
     total_gap: float = UPSET_BOUNDARY_TOTAL_GAP,
 ) -> List[Horse]:
     """
-    荒れレースモード専用の境界再判定。
+    荒れモードの境界再判定。
 
-    優先順位:
-      1. 特殊コース実績昇格
-      2. 3歳同条件昇級成長昇格（最大1頭）
-      3. 従来の通常昇格・相手特化昇格
-
-    特殊コース実績昇格:
-      ・新潟芝1000m
-      ・直近3走以内に同条件・3勝クラス以上
-      ・0.2秒差以内
-
-    3歳同条件昇級成長昇格:
-      ・3歳同条件昇級補正が5点
-      ・選定外なら通常境界判定より先に最大1頭救済
-      ・上位3人気と既存軸候補を保護
-      ・降格馬は1着期待順位が最も低い馬
-
-    通常昇格:
-      ・内部総合差1.5以内
-      ・1着期待順位が上
-      ・馬券内期待順位も上
-
-    相手特化昇格:
-      ・内部総合差1.5以内
-      ・馬券内期待順位が3順位以上上
-      ・1着期待順位は選定馬より2順位以内の下まで許容
-
-    全ルールを合わせた入れ替え総数は最大2頭。
+    新潟芝1000mの特殊コース実績だけを例外的に優先し、
+    それ以外は新しい基本採点・1着期待・馬券内期待の境界比較で判断する。
     """
     for horse in horses.values():
         horse.score.upset_boundary_promoted = False
@@ -3549,235 +3388,101 @@ def apply_upset_boundary_rerank(
     selected = list(base_pool)
     selected_numbers = {horse.number for horse in selected}
     original_outsiders = [
-        horse
-        for horse in horses.values()
+        horse for horse in horses.values()
         if horse.number not in selected_numbers
     ]
-
     promoted_numbers = set()
 
-    # -----------------------------------------------------
-    # 1. 特殊コース実績を最優先で昇格
-    # -----------------------------------------------------
     special_outsiders = sorted(
         [
-            horse
-            for horse in original_outsiders
+            horse for horse in original_outsiders
             if horse.score.special_course_experience_bonus > 0
         ],
         key=special_course_promotion_key,
         reverse=True,
     )
-
-    # すでに選定内にいる特殊コース実績馬は後続判定で落とさない。
-    special_selected_numbers = {
-        horse.number
-        for horse in selected
+    promoted_numbers.update(
+        horse.number for horse in selected
         if horse.score.special_course_experience_bonus > 0
-    }
-    promoted_numbers.update(special_selected_numbers)
+    )
 
     for outsider in special_outsiders:
         if count_upset_promotions(horses) >= max_replacements:
             break
-
         replaceable = [
-            horse
-            for horse in selected
+            horse for horse in selected
             if horse.number not in protected_numbers
             and horse.number not in promoted_numbers
             and horse.score.special_course_experience_bonus <= 0
         ]
         if not replaceable:
             break
-
-        insider = min(
-            replaceable,
-            key=special_course_replacement_key,
-        )
-
-        replace_index = next(
-            index
-            for index, horse in enumerate(selected)
-            if horse.number == insider.number
-        )
-        selected[replace_index] = outsider
-
+        insider = min(replaceable, key=special_course_replacement_key)
+        idx = next(i for i, horse in enumerate(selected) if horse.number == insider.number)
+        selected[idx] = outsider
         selected_numbers.remove(insider.number)
         selected_numbers.add(outsider.number)
         promoted_numbers.add(outsider.number)
-
         outsider.score.upset_boundary_promoted = True
         outsider.score.upset_boundary_rule = "特殊コース実績昇格"
         insider.score.upset_boundary_demoted = True
 
-    # -----------------------------------------------------
-    # 2. 3歳同条件昇級成長馬を最大1頭、優先昇格
-    # -----------------------------------------------------
-    young_selected_numbers = {
-        horse.number
-        for horse in selected
-        if horse.score.young_same_course_step_up_bonus >= 5
-    }
-    promoted_numbers.update(young_selected_numbers)
-
-    young_outsiders = sorted(
-        [
-            horse
-            for horse in original_outsiders
-            if (
-                horse.number not in selected_numbers
-                and horse.score.young_same_course_step_up_bonus >= 5
-            )
-        ],
-        key=young_step_up_promotion_key,
-        reverse=True,
-    )
-
-    young_promotions = 0
-
-    for outsider in young_outsiders:
-        if count_upset_promotions(horses) >= max_replacements:
-            break
-
-        if young_promotions >= UPSET_YOUNG_STEP_UP_MAX_PROMOTIONS:
-            break
-
-        replaceable = [
-            horse
-            for horse in selected
-            if horse.number not in protected_numbers
-            and horse.number not in promoted_numbers
-            and horse.score.young_same_course_step_up_bonus < 5
-        ]
-        if not replaceable:
-            break
-
-        insider = max(
-            replaceable,
-            key=young_step_up_replacement_key,
-        )
-
-        replace_index = next(
-            index
-            for index, horse in enumerate(selected)
-            if horse.number == insider.number
-        )
-        selected[replace_index] = outsider
-
-        selected_numbers.remove(insider.number)
-        selected_numbers.add(outsider.number)
-        promoted_numbers.add(outsider.number)
-
-        outsider.score.upset_boundary_promoted = True
-        outsider.score.upset_boundary_rule = "3歳同条件昇級昇格"
-        insider.score.upset_boundary_demoted = True
-        young_promotions += 1
-
-    replacements_used = count_upset_promotions(horses)
-    remaining_replacements = max(0, max_replacements - replacements_used)
-
-    # -----------------------------------------------------
-    # 3. 残り枠だけ従来の境界判定
-    # -----------------------------------------------------
-    for _ in range(remaining_replacements):
+    remaining = max_replacements - count_upset_promotions(horses)
+    for _ in range(max(0, remaining)):
         qualifying_pairs = []
-
         replaceable = [
-            horse
-            for horse in selected
+            horse for horse in selected
             if horse.number not in protected_numbers
             and horse.number not in promoted_numbers
         ]
-
         for outsider in original_outsiders:
             if outsider.number in selected_numbers:
                 continue
-
             for insider in replaceable:
-                internal_gap = (
-                    insider.score.total
-                    - outsider.score.total
-                )
-
-                if internal_gap > total_gap:
+                gap = insider.score.core_selection_score - outsider.score.core_selection_score
+                if gap > total_gap:
                     continue
-
-                first_gain = (
-                    insider.score.first_place_rank
-                    - outsider.score.first_place_rank
-                )
-                in_money_gain = (
-                    insider.score.in_money_rank
-                    - outsider.score.in_money_rank
-                )
-                first_deficit = (
-                    outsider.score.first_place_rank
-                    - insider.score.first_place_rank
-                )
-
-                standard_rule = (
-                    first_gain > 0
-                    and in_money_gain > 0
-                )
-                partner_rule = (
+                first_gain = insider.score.first_place_rank - outsider.score.first_place_rank
+                in_money_gain = insider.score.in_money_rank - outsider.score.in_money_rank
+                first_deficit = outsider.score.first_place_rank - insider.score.first_place_rank
+                standard = first_gain > 0 and in_money_gain > 0
+                partner = (
                     in_money_gain >= UPSET_PARTNER_IN_MONEY_GAIN
                     and first_deficit <= UPSET_PARTNER_FIRST_DEFICIT
                 )
-
-                if standard_rule:
-                    rule_name = "通常昇格"
-                    rule_priority = 2
-                elif partner_rule:
-                    rule_name = "相手特化昇格"
-                    rule_priority = 1
+                if standard:
+                    rule_name, priority = "通常昇格", 2
+                elif partner:
+                    rule_name, priority = "相手特化昇格", 1
                 else:
                     continue
-
-                qualifying_pairs.append(
-                    (
-                        outsider.score.total,
-                        outsider.score.selection_score,
-                        rule_priority,
-                        in_money_gain,
-                        first_gain,
-                        -abs(internal_gap),
-                        -outsider.popularity,
-                        -outsider.number,
-                        rule_name,
-                        outsider,
-                        insider,
-                    )
-                )
-
+                qualifying_pairs.append((
+                    outsider.score.core_selection_score,
+                    outsider.score.selection_score,
+                    priority,
+                    in_money_gain,
+                    first_gain,
+                    -abs(gap),
+                    -outsider.popularity,
+                    -outsider.number,
+                    rule_name,
+                    outsider,
+                    insider,
+                ))
         if not qualifying_pairs:
             break
-
-        qualifying_pairs.sort(
-            reverse=True,
-            key=lambda row: row[:8],
-        )
-        rule_name = qualifying_pairs[0][-3]
-        outsider = qualifying_pairs[0][-2]
-        insider = qualifying_pairs[0][-1]
-
-        replace_index = next(
-            index
-            for index, horse in enumerate(selected)
-            if horse.number == insider.number
-        )
-        selected[replace_index] = outsider
-
+        qualifying_pairs.sort(reverse=True, key=lambda row: row[:8])
+        rule_name, outsider, insider = qualifying_pairs[0][-3:]
+        idx = next(i for i, horse in enumerate(selected) if horse.number == insider.number)
+        selected[idx] = outsider
         selected_numbers.remove(insider.number)
         selected_numbers.add(outsider.number)
         promoted_numbers.add(outsider.number)
-
         outsider.score.upset_boundary_promoted = True
         outsider.score.upset_boundary_rule = rule_name
         insider.score.upset_boundary_demoted = True
 
     return selected
-
 
 
 def select_mark_pool(
@@ -3887,43 +3592,27 @@ FIRST_PLACE_TIEBREAK_GAP = 1.5
 def first_place_order_key(horse: Horse):
     return (
         horse.score.first_place_score,
-        horse.score.last2_form_score,
-        horse.score.time_index,
-        horse.score.avg5_score,
-        horse.score.ability_index,
+        horse.score.current_form_score,
+        horse.score.same_condition_peak_score,
+        horse.score.base_ability_score,
+        horse.score.pace_style_score,
         -horse.popularity,
         -horse.number,
     )
-
 
 def wins_close_first_place_tiebreak(
     challenger: Horse,
     leader: Horse,
 ) -> bool:
-    """
-    1着期待指数差が1.5以内のときだけ使う最終判定。
-
-    次の3項目すべてで挑戦馬が上なら、1着期待順位を逆転する。
-      ・上級僅差力
-      ・レースレベル
-      ・5走平均順位
-    """
-    gap = (
-        leader.score.first_place_score
-        - challenger.score.first_place_score
-    )
+    """指数差1.5以内で、3つの新グループをすべて上回る馬だけ逆転する。"""
+    gap = leader.score.first_place_score - challenger.score.first_place_score
     if gap < 0 or gap > FIRST_PLACE_TIEBREAK_GAP:
         return False
-
     return (
-        challenger.score.high_class_close_score
-        > leader.score.high_class_close_score
-        and challenger.score.race_level
-        > leader.score.race_level
-        and challenger.score.avg5_rank
-        < leader.score.avg5_rank
+        challenger.score.base_ability_score > leader.score.base_ability_score
+        and challenger.score.condition_performance_score > leader.score.condition_performance_score
+        and challenger.score.current_form_score > leader.score.current_form_score
     )
-
 
 def first_place_tiebreak_decision(
     candidates: List[Horse],
@@ -3965,15 +3654,13 @@ def rank_first_place_candidates(
 def in_money_order_key(horse: Horse):
     return (
         horse.score.in_money_score,
-        horse.score.recent_top3_rate,
-        horse.score.recent_top2_rate,
         horse.score.stability_score,
-        horse.score.avg5_score,
-        horse.score.selection_score,
+        horse.score.condition_performance_score,
+        horse.score.core_selection_score,
+        horse.score.recent_top3_rate,
         -horse.popularity,
         -horse.number,
     )
-
 
 def first_place_support_count(horse: Horse) -> int:
     signals = (
@@ -4604,6 +4291,12 @@ def result_dataframe(selected: List[Horse]) -> pd.DataFrame:
                 "推定脚質": horse.running_style,
                 "能力順位": horse.score.ability_rank,
                 "能力指数": horse.score.ability_index,
+                "基礎能力": horse.score.base_ability_score,
+                "今回条件実績": horse.score.condition_performance_score,
+                "同条件最高内容": horse.score.same_condition_peak_score,
+                "直近状態": horse.score.current_form_score,
+                "展開・脚質": horse.score.pace_style_score,
+                "選定基本点": horse.score.core_selection_score,
                 "1着期待順位": horse.score.first_place_rank,
                 "1着期待指数": horse.score.first_place_score,
                 "僅差判定": (
@@ -4617,10 +4310,6 @@ def result_dataframe(selected: List[Horse]) -> pd.DataFrame:
                     else ""
                 ),
                 "格補正勝ち切り": horse.score.class_adjusted_win_score,
-                "3歳条件替わり": horse.score.young_condition_change_bonus,
-                "3歳軽斤量現級": horse.score.young_lightweight_current_class_bonus,
-                "3歳休養成長": horse.score.young_layoff_growth_bonus,
-                "3歳同条件昇級": horse.score.young_same_course_step_up_bonus,
                 "特殊コース実績": horse.score.special_course_experience_bonus,
                 "上級僅差力": horse.score.high_class_close_score,
                 "馬券内期待順位": horse.score.in_money_rank,
@@ -4651,11 +4340,7 @@ def result_dataframe(selected: List[Horse]) -> pd.DataFrame:
                 "軸タイプ": horse.score.axis_type,
                 "軸判定": "軸禁止" if horse.score.axis_banned else "候補可",
                 "軽斤量補正": horse.score.weight_bonus,
-                "3歳軽斤量現級": horse.score.young_lightweight_current_class_bonus,
-                "3歳休養成長": horse.score.young_layoff_growth_bonus,
-                "3歳同条件昇級": horse.score.young_same_course_step_up_bonus,
                 "特殊コース実績": horse.score.special_course_experience_bonus,
-                "高格勝利補正": horse.score.high_class_win_bonus,
                 "印選定指数": horse.score.selection_score,
                 "生存指数": horse.score.survival_score,
                 "危険度": horse.score.danger_score,
@@ -4679,6 +4364,12 @@ def diagnostic_dataframe(horses: Dict[int, Horse]) -> pd.DataFrame:
                 "内部総合": horse.score.total,
                 "能力指数": horse.score.ability_index,
                 "能力順位": horse.score.ability_rank,
+                "基礎能力": horse.score.base_ability_score,
+                "今回条件実績": horse.score.condition_performance_score,
+                "同条件最高内容": horse.score.same_condition_peak_score,
+                "直近状態": horse.score.current_form_score,
+                "展開・脚質": horse.score.pace_style_score,
+                "選定基本点": horse.score.core_selection_score,
                 "1着期待指数": horse.score.first_place_score,
                 "1着期待順位": horse.score.first_place_rank,
                 "僅差判定": (
@@ -4696,10 +4387,6 @@ def diagnostic_dataframe(horses: Dict[int, Horse]) -> pd.DataFrame:
                     )
                 ),
                 "格補正勝ち切り": horse.score.class_adjusted_win_score,
-                "3歳条件替わり": horse.score.young_condition_change_bonus,
-                "3歳軽斤量現級": horse.score.young_lightweight_current_class_bonus,
-                "3歳休養成長": horse.score.young_layoff_growth_bonus,
-                "3歳同条件昇級": horse.score.young_same_course_step_up_bonus,
                 "特殊コース実績": horse.score.special_course_experience_bonus,
                 "上級僅差力": horse.score.high_class_close_score,
                 "馬券内期待指数": horse.score.in_money_score,
@@ -4719,7 +4406,6 @@ def diagnostic_dataframe(horses: Dict[int, Horse]) -> pd.DataFrame:
                 "斤量": horse.carried_weight,
                 "斤量差": horse.weight_allowance,
                 "軽斤量補正": horse.score.weight_bonus,
-                "高格勝利補正": horse.score.high_class_win_bonus,
                 "馬体増減": horse.weight_change,
                 "休養週": horse.layoff_weeks,
                 "相手弱化": horse.score.transition_bonus,
@@ -4764,9 +4450,12 @@ def clear_inputs():
     st.session_state["upset_mode"] = False
 
 
-st.title("🐎 競馬AI Next v0.6.24 3歳同条件昇級優先昇格版")
+st.title("🐎 競馬AI Next v0.7.0 採点バランス再設計版")
 st.caption(
-    "荒れモードで3歳同条件昇級成長馬を最大1頭、通常境界より先に昇格"
+    "基礎能力・今回条件・直近状態・タイム指数・展開の5グループで重複採点を整理"
+)
+st.caption(
+    "旧3歳専用補正・休養成長補正・同条件昇級補正は停止し、基本採点へ統合しています。"
 )
 
 conditions_text = st.text_input(
@@ -4781,16 +4470,15 @@ upset_mode = st.checkbox(
     key="upset_mode",
     help=(
         "ONにすると、通常は原則除外している9番人気以下も"
-        "7頭選定の候補に含めます。特殊コース実績、"
-        "3歳同条件昇級成長の順で優先昇格し、残り枠では"
-        "従来の通常昇格・相手特化昇格を行います。入れ替えは最大2頭です。"
+        "7頭選定の候補に含めます。新しい選定基本点と期待順位で"
+        "通常昇格・相手特化昇格を行い、特殊コース実績だけを例外優先します。"
     ),
 )
 
 if upset_mode:
     st.warning(
         "荒れレースモード適用中：9番人気以下の消しを解除しています。"
-        "特殊コース実績と3歳同条件昇級成長を優先して境界再判定し、"
+        "選定基本点・1着期待・馬券内期待で境界再判定し、"
         "選定した7頭をすべて馬券対象にします。"
     )
 
@@ -4947,9 +4635,8 @@ if predict_clicked:
     if upset_mode:
         st.warning(
             "この予想は荒れレースモードです。"
-            "9番人気以下も候補に含め、特殊コース実績と"
-            "3歳同条件昇級成長を優先した境界再判定後の7頭を"
-            "すべて馬券対象として表示しています。"
+            "9番人気以下も候補に含め、新しい選定基本点と期待順位で"
+            "境界再判定した7頭をすべて馬券対象として表示しています。"
         )
 
         promoted_horses = [
@@ -5063,7 +4750,7 @@ if predict_clicked:
     if upset_mode:
         st.subheader("予想結果（荒れモード7頭）")
         st.caption(
-            "人気薄の消しを解除し、内部総合差1.5以内で境界再判定します。"
+            "人気薄の消しを解除し、選定基本点差1.5以内で境界再判定します。"
             "期待順位が両方上の通常昇格に加え、馬券内期待が3順位以上上で"
             "1着期待が2順位以内の下までなら相手特化昇格。最大2頭まで入れ替え、"
             "予備へは落としません。"
@@ -5088,8 +4775,8 @@ if predict_clicked:
             "馬券対象は◎・○・▲・△・注・穴の6頭です。"
             " 残留指数は馬券内期待60％・1着期待25％・能力指数15％。"
             "両期待順位が5位以内の馬と軸候補は予備から保護します。"
-            " 1着期待指数差1.5以内では、上級僅差力・レースレベル・"
-            "5走平均順位の3項目をすべて上回る馬を最終的に優先します。"
+            " 1着期待指数差1.5以内では、基礎能力・今回条件実績・"
+            "直近状態の3グループをすべて上回る馬を最終的に優先します。"
         )
 
     st.dataframe(
