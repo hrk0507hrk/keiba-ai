@@ -12,7 +12,7 @@ import streamlit as st
 # =========================================================
 
 st.set_page_config(
-    page_title="競馬AI Next",
+    page_title="競馬AI Ranking",
     page_icon="🐎",
     layout="wide",
 )
@@ -102,6 +102,7 @@ class RaceRecord:
     margin: Optional[float] = None
     passing: str = ""
     last3f: float = 0.0
+    race_time_sec: float = 0.0
 
 
 @dataclass
@@ -134,6 +135,26 @@ class ScoreDetail:
     current_form_score: float = 50.0
     pace_style_score: float = 50.0
     core_selection_score: float = 50.0
+    # Ranking AI v1.0: five independent viewpoints.
+    basic_rank_score: float = 50.0
+    form_rank_score: float = 50.0
+    condition_rank_score: float = 50.0
+    speed_rank_score: float = 50.0
+    pace_rank_score: float = 50.0
+    clock_score: float = 50.0
+    clock_data_count: int = 0
+    basic_rank: int = 0
+    form_rank: int = 0
+    condition_rank: int = 0
+    speed_rank: int = 0
+    pace_rank: int = 0
+    ranking_points: int = 0
+    top5_count: int = 0
+    ai_overall_rank: int = 0
+    average_rank: float = 0.0
+    selection_route: str = ""
+    selection_reason: str = ""
+    value_gap: int = 0
     transition_bonus: float = 0.0
     age_adjustment: float = 0.0
     survival_score: float = 0.0
@@ -555,6 +576,25 @@ def parse_last3f(line: str) -> float:
     return plausible[-1] if plausible else 0.0
 
 
+def parse_race_time(line: str) -> float:
+    """馬柱中の走破時計を秒へ変換する。明示的な時計形式だけを対象にする。"""
+    # 1:34.5 / 0:55.2 など。
+    match = re.search(r"(?<!\d)(\d{1,2}):(\d{2}\.\d)(?!\d)", line)
+    if match:
+        minutes = safe_int(match.group(1), 0)
+        seconds = safe_float(match.group(2), 0.0)
+        total = minutes * 60 + seconds
+        return total if 45.0 <= total <= 300.0 else 0.0
+
+    # 「タイム 55.2」のように明示される短距離形式。
+    match = re.search(r"(?:タイム|時計)\s*[:：]?\s*(\d{2,3}\.\d)", line)
+    if match:
+        total = safe_float(match.group(1), 0.0)
+        return total if 45.0 <= total <= 300.0 else 0.0
+
+    return 0.0
+
+
 def parse_record_conditions(lines: List[str]):
     joined = " ".join(lines).replace("ダート", "ダ")
 
@@ -603,6 +643,7 @@ def record_from_block(lines: List[str]) -> Optional[RaceRecord]:
     margin: Optional[float] = None
     passing = ""
     last3f = 0.0
+    race_time_sec = 0.0
 
     # 着差は通常ブロック最終行にあるため後ろから探す。
     for line in reversed(lines[1:]):
@@ -616,6 +657,9 @@ def record_from_block(lines: List[str]) -> Optional[RaceRecord]:
 
         if not last3f:
             last3f = parse_last3f(line)
+
+        if not race_time_sec:
+            race_time_sec = parse_race_time(line)
 
     # 着順不明時は通過順位を着順として代用しない。
     # 着差が負なら自身が勝ったことだけは確定できるため1着とする。
@@ -637,6 +681,7 @@ def record_from_block(lines: List[str]) -> Optional[RaceRecord]:
         margin=margin,
         passing=passing,
         last3f=last3f,
+        race_time_sec=race_time_sec,
     )
 
 
@@ -4438,6 +4483,725 @@ def diagnostic_dataframe(horses: Dict[int, Horse]) -> pd.DataFrame:
     )
 
 
+
+
+# =========================================================
+# Ranking AI v1.0
+# =========================================================
+
+RANKING_SPECS = (
+    ("基礎能力", "basic_rank_score", "basic_rank"),
+    ("近走状態", "form_rank_score", "form_rank"),
+    ("今回条件適性", "condition_rank_score", "condition_rank"),
+    ("スピード能力", "speed_rank_score", "speed_rank"),
+    ("展開適合", "pace_rank_score", "pace_rank"),
+)
+
+RANKING_POINTS = {1: 5, 2: 4, 3: 3, 4: 2, 5: 1}
+
+
+def weighted_recent_record_score(horse: Horse) -> float:
+    """前走40・2走前25・3走前15を中心に現在の状態を測る。"""
+    if not horse.records:
+        return 40.0
+
+    weights = (0.50, 0.31, 0.19)
+    values = []
+    used = []
+    for index, record in enumerate(horse.records[:3]):
+        values.append(record_performance_score(record) * weights[index])
+        used.append(weights[index])
+    return clamp(sum(values) / sum(used)) if used else 40.0
+
+
+def growth_context_score(horse: Horse) -> float:
+    """成長・休養・馬体変化は近走状態の5％だけに抑える。"""
+    score = 50.0
+    if horse.age == 3:
+        score += 6.0
+    elif horse.age == 4:
+        score += 3.0
+
+    if 2 <= horse.layoff_weeks <= 8:
+        score += 3.0
+    elif 9 <= horse.layoff_weeks <= 16 and horse.age <= 4:
+        score += 1.5
+    elif horse.layoff_weeks >= 26:
+        score -= 8.0
+    elif horse.layoff_weeks >= 18:
+        score -= 4.0
+
+    if horse.weight_change >= 12 and horse.age <= 4:
+        score += 4.0
+    elif horse.weight_change >= 6 and horse.age <= 4:
+        score += 2.0
+    elif horse.weight_change <= -12:
+        score -= 5.0
+
+    return clamp(score)
+
+
+def calculate_basic_ranking_score(horse: Horse) -> float:
+    """格・相手・着差・上級好走・勝ち切りだけを見る。"""
+    recent_top2_score = rate_to_score(
+        horse.score.recent_top2_rate,
+        baseline=45.0,
+        sensitivity=0.75,
+    )
+    return clamp(
+        horse.score.race_level * 0.35
+        + horse.score.high_class_close_score * 0.30
+        + horse.score.class_adjusted_win_score * 0.25
+        + recent_top2_score * 0.10
+    )
+
+
+def calculate_form_ranking_score(horse: Horse) -> float:
+    """古い平均で薄めず、直近3走と上昇度を中心に見る。"""
+    recent_content = weighted_recent_record_score(horse)
+    return clamp(
+        recent_content * 0.80
+        + horse.score.trend_score * 0.15
+        + growth_context_score(horse) * 0.05
+    )
+
+
+def performance_from_records(records: List[RaceRecord]) -> float:
+    """少数実績を消しすぎず、強い1走と平均の両方を残す。"""
+    if not records:
+        return 50.0
+    scores = [record_performance_score(record) for record in records]
+    scores.sort(reverse=True)
+    best = scores[0]
+    mean_top = average(scores[:3], 50.0)
+    raw = best * 0.60 + mean_top * 0.40
+    reliability = 0.90 if len(scores) == 1 else 0.97 if len(scores) == 2 else 1.0
+    return clamp(50.0 + (raw - 50.0) * reliability)
+
+
+def calculate_condition_components(
+    horse: Horse,
+    conditions: RaceConditions,
+) -> Tuple[float, float, float, float, float]:
+    if not horse.records or not has_known_conditions(conditions):
+        return 50.0, 50.0, 50.0, 50.0, 50.0
+
+    same_records = []
+    distance_records = []
+    surface_records = []
+    venue_records = []
+    going_records = []
+
+    for record in horse.records[:5]:
+        same_surface = (
+            not conditions.surface
+            or not record.surface
+            or record.surface == conditions.surface
+        )
+        distance_diff = (
+            abs(record.distance - conditions.distance)
+            if conditions.distance and record.distance
+            else 9999
+        )
+
+        if same_surface and distance_diff <= 200:
+            if not conditions.venue or record.venue == conditions.venue:
+                same_records.append(record)
+
+        if same_surface and distance_diff <= 400:
+            distance_records.append(record)
+
+        if conditions.surface and record.surface == conditions.surface:
+            surface_records.append(record)
+
+        if conditions.venue and record.venue == conditions.venue:
+            venue_records.append(record)
+
+        if conditions.going and record.going == conditions.going:
+            going_records.append(record)
+
+    same_score = performance_from_records(same_records)
+    distance_score = performance_from_records(distance_records)
+    surface_score = performance_from_records(surface_records)
+    venue_score = performance_from_records(venue_records)
+    going_score = performance_from_records(going_records)
+
+    return same_score, distance_score, surface_score, venue_score, going_score
+
+
+def calculate_condition_ranking_score(
+    horse: Horse,
+    conditions: RaceConditions,
+) -> float:
+    same, distance, surface, venue, going = calculate_condition_components(
+        horse,
+        conditions,
+    )
+    return clamp(
+        same * 0.35
+        + distance * 0.25
+        + surface * 0.15
+        + venue * 0.15
+        + going * 0.10
+    )
+
+
+def clock_group_key(record: RaceRecord) -> Tuple[str, int]:
+    if record.distance <= 0:
+        return record.surface or "不明", 0
+    # 100m単位でまとめ、距離違いの時計を直接比較しない。
+    return record.surface or "不明", int(round(record.distance / 100.0) * 100)
+
+
+def calculate_clock_scores(horses: Dict[int, Horse]) -> Tuple[Dict[int, float], Dict[int, int]]:
+    """同じ芝ダート・ほぼ同距離のレース内相対時計。データ不足時は中立。"""
+    groups: Dict[Tuple[str, int], List[float]] = {}
+    for horse in horses.values():
+        for record in horse.records[:5]:
+            if record.race_time_sec > 0 and record.distance > 0:
+                groups.setdefault(clock_group_key(record), []).append(record.race_time_sec)
+
+    scores: Dict[int, float] = {}
+    counts: Dict[int, int] = {}
+    recency_weights = (1.00, 0.85, 0.70, 0.55, 0.40)
+
+    for horse in horses.values():
+        weighted = []
+        used = []
+        for index, record in enumerate(horse.records[:5]):
+            if record.race_time_sec <= 0 or record.distance <= 0:
+                continue
+            peers = groups.get(clock_group_key(record), [])
+            if len(peers) < 3:
+                continue
+            median_value = statistics.median(peers)
+            scale = max(statistics.pstdev(peers) if len(peers) >= 2 else 1.0, 0.35)
+            raw = 65.0 + (median_value - record.race_time_sec) / scale * 10.0
+            weight = recency_weights[index]
+            weighted.append(clamp(raw, 25.0, 95.0) * weight)
+            used.append(weight)
+        scores[horse.number] = clamp(sum(weighted) / sum(used)) if used else 50.0
+        counts[horse.number] = len(used)
+
+    return scores, counts
+
+
+def calculate_speed_ranking_score(
+    horse: Horse,
+    clock_score: float,
+    clock_count: int,
+) -> float:
+    """タイム指数を主軸に、取得できた実時計だけを補助利用する。"""
+    if clock_count <= 0:
+        return clamp(horse.score.time_index)
+    return clamp(horse.score.time_index * 0.80 + clock_score * 0.20)
+
+
+def pace_scenario(front_count: int) -> str:
+    if front_count <= 2:
+        return "スロー想定"
+    if front_count >= 5:
+        return "ハイ想定"
+    return "平均想定"
+
+
+def scenario_style_score(style: str, front_count: int) -> float:
+    scenario = pace_scenario(front_count)
+    tables = {
+        "スロー想定": {"逃げ": 90, "先行": 82, "差し": 58, "追込": 48, "不明": 55},
+        "平均想定": {"逃げ": 72, "先行": 78, "差し": 71, "追込": 60, "不明": 58},
+        "ハイ想定": {"逃げ": 45, "先行": 63, "差し": 84, "追込": 77, "不明": 60},
+    }
+    return float(tables[scenario].get(style, 55))
+
+
+def frame_fit_score(horse: Horse, conditions: RaceConditions) -> float:
+    if horse.frame <= 0:
+        return 50.0
+    score = 50.0
+    if conditions.distance and conditions.distance <= 1400:
+        if horse.running_style in ("逃げ", "先行") and horse.frame <= 4:
+            score += 8.0
+        elif horse.running_style == "追込" and horse.frame >= 6:
+            score += 3.0
+    if conditions.distance and conditions.distance >= 1800:
+        if horse.frame <= 4:
+            score += 3.0
+    return clamp(score)
+
+
+def average_position_content(horse: Horse) -> float:
+    values = [position_content_score(record) for record in horse.records[:5] if record.passing]
+    return average(values, 50.0)
+
+
+def calculate_pace_ranking_score(
+    horse: Horse,
+    conditions: RaceConditions,
+    front_count: int,
+) -> float:
+    return clamp(
+        scenario_style_score(horse.running_style, front_count) * 0.45
+        + average_position_content(horse) * 0.20
+        + horse.score.closing_power * 0.20
+        + frame_fit_score(horse, conditions) * 0.10
+        + horse.score.running_style * 0.05
+    )
+
+
+def ranking_values(horse: Horse) -> List[Tuple[str, float, int]]:
+    return [
+        (label, getattr(horse.score, score_field), getattr(horse.score, rank_field))
+        for label, score_field, rank_field in RANKING_SPECS
+    ]
+
+
+def assign_five_ranks(horses: Dict[int, Horse]) -> None:
+    for _label, score_field, rank_field in RANKING_SPECS:
+        ranked = sorted(
+            horses.values(),
+            key=lambda horse: (
+                getattr(horse.score, score_field),
+                -horse.popularity,
+                -horse.number,
+            ),
+            reverse=True,
+        )
+        for rank, horse in enumerate(ranked, start=1):
+            setattr(horse.score, rank_field, rank)
+
+    for horse in horses.values():
+        ranks = [rank for _label, _score, rank in ranking_values(horse)]
+        horse.score.ranking_points = sum(RANKING_POINTS.get(rank, 0) for rank in ranks)
+        horse.score.top5_count = sum(rank <= 5 for rank in ranks)
+        horse.score.average_rank = round(average(ranks, 99.0), 2)
+
+    overall = sorted(
+        horses.values(),
+        key=lambda horse: (
+            horse.score.ranking_points,
+            horse.score.top5_count,
+            -horse.score.average_rank,
+            horse.score.first_place_score,
+            horse.score.in_money_score,
+            -horse.popularity,
+            -horse.number,
+        ),
+        reverse=True,
+    )
+    for rank, horse in enumerate(overall, start=1):
+        horse.score.ai_overall_rank = rank
+        horse.score.value_gap = (
+            horse.popularity - rank
+            if horse.popularity != 99
+            else 0
+        )
+
+
+def assign_ranking_expectancy(horses: Dict[int, Horse]) -> None:
+    for horse in horses.values():
+        horse.score.first_place_score = round(clamp(
+            horse.score.basic_rank_score * 0.30
+            + horse.score.form_rank_score * 0.25
+            + horse.score.speed_rank_score * 0.25
+            + horse.score.condition_rank_score * 0.15
+            + horse.score.pace_rank_score * 0.05
+        ), 1)
+        horse.score.in_money_score = round(clamp(
+            horse.score.basic_rank_score * 0.20
+            + horse.score.form_rank_score * 0.20
+            + horse.score.condition_rank_score * 0.25
+            + horse.score.speed_rank_score * 0.20
+            + horse.score.pace_rank_score * 0.15
+        ), 1)
+
+    first_ranked = sorted(
+        horses.values(),
+        key=lambda h: (h.score.first_place_score, h.score.ranking_points, -h.popularity),
+        reverse=True,
+    )
+    money_ranked = sorted(
+        horses.values(),
+        key=lambda h: (h.score.in_money_score, h.score.ranking_points, -h.popularity),
+        reverse=True,
+    )
+    for rank, horse in enumerate(first_ranked, 1):
+        horse.score.first_place_rank = rank
+    for rank, horse in enumerate(money_ranked, 1):
+        horse.score.in_money_rank = rank
+
+
+def score_horses_ranking_v1(
+    horses: Dict[int, Horse],
+    conditions: RaceConditions,
+    mode: str,
+) -> Dict[int, Horse]:
+    """五つの独立ランキングを作る新設計。総合点への直接補正は使わない。"""
+    for horse in horses.values():
+        infer_running_style(horse)
+
+    front_count = sum(
+        1 for horse in horses.values()
+        if horse.running_style in ("逃げ", "先行")
+    )
+    assign_weight_allowance(horses)
+    closing_scores = score_closing_power_all(horses)
+    clock_scores, clock_counts = calculate_clock_scores(horses)
+
+    raw_time: Dict[int, float] = {}
+    for horse in horses.values():
+        horse.front_competitors = front_count
+        horse.score.recent_form = round(score_recent_form(horse), 1)
+        horse.score.race_level = round(score_race_level(horse, conditions), 1)
+        horse.score.suitability = round(score_suitability(horse, conditions), 1)
+        horse.score.running_style = round(score_running_style(horse, front_count), 1)
+        horse.score.closing_power = round(closing_scores.get(horse.number, 50.0), 1)
+        horse.score.trend_score = round(calculate_trend_score(horse), 1)
+        horse.score.class_adjusted_win_score = round(
+            calculate_class_adjusted_win_score(horse, conditions), 1
+        )
+        horse.score.high_class_close_score = round(
+            calculate_high_class_close_score(horse, conditions), 1
+        )
+        (
+            horse.score.recent_win_rate,
+            horse.score.recent_top2_rate,
+            horse.score.recent_top3_rate,
+            horse.score.recent_rate_count,
+        ) = recent_finish_rates(horse)
+        raw_time[horse.number] = score_time_index(horse, mode)
+
+    normalized_time = blend_field_scores(
+        raw_time,
+        relative_low=43.0,
+        relative_high=91.0,
+        absolute_weight=0.72,
+    )
+
+    for horse in horses.values():
+        horse.score.time_index = round(normalized_time.get(horse.number, 50.0), 1)
+        horse.score.clock_score = round(clock_scores.get(horse.number, 50.0), 1)
+        horse.score.clock_data_count = clock_counts.get(horse.number, 0)
+
+        horse.score.basic_rank_score = round(calculate_basic_ranking_score(horse), 1)
+        horse.score.form_rank_score = round(calculate_form_ranking_score(horse), 1)
+        horse.score.condition_rank_score = round(
+            calculate_condition_ranking_score(horse, conditions), 1
+        )
+        horse.score.speed_rank_score = round(
+            calculate_speed_ranking_score(
+                horse,
+                horse.score.clock_score,
+                horse.score.clock_data_count,
+            ),
+            1,
+        )
+        horse.score.pace_rank_score = round(
+            calculate_pace_ranking_score(horse, conditions, front_count), 1
+        )
+
+        # 互換表示用。新設計ではこの平均で選定しない。
+        horse.score.total = round(average([
+            horse.score.basic_rank_score,
+            horse.score.form_rank_score,
+            horse.score.condition_rank_score,
+            horse.score.speed_rank_score,
+            horse.score.pace_rank_score,
+        ], 50.0), 1)
+
+    assign_ranking_expectancy(horses)
+    assign_five_ranks(horses)
+    return horses
+
+
+def rank_list(horse: Horse) -> List[int]:
+    return [rank for _label, _score, rank in ranking_values(horse)]
+
+
+def overall_selection_order(horse: Horse):
+    return (
+        horse.score.ranking_points,
+        horse.score.top5_count,
+        -horse.score.average_rank,
+        horse.score.in_money_score,
+        horse.score.first_place_score,
+        -horse.popularity,
+        -horse.number,
+    )
+
+
+def specialist_order(horse: Horse):
+    ranks = sorted(rank_list(horse))
+    return (
+        -ranks[0],
+        -ranks[1],
+        horse.score.ranking_points,
+        horse.score.in_money_score,
+        horse.score.first_place_score,
+        -horse.popularity,
+        -horse.number,
+    )
+
+
+def qualifies_specialist(horse: Horse, field_size: int) -> bool:
+    ranks = sorted(rank_list(horse))
+    bottom_cut = max(8, int(field_size * 0.75 + 0.999))
+    bottom_count = sum(rank >= bottom_cut for rank in ranks)
+    return ranks[0] <= 2 and ranks[1] <= 6 and bottom_count < 4
+
+
+def qualifies_value(horse: Horse) -> bool:
+    if horse.popularity == 99 or horse.popularity < 5:
+        return False
+    ranks = rank_list(horse)
+    return (
+        sum(rank <= 3 for rank in ranks) >= 2
+        or (min(ranks) == 1 and sorted(ranks)[1] <= 5)
+    )
+
+
+def top_ranking_reasons(horse: Horse, limit: int = 2) -> List[str]:
+    items = sorted(ranking_values(horse), key=lambda item: (item[2], -item[1]))
+    return [f"{label}{rank}位" for label, _score, rank in items[:limit]]
+
+
+def select_ranking_v1(horses: Dict[int, Horse]) -> List[Horse]:
+    """総合型4・特化型2・穴価値型1の三つの入口から7頭を選ぶ。"""
+    for horse in horses.values():
+        horse.mark = ""
+        horse.comment = ""
+        horse.score.selection_route = ""
+        horse.score.selection_reason = ""
+
+    all_horses = list(horses.values())
+    if not all_horses:
+        return []
+
+    target_count = min(7, len(all_horses))
+    selected: List[Horse] = []
+    selected_numbers = set()
+
+    overall = sorted(all_horses, key=overall_selection_order, reverse=True)
+
+    # 1) 総合型4頭：複数ランキングで上位。
+    general_candidates = [horse for horse in overall if horse.score.top5_count >= 2]
+    for horse in general_candidates:
+        if len([h for h in selected if h.score.selection_route == "総合型"]) >= min(4, target_count):
+            break
+        horse.score.selection_route = "総合型"
+        selected.append(horse)
+        selected_numbers.add(horse.number)
+
+    # 足りない場合だけポイント上位で補完。
+    for horse in overall:
+        if len([h for h in selected if h.score.selection_route == "総合型"]) >= min(4, target_count):
+            break
+        if horse.number in selected_numbers:
+            continue
+        horse.score.selection_route = "総合型"
+        selected.append(horse)
+        selected_numbers.add(horse.number)
+
+    # 2) 特化型2頭：一つの突出だけでなく、二つ目の裏付けも必要。
+    specialist_candidates = [
+        horse for horse in all_horses
+        if horse.number not in selected_numbers
+        and qualifies_specialist(horse, len(all_horses))
+    ]
+    specialist_candidates.sort(key=specialist_order, reverse=True)
+    for horse in specialist_candidates[:max(0, min(2, target_count - len(selected)))]:
+        horse.score.selection_route = "特化型"
+        selected.append(horse)
+        selected_numbers.add(horse.number)
+
+    # 特化枠が不足したら、未選出の最小順位が優秀な馬で補う。
+    while len([h for h in selected if h.score.selection_route == "特化型"]) < 2 and len(selected) < target_count:
+        remaining = [h for h in all_horses if h.number not in selected_numbers]
+        if not remaining:
+            break
+        horse = max(remaining, key=specialist_order)
+        horse.score.selection_route = "特化型"
+        selected.append(horse)
+        selected_numbers.add(horse.number)
+
+    # 3) 穴価値型1頭：AI順位と人気順位のズレ。
+    if len(selected) < target_count:
+        value_candidates = [
+            horse for horse in all_horses
+            if horse.number not in selected_numbers and qualifies_value(horse)
+        ]
+        if not value_candidates:
+            value_candidates = [
+                horse for horse in all_horses
+                if horse.number not in selected_numbers
+                and horse.popularity != 99
+                and horse.popularity >= 5
+            ]
+        if value_candidates:
+            value_horse = max(
+                value_candidates,
+                key=lambda horse: (
+                    horse.score.value_gap,
+                    horse.score.ranking_points,
+                    horse.score.top5_count,
+                    horse.score.in_money_score,
+                    horse.popularity,
+                ),
+            )
+            value_horse.score.selection_route = "穴価値型"
+            selected.append(value_horse)
+            selected_numbers.add(value_horse.number)
+
+    # 7頭未満なら総合順位で埋める。
+    for horse in overall:
+        if len(selected) >= target_count:
+            break
+        if horse.number in selected_numbers:
+            continue
+        horse.score.selection_route = "補完型"
+        selected.append(horse)
+        selected_numbers.add(horse.number)
+
+    # 選定理由。
+    for horse in selected:
+        reasons = [horse.score.selection_route]
+        reasons.extend(top_ranking_reasons(horse, 2))
+        if horse.score.selection_route == "穴価値型":
+            reasons.append(f"人気{horse.popularity}位−AI{horse.score.ai_overall_rank}位")
+        horse.score.selection_reason = "・".join(reasons)
+        horse.comment = horse.score.selection_reason
+
+    # ◎は1着指数。穴価値馬には可能なら「穴」を固定し、残りは馬券内指数順。
+    first = max(
+        selected,
+        key=lambda horse: (
+            horse.score.first_place_score,
+            horse.score.ranking_points,
+            -horse.popularity,
+        ),
+    )
+    first.mark = "◎"
+
+    value_horse = next(
+        (horse for horse in selected if horse.score.selection_route == "穴価値型"),
+        None,
+    )
+    partners = [horse for horse in selected if horse.number != first.number]
+    partners.sort(
+        key=lambda horse: (
+            horse.score.in_money_score,
+            horse.score.ranking_points,
+            -horse.score.average_rank,
+            -horse.popularity,
+        ),
+        reverse=True,
+    )
+
+    if value_horse is not None and value_horse.number != first.number:
+        value_horse.mark = "穴"
+        normal_partners = [horse for horse in partners if horse.number != value_horse.number]
+        for mark, horse in zip(("○", "▲", "△", "☆", "注"), normal_partners):
+            horse.mark = mark
+    else:
+        for mark, horse in zip(("○", "▲", "△", "☆", "注", "穴"), partners):
+            horse.mark = mark
+
+    mark_order = {mark: index for index, mark in enumerate(MARKS)}
+    return sorted(selected, key=lambda horse: mark_order.get(horse.mark, 99))
+
+
+def ranking_result_dataframe(selected: List[Horse]) -> pd.DataFrame:
+    return pd.DataFrame([
+        {
+            "印": horse.mark,
+            "馬番": horse.number,
+            "馬名": horse.name,
+            "人気": "-" if horse.popularity == 99 else horse.popularity,
+            "選定ルート": horse.score.selection_route,
+            "ランキング点": horse.score.ranking_points,
+            "上位5項目数": horse.score.top5_count,
+            "AI総合順位": horse.score.ai_overall_rank,
+            "基礎能力": f"{horse.score.basic_rank_score:.1f}（{horse.score.basic_rank}位）",
+            "近走状態": f"{horse.score.form_rank_score:.1f}（{horse.score.form_rank}位）",
+            "条件適性": f"{horse.score.condition_rank_score:.1f}（{horse.score.condition_rank}位）",
+            "スピード": f"{horse.score.speed_rank_score:.1f}（{horse.score.speed_rank}位）",
+            "展開適合": f"{horse.score.pace_rank_score:.1f}（{horse.score.pace_rank}位）",
+            "1着期待": horse.score.first_place_score,
+            "馬券内期待": horse.score.in_money_score,
+            "評価理由": horse.score.selection_reason,
+        }
+        for horse in selected
+    ])
+
+
+def ranking_top_dataframe(horses: Dict[int, Horse], score_field: str) -> pd.DataFrame:
+    ranked = sorted(
+        horses.values(),
+        key=lambda horse: (getattr(horse.score, score_field), -horse.popularity),
+        reverse=True,
+    )[:5]
+    return pd.DataFrame([
+        {
+            "順位": rank,
+            "馬番": horse.number,
+            "馬名": horse.name,
+            "人気": "-" if horse.popularity == 99 else horse.popularity,
+            "評価点": getattr(horse.score, score_field),
+            "選定": horse.score.selection_route or "選外",
+        }
+        for rank, horse in enumerate(ranked, 1)
+    ])
+
+
+def ranking_matrix_dataframe(horses: Dict[int, Horse]) -> pd.DataFrame:
+    return pd.DataFrame([
+        {
+            "馬番": horse.number,
+            "馬名": horse.name,
+            "人気": "-" if horse.popularity == 99 else horse.popularity,
+            "基礎能力順位": horse.score.basic_rank,
+            "近走状態順位": horse.score.form_rank,
+            "条件適性順位": horse.score.condition_rank,
+            "スピード順位": horse.score.speed_rank,
+            "展開順位": horse.score.pace_rank,
+            "ランキング点": horse.score.ranking_points,
+            "上位5項目数": horse.score.top5_count,
+            "AI総合順位": horse.score.ai_overall_rank,
+            "人気差": horse.score.value_gap,
+            "選定ルート": horse.score.selection_route or "選外",
+        }
+        for horse in sorted(horses.values(), key=lambda h: h.score.ai_overall_rank)
+    ])
+
+
+def ranking_diagnostic_dataframe(horses: Dict[int, Horse]) -> pd.DataFrame:
+    return pd.DataFrame([
+        {
+            "馬番": horse.number,
+            "馬名": horse.name,
+            "人気": horse.popularity,
+            "基礎能力点": horse.score.basic_rank_score,
+            "近走状態点": horse.score.form_rank_score,
+            "条件適性点": horse.score.condition_rank_score,
+            "スピード点": horse.score.speed_rank_score,
+            "展開適合点": horse.score.pace_rank_score,
+            "タイム指数点": horse.score.time_index,
+            "実時計点": horse.score.clock_score,
+            "時計件数": horse.score.clock_data_count,
+            "レースレベル": horse.score.race_level,
+            "上級僅差力": horse.score.high_class_close_score,
+            "格補正勝ち切り": horse.score.class_adjusted_win_score,
+            "近走内容": horse.score.recent_form,
+            "上昇度": horse.score.trend_score,
+            "脚質": horse.running_style,
+            "上がり評価": horse.score.closing_power,
+            "先行候補数": horse.front_competitors,
+        }
+        for horse in sorted(horses.values(), key=lambda h: h.number)
+    ])
+
+
+
 # =========================================================
 # UI
 # =========================================================
@@ -4447,40 +5211,17 @@ def clear_inputs():
     st.session_state["racecard_input"] = ""
     st.session_state["past_input"] = ""
     st.session_state["timeindex_input"] = ""
-    st.session_state["upset_mode"] = False
 
 
-st.title("🐎 競馬AI Next v0.7.0 採点バランス再設計版")
-st.caption(
-    "基礎能力・今回条件・直近状態・タイム指数・展開の5グループで重複採点を整理"
-)
-st.caption(
-    "旧3歳専用補正・休養成長補正・同条件昇級補正は停止し、基本採点へ統合しています。"
-)
+st.title("🐎 競馬AI Ranking v1.0")
+st.caption("基礎能力・近走状態・今回条件適性・スピード能力・展開適合の5ランキング型")
+st.caption("総合型4頭＋特化型2頭＋穴価値型1頭。初期検証では7頭を削らず全頭表示します。")
 
 conditions_text = st.text_input(
     "レース条件（任意）",
-    placeholder="例：名古屋 B級 ダ1500 良　※分かる項目だけでもOK",
+    placeholder="例：新潟 1勝 芝1800 良　※分かる項目だけでもOK",
     key="conditions_input",
 )
-
-upset_mode = st.checkbox(
-    "荒れレースモード",
-    value=False,
-    key="upset_mode",
-    help=(
-        "ONにすると、通常は原則除外している9番人気以下も"
-        "7頭選定の候補に含めます。新しい選定基本点と期待順位で"
-        "通常昇格・相手特化昇格を行い、特殊コース実績だけを例外優先します。"
-    ),
-)
-
-if upset_mode:
-    st.warning(
-        "荒れレースモード適用中：9番人気以下の消しを解除しています。"
-        "選定基本点・1着期待・馬券内期待で境界再判定し、"
-        "選定した7頭をすべて馬券対象にします。"
-    )
 
 racecard_text = st.text_area(
     "① 出走表",
@@ -4504,20 +5245,10 @@ timeindex_text = st.text_area(
 )
 
 button_col1, button_col2 = st.columns([4, 1])
-
 with button_col1:
-    predict_clicked = st.button(
-        "予想開始",
-        type="primary",
-        use_container_width=True,
-    )
-
+    predict_clicked = st.button("ランキング予想開始", type="primary", use_container_width=True)
 with button_col2:
-    st.button(
-        "クリア",
-        use_container_width=True,
-        on_click=clear_inputs,
-    )
+    st.button("クリア", use_container_width=True, on_click=clear_inputs)
 
 if predict_clicked:
     conditions = merge_conditions(conditions_text, racecard_text)
@@ -4526,13 +5257,10 @@ if predict_clicked:
     horses, time_mode = parse_time_index(timeindex_text, horses)
 
     errors = []
-
     if not horses:
         errors.append("出走表から馬を読み取れませんでした。")
-
     if not any(horse.records for horse in horses.values()):
         errors.append("馬柱の近走データを読み取れませんでした。")
-
     if not any(
         any(value is not None for value in vars(horse.time_index).values())
         for horse in horses.values()
@@ -4542,279 +5270,105 @@ if predict_clicked:
     if errors:
         for error in errors:
             st.error(error)
-
         st.stop()
 
     if not has_known_conditions(conditions):
         st.warning(
-            "レース条件が読み取れなかったため、競馬場格差補正は使用せず、"
-            "条件適性は中立値で判定します。軸精度を上げるには"
-            "「中京 ダ1400 良」のようにレース条件を入力してください。"
-        )
-    elif not conditions.venue:
-        st.info(
-            "開催場が不明なため、競馬場格差・相手弱化の加点は使用しません。"
+            "レース条件が不明なため、今回条件適性ランキングは中立寄りになります。"
+            "『中京 ダ1400 良 1勝』のように入力すると精度を上げられます。"
         )
 
-    horses = score_horses(
-        horses,
-        conditions,
-        time_mode,
-    )
+    horses = score_horses_ranking_v1(horses, conditions, time_mode)
+    selected = select_ranking_v1(horses)
 
-    # 相手7頭は従来条件のまま固定。
-    opponent_pool = select_mark_pool(
-        horses,
-        upset_mode=upset_mode,
-    )
-    opponent_numbers = {horse.number for horse in opponent_pool}
-
-    # 全頭1着期待1位と軸基準を確認する。
-    (
-        confidence_stars,
-        race_difficulty,
-        axis_operation,
-        axis_gap,
-        first_place_candidates,
-        primary_axis,
-    ) = first_place_axis_analysis(list(horses.values()))
-
-    first_place_leader = (
-        first_place_candidates[0]
-        if first_place_candidates
-        else None
-    )
-
-    # 表示印を作る。内部7頭から6頭残留指数で予備を再選定する。
-    selected, reserve_horse = select_marks_with_reserve(
-        horses,
-        upset_mode=upset_mode,
-    )
-    displayed_first_choice = next(
-        (horse for horse in selected if horse.mark == "◎"),
+    first = next((horse for horse in selected if horse.mark == "◎"), None)
+    overall_leader = min(horses.values(), key=lambda h: h.score.ai_overall_rank)
+    value_horse = next(
+        (horse for horse in selected if horse.score.selection_route == "穴価値型"),
         None,
     )
-
-    full_leader_is_outside = (
-        first_place_leader is not None
-        and first_place_leader.number not in opponent_numbers
-    )
-    leader_added_from_outside = (
-        full_leader_is_outside
-        and primary_axis is not None
-        and any(
-            horse.number == first_place_leader.number
-            for horse in selected
-        )
-    )
-    outside_leader_not_added = (
-        full_leader_is_outside
-        and not leader_added_from_outside
-    )
-
-    # 相手期待1位は、実際に馬券対象として残った馬から選ぶ。
-    partner_candidates = [
-        horse
-        for horse in selected
-        if (
-            displayed_first_choice is None
-            or horse.number != displayed_first_choice.number
-        )
-    ]
-    partner_candidates.sort(key=in_money_order_key, reverse=True)
-    best_partner = partner_candidates[0] if partner_candidates else None
-
-    axis_names = (
-        f"{primary_axis.number}番 {primary_axis.name}"
-        if primary_axis is not None
-        else "軸なし"
-    )
+    scenario = pace_scenario(next(iter(horses.values())).front_competitors) if horses else "不明"
 
     st.divider()
-
-    if upset_mode:
-        st.warning(
-            "この予想は荒れレースモードです。"
-            "9番人気以下も候補に含め、新しい選定基本点と期待順位で"
-            "境界再判定した7頭をすべて馬券対象として表示しています。"
+    metric1, metric2, metric3, metric4 = st.columns(4)
+    with metric1:
+        st.metric(
+            "◎ 1着候補",
+            f"{first.number}番 {first.name}" if first else "該当なし",
+            f"1着期待 {first.score.first_place_score:.1f}" if first else "",
         )
-
-        promoted_horses = [
-            horse
-            for horse in horses.values()
-            if horse.score.upset_boundary_promoted
-        ]
-        demoted_horses = [
-            horse
-            for horse in horses.values()
-            if horse.score.upset_boundary_demoted
-        ]
-
-        if promoted_horses:
-            promoted_text = "、".join(
-                f"{horse.number}番 {horse.name}"
-                f"（{horse.score.upset_boundary_rule}）"
-                for horse in promoted_horses
-            )
-            demoted_text = "、".join(
-                f"{horse.number}番 {horse.name}"
-                for horse in demoted_horses
-            )
-            st.caption(
-                f"荒れ境界再判定：昇格 {promoted_text}"
-                + (
-                    f"／降格 {demoted_text}"
-                    if demoted_text
-                    else ""
-                )
-            )
-
-    if selected:
-        summary_col1, summary_col2, summary_col3, summary_col4 = st.columns(4)
-        with summary_col1:
-            if first_place_leader is None:
-                leader_text = "該当なし"
-                leader_delta = ""
-            else:
-                leader_text = (
-                    f"{first_place_leader.number}番 "
-                    f"{first_place_leader.name}"
-                )
-                leader_delta = (
-                    f"1着期待指数 "
-                    f"{first_place_leader.score.first_place_score:.1f}"
-                )
-            st.metric("全頭1着期待1位", leader_text, leader_delta)
-
-        with summary_col2:
-            if best_partner is None:
-                partner_text = "該当なし"
-                partner_delta = ""
-            else:
-                partner_text = f"{best_partner.number}番 {best_partner.name}"
-                partner_delta = (
-                    f"馬券内期待指数 "
-                    f"{best_partner.score.in_money_score:.1f}"
-                )
-            st.metric("相手期待1位", partner_text, partner_delta)
-
-        with summary_col3:
-            st.metric(
-                "軸信頼度",
-                confidence_stars,
-                f"1着期待差 {axis_gap:.1f}",
-            )
-
-        with summary_col4:
-            st.metric("軸運用", axis_operation)
-
-        if primary_axis is not None:
-            outside_note = (
-                " 従来の相手7頭選定外ですが、軸基準を満たしたため追加しています。"
-                if primary_axis.number not in opponent_numbers
-                else ""
-            )
-            st.success(
-                f"単独軸候補は{primary_axis.number}番 "
-                f"{primary_axis.name}。"
-                f"{outside_note}"
-                + (
-                    " 荒れモードのため、境界再判定後の7頭をすべて表示しています。"
-                    if upset_mode
-                    else " ○以下は内部7頭から6頭残留指数で選び直した馬券対象です。"
-                )
-            )
-        elif outside_leader_not_added:
-            displayed_text = (
-                f"{displayed_first_choice.number}番 "
-                f"{displayed_first_choice.name}"
-                if displayed_first_choice is not None
-                else "該当なし"
-            )
-            st.info(
-                "全頭1着期待1位は相手7頭選定外ですが、"
-                "単独軸の絶対基準を満たさないため追加していません。"
-                f" ◎は相手7頭内の1着期待最上位 "
-                f"{displayed_text}です。固定軸推奨ではありません。"
-            )
-        else:
-            st.info(
-                "単独軸の絶対基準を満たさないため軸なしです。"
-                "◎は相手7頭内にいる全頭1着期待1位ですが、"
-                "固定軸推奨ではありません。"
-            )
-
-
-
-
-    if upset_mode:
-        st.subheader("予想結果（荒れモード7頭）")
-        st.caption(
-            "人気薄の消しを解除し、選定基本点差1.5以内で境界再判定します。"
-            "期待順位が両方上の通常昇格に加え、馬券内期待が3順位以上上で"
-            "1着期待が2順位以内の下までなら相手特化昇格。最大2頭まで入れ替え、"
-            "予備へは落としません。"
+    with metric2:
+        st.metric(
+            "ランキング総合1位",
+            f"{overall_leader.number}番 {overall_leader.name}",
+            f"{overall_leader.score.ranking_points}点",
         )
-    elif leader_added_from_outside:
-        st.subheader("予想結果（◎＋相手6頭／予備1頭）")
-        st.caption(
-            "選定外の強い単独軸を◎として追加した例外表示です。"
-            "内部相手7頭を6頭残留指数で再判定し、馬券対象は◎＋相手6頭です。"
+    with metric3:
+        st.metric(
+            "穴価値型",
+            f"{value_horse.number}番 {value_horse.name}" if value_horse else "該当なし",
+            (
+                f"人気差 +{value_horse.score.value_gap}"
+                if value_horse and value_horse.score.value_gap > 0
+                else "人気とのズレ小"
+            ),
         )
-    elif outside_leader_not_added:
-        st.subheader("予想結果（6頭／予備1頭）")
-        st.caption(
-            "全頭1着期待1位は軸基準未達のため追加していません。"
-            "内部7頭選定は維持し、6頭残留指数が最も低い非保護馬を予備へ回しています。"
-            " 指数差1.5以内では3項目の僅差最終判定を適用します。"
-        )
-    else:
-        st.subheader("予想結果（6頭／予備1頭）")
-        st.caption(
-            "内部7頭選定はこれまでどおり維持し、最後に6頭残留指数で予備を再選定します。"
-            "馬券対象は◎・○・▲・△・注・穴の6頭です。"
-            " 残留指数は馬券内期待60％・1着期待25％・能力指数15％。"
-            "両期待順位が5位以内の馬と軸候補は予備から保護します。"
-            " 1着期待指数差1.5以内では、基礎能力・今回条件実績・"
-            "直近状態の3グループをすべて上回る馬を最終的に優先します。"
-        )
+    with metric4:
+        st.metric("展開想定", scenario)
 
+    st.subheader("最終選定 7頭")
+    st.caption(
+        "総合点だけでは選ばず、総合型・特化型・穴価値型の別ルートから拾っています。"
+        "初期検証中は予備へ削らず、選定された7頭をすべて表示します。"
+    )
     st.dataframe(
-        result_dataframe(selected),
+        ranking_result_dataframe(selected),
         use_container_width=True,
         hide_index=True,
     )
 
-    if reserve_horse is not None:
-        with st.expander("予備馬（6頭残留指数で再選定・馬券対象外）", expanded=False):
-            st.caption(
-                "内部7頭には残していますが、馬券内期待60％・1着期待25％・"
-                "能力指数15％の残留指数で予備へ回しています。"
-                "◎・軸候補・1着期待と馬券内期待が両方5位以内の馬は保護します。"
-            )
+    route_counts = {
+        route: sum(h.score.selection_route == route for h in selected)
+        for route in ("総合型", "特化型", "穴価値型", "補完型")
+    }
+    st.caption(
+        "選定内訳："
+        + "／".join(f"{route}{count}頭" for route, count in route_counts.items() if count)
+    )
+
+    st.subheader("5ランキング 上位5頭")
+    tabs = st.tabs([label for label, _score, _rank in RANKING_SPECS])
+    for tab, (label, score_field, _rank_field) in zip(tabs, RANKING_SPECS):
+        with tab:
             st.dataframe(
-                result_dataframe([reserve_horse]),
+                ranking_top_dataframe(horses, score_field),
                 use_container_width=True,
                 hide_index=True,
             )
 
-    with st.expander("読み取り・採点確認"):
-        st.write(
-            f"判定形式："
-            f"{'中央競馬' if time_mode == 'central' else '地方競馬'}"
-        )
-
-        st.write(
-            f"対象条件："
-            f"{conditions.venue or '不明'} "
-            f"{conditions.surface or '不明'}"
-            f"{conditions.distance or '不明'} "
-            f"{conditions.going or '不明'} "
-            f"{conditions.race_class or 'クラス不明'}"
-        )
-
+    with st.expander("全頭ランキング比較", expanded=False):
         st.dataframe(
-            diagnostic_dataframe(horses),
+            ranking_matrix_dataframe(horses),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    with st.expander("読み取り・採点詳細", expanded=False):
+        st.write(
+            f"判定形式：{'中央競馬' if time_mode == 'central' else '地方競馬'}"
+        )
+        st.write(
+            f"対象条件：{conditions.venue or '不明'} "
+            f"{conditions.surface or '不明'}{conditions.distance or '不明'} "
+            f"{conditions.going or '不明'} {conditions.race_class or 'クラス不明'}"
+        )
+        clock_count = sum(h.score.clock_data_count for h in horses.values())
+        st.write(
+            f"比較可能な実時計データ：{clock_count}件。"
+            "不足時はスピード能力をタイム指数中心で計算します。"
+        )
+        st.dataframe(
+            ranking_diagnostic_dataframe(horses),
             use_container_width=True,
             hide_index=True,
         )
