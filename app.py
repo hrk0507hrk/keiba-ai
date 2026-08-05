@@ -22,7 +22,7 @@ st.set_page_config(
 # Config
 # =========================================================
 
-MARKS = ("◎", "○", "▲", "△", "☆", "注", "穴")
+MARKS = ("◎", "○", "▲", "△", "☆", "注", "穴", "補")
 
 VENUES = (
     "札幌", "函館", "福島", "新潟", "東京", "中山", "中京", "京都", "阪神", "小倉",
@@ -420,7 +420,13 @@ def parse_horse_header(line: str) -> Optional[Tuple[int, str]]:
             continue
 
         number = safe_int(match.group(1))
-        name = re.sub(r"[牡牝セ騙]\d+$", "", match.group(2)).strip()
+        raw_name = match.group(2).strip()
+
+        # netkeiba出走表の「枠番 馬番」行を馬名行として誤認しない。
+        if re.fullmatch(r"\d{1,2}", raw_name) or raw_name in {"--", "－", "―"}:
+            continue
+
+        name = re.sub(r"[牡牝セ騙]\d+$", "", raw_name).strip()
 
         if not 1 <= number <= 18:
             continue
@@ -434,16 +440,61 @@ def parse_horse_header(line: str) -> Optional[Tuple[int, str]]:
     return None
 
 
+def racecard_name_candidate(line: str) -> str:
+    """枠番・馬番行の直後から馬名だけを安全に取得する。"""
+    if line in {"--", "－", "―", "編集"}:
+        return ""
+    if re.search(r"20\d{2}[./年]\d{1,2}", line):
+        return ""
+    if any(word in line for word in ("馬メモ", "レース別馬メモ", "全角", "削除保存", "閉じる")):
+        return ""
+
+    # 「ベルガラス」または「ベルガラス 牡5 ...」の先頭語を馬名として扱う。
+    match = re.match(r"^([^\s]+)(?:\s+(?:牡|牝|セ|騙)\d{1,2}|$)", line)
+    if not match:
+        return ""
+
+    name = match.group(1).strip()
+    if re.fullmatch(r"[\d.()+-]+", name):
+        return ""
+    if any(word in name for word in ("人気", "指数", "着", "枠", "斤量", "タイム")):
+        return ""
+    return name
+
+
 def parse_racecard(text: str) -> Dict[int, Horse]:
     horses: Dict[int, Horse] = {}
     current: Optional[Horse] = None
+    pending_number: Optional[int] = None
 
     for line in normalize_lines(text):
+        # netkeiba形式の独立した「枠番 馬番」行。
+        frame_number = re.fullmatch(r"([1-8])\s+([1-9]|1[0-8])", line)
+        if frame_number:
+            frame = safe_int(frame_number.group(1))
+            number = safe_int(frame_number.group(2))
+            current = horses.setdefault(number, Horse(number=number, name=f"{number}番"))
+            current.frame = frame
+            pending_number = number
+            continue
+
+        # 枠番・馬番行の後にある「--」を飛ばし、その次の馬名を紐づける。
+        if pending_number is not None:
+            name = racecard_name_candidate(line)
+            if name:
+                current = horses[pending_number]
+                current.name = name
+                pending_number = None
+            elif line in {"--", "－", "―", "編集"}:
+                continue
+
+        # 「6番 馬名」「6 馬名」など別形式にも対応。
         header = parse_horse_header(line)
         if header:
             number, name = header
             current = horses.setdefault(number, Horse(number=number, name=name))
             current.name = name
+            pending_number = None
 
         if current is None:
             continue
@@ -635,8 +686,30 @@ def parse_record_conditions(lines: List[str]):
     return date, venue, surface, distance, going, race_class
 
 
-def record_from_block(lines: List[str]) -> Optional[RaceRecord]:
+def is_non_start_record(lines: List[str]) -> bool:
+    """取消・除外・取止・中止・失格など、正式に完走していないレースを判定する。"""
     if not lines:
+        return False
+
+    status_tokens = {
+        "取消", "除", "除外", "競走除外", "取", "取止",
+        "中", "中止", "競走中止", "失", "失格",
+    }
+    date_line = normalize_text(lines[0])
+
+    # netkeiba馬柱では「2026.05.05 船橋除」のように日付行末へ付く。
+    if re.search(
+        r"(?:取消|競走除外|除外|除|取止|取|競走中止|中止|中|失格|失)\s*$",
+        date_line,
+    ):
+        return True
+
+    # 別形式で結果が独立行になる場合にも対応。
+    return any(normalize_text(line) in status_tokens for line in lines[1:4])
+
+
+def record_from_block(lines: List[str]) -> Optional[RaceRecord]:
+    if not lines or is_non_start_record(lines):
         return None
 
     finish, finish_known = parse_finish(lines)
@@ -4966,7 +5039,7 @@ def top_ranking_reasons(horse: Horse, limit: int = 2) -> List[str]:
 
 
 def select_ranking_v1(horses: Dict[int, Horse]) -> List[Horse]:
-    """総合型4・特化型2・穴価値型1の三つの入口から7頭を選ぶ。"""
+    """総合型4・特化型2に、条件成立時のみ穴価値型、未成立時は補完型を加えて7頭を選ぶ。"""
     for horse in horses.values():
         horse.mark = ""
         horse.comment = ""
@@ -5024,19 +5097,12 @@ def select_ranking_v1(horses: Dict[int, Horse]) -> List[Horse]:
         selected.append(horse)
         selected_numbers.add(horse.number)
 
-    # 3) 穴価値型1頭：AI順位と人気順位のズレ。
+    # 3) 穴価値型：本来の条件を満たす馬がいる場合だけ選ぶ。
     if len(selected) < target_count:
         value_candidates = [
             horse for horse in all_horses
             if horse.number not in selected_numbers and qualifies_value(horse)
         ]
-        if not value_candidates:
-            value_candidates = [
-                horse for horse in all_horses
-                if horse.number not in selected_numbers
-                and horse.popularity != 99
-                and horse.popularity >= 5
-            ]
         if value_candidates:
             value_horse = max(
                 value_candidates,
@@ -5052,8 +5118,17 @@ def select_ranking_v1(horses: Dict[int, Horse]) -> List[Horse]:
             selected.append(value_horse)
             selected_numbers.add(value_horse.number)
 
-    # 7頭未満なら総合順位で埋める。
-    for horse in overall:
+    # 穴条件が不成立、またはまだ7頭未満ならAI総合順位の上位から補完する。
+    overall_by_ai_rank = sorted(
+        all_horses,
+        key=lambda horse: (
+            horse.score.ai_overall_rank,
+            -horse.score.in_money_score,
+            -horse.score.first_place_score,
+            horse.number,
+        ),
+    )
+    for horse in overall_by_ai_rank:
         if len(selected) >= target_count:
             break
         if horse.number in selected_numbers:
@@ -5068,10 +5143,12 @@ def select_ranking_v1(horses: Dict[int, Horse]) -> List[Horse]:
         reasons.extend(top_ranking_reasons(horse, 2))
         if horse.score.selection_route == "穴価値型":
             reasons.append(f"人気{horse.popularity}位−AI{horse.score.ai_overall_rank}位")
+        elif horse.score.selection_route == "補完型":
+            reasons.append(f"AI総合{horse.score.ai_overall_rank}位")
         horse.score.selection_reason = "・".join(reasons)
         horse.comment = horse.score.selection_reason
 
-    # ◎は1着指数。穴価値馬には可能なら「穴」を固定し、残りは馬券内指数順。
+    # ◎は1着指数。穴価値型または補完型は専用印へ固定し、残りは馬券内指数順。
     first = max(
         selected,
         key=lambda horse: (
@@ -5086,6 +5163,13 @@ def select_ranking_v1(horses: Dict[int, Horse]) -> List[Horse]:
         (horse for horse in selected if horse.score.selection_route == "穴価値型"),
         None,
     )
+    complement_horse = next(
+        (horse for horse in selected if horse.score.selection_route == "補完型"),
+        None,
+    )
+    route_horse = value_horse or complement_horse
+    route_mark = "穴" if value_horse is not None else "補"
+
     partners = [horse for horse in selected if horse.number != first.number]
     partners.sort(
         key=lambda horse: (
@@ -5097,13 +5181,14 @@ def select_ranking_v1(horses: Dict[int, Horse]) -> List[Horse]:
         reverse=True,
     )
 
-    if value_horse is not None and value_horse.number != first.number:
-        value_horse.mark = "穴"
-        normal_partners = [horse for horse in partners if horse.number != value_horse.number]
+    if route_horse is not None and route_horse.number != first.number:
+        route_horse.mark = route_mark
+        normal_partners = [horse for horse in partners if horse.number != route_horse.number]
         for mark, horse in zip(("○", "▲", "△", "☆", "注"), normal_partners):
             horse.mark = mark
     else:
-        for mark, horse in zip(("○", "▲", "△", "☆", "注", "穴"), partners):
+        # 専用ルート馬が◎になった場合は、残る6頭の最後を補助印で表示する。
+        for mark, horse in zip(("○", "▲", "△", "☆", "注", "補"), partners):
             horse.mark = mark
 
     mark_order = {mark: index for index, mark in enumerate(MARKS)}
@@ -5213,9 +5298,9 @@ def clear_inputs():
     st.session_state["timeindex_input"] = ""
 
 
-st.title("🐎 競馬AI Ranking v1.0")
+st.title("🐎 競馬AI Ranking v1.0.1")
 st.caption("基礎能力・近走状態・今回条件適性・スピード能力・展開適合の5ランキング型")
-st.caption("総合型4頭＋特化型2頭＋穴価値型1頭。初期検証では7頭を削らず全頭表示します。")
+st.caption("総合型4頭＋特化型2頭＋穴価値型または補完型1頭。初期検証では7頭を削らず全頭表示します。")
 
 conditions_text = st.text_input(
     "レース条件（任意）",
@@ -5287,6 +5372,11 @@ if predict_clicked:
         (horse for horse in selected if horse.score.selection_route == "穴価値型"),
         None,
     )
+    complement_horse = next(
+        (horse for horse in selected if horse.score.selection_route == "補完型"),
+        None,
+    )
+    value_or_complement = value_horse or complement_horse
     scenario = pace_scenario(next(iter(horses.values())).front_competitors) if horses else "不明"
 
     st.divider()
@@ -5304,21 +5394,32 @@ if predict_clicked:
             f"{overall_leader.score.ranking_points}点",
         )
     with metric3:
+        metric3_label = "穴価値型" if value_horse else "補完型"
+        metric3_delta = (
+            f"人気差 +{value_horse.score.value_gap}"
+            if value_horse and value_horse.score.value_gap > 0
+            else (
+                f"AI総合 {complement_horse.score.ai_overall_rank}位"
+                if complement_horse
+                else "該当なし"
+            )
+        )
         st.metric(
-            "穴価値型",
-            f"{value_horse.number}番 {value_horse.name}" if value_horse else "該当なし",
+            metric3_label,
             (
-                f"人気差 +{value_horse.score.value_gap}"
-                if value_horse and value_horse.score.value_gap > 0
-                else "人気とのズレ小"
+                f"{value_or_complement.number}番 {value_or_complement.name}"
+                if value_or_complement
+                else "該当なし"
             ),
+            metric3_delta,
         )
     with metric4:
         st.metric("展開想定", scenario)
 
     st.subheader("最終選定 7頭")
     st.caption(
-        "総合点だけでは選ばず、総合型・特化型・穴価値型の別ルートから拾っています。"
+        "総合点だけでは選ばず、総合型・特化型に加え、条件成立時のみ穴価値型、"
+        "不成立時はAI総合上位の補完型から拾っています。"
         "初期検証中は予備へ削らず、選定された7頭をすべて表示します。"
     )
     st.dataframe(
