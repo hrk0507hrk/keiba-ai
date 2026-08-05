@@ -158,6 +158,12 @@ class ScoreDetail:
     transition_bonus: float = 0.0
     age_adjustment: float = 0.0
     survival_score: float = 0.0
+    survival_class_component: float = 0.0
+    survival_condition_component: float = 0.0
+    survival_form_component: float = 0.0
+    survival_support_component: float = 0.0
+    survival_risk_component: float = 0.0
+    survival_reason: str = ""
     danger_score: float = 0.0
     recent_peak_score: float = 0.0
     weight_bonus: float = 0.0
@@ -5038,97 +5044,308 @@ def top_ranking_reasons(horse: Horse, limit: int = 2) -> List[str]:
     return [f"{label}{rank}位" for label, _score, rank in items[:limit]]
 
 
-def select_ranking_v1(horses: Dict[int, Horse]) -> List[Horse]:
-    """総合型4・特化型2に、条件成立時のみ穴価値型、未成立時は補完型を加えて7頭を選ぶ。"""
+def survival_margin(record: RaceRecord) -> Optional[float]:
+    """生存判定用の着差。勝利は0秒差、取消・除外などは対象外。"""
+    if not record.finish_known or not (1 <= record.finish < 99):
+        return None
+    if record.finish == 1:
+        return 0.0
+    if record.margin is None:
+        return None
+    return max(0.0, float(record.margin))
+
+
+def calculate_selection_survival_index(
+    horse: Horse,
+    conditions: RaceConditions,
+) -> Tuple[float, List[str]]:
+    """
+    Ranking v1.1の選定用生存指数。
+
+    ランキング順位だけでは拾いにくい、格上実績・今回条件実績・
+    直近上昇を直接評価し、昇級・条件変更・長期休養を減点する。
+    人気は能力判定へ混ぜない。
+    """
+    records = [
+        record for record in horse.records[:5]
+        if survival_margin(record) is not None
+    ]
+    current_level = class_score(conditions.race_class) if conditions.race_class else None
+
+    class_component = 0.0
+    condition_component = 0.0
+    form_component = 0.0
+    support_component = 0.0
+    risk_component = 0.0
+    reasons: List[str] = []
+
+    # 1) 格・絶対能力
+    if current_level is not None:
+        upper_margins: List[float] = []
+        same_margins: List[float] = []
+        same_or_upper_close_count = 0
+
+        for record in records:
+            margin = survival_margin(record)
+            if margin is None or not record.race_class:
+                continue
+            prior_level = class_score(record.race_class)
+            if prior_level > current_level + 1.0:
+                upper_margins.append(margin)
+            elif abs(prior_level - current_level) <= 1.0:
+                same_margins.append(margin)
+            if prior_level >= current_level - 1.0 and margin <= 1.0:
+                same_or_upper_close_count += 1
+
+        if upper_margins:
+            best_upper = min(upper_margins)
+            if best_upper <= 0.5:
+                class_component += 5.0
+                reasons.append("上位クラス0.5秒内")
+            elif best_upper <= 1.0:
+                class_component += 3.0
+                reasons.append("上位クラス1.0秒内")
+
+        if same_margins:
+            best_same = min(same_margins)
+            if best_same <= 0.5:
+                class_component += 4.0
+                reasons.append("同クラス0.5秒内")
+            elif best_same <= 1.0:
+                class_component += 2.0
+                reasons.append("同クラス1.0秒内")
+
+        if same_or_upper_close_count >= 2:
+            class_component += 2.0
+            reasons.append("同格以上で複数好走")
+
+    # 2) 今回条件での実証
+    exact_condition_close = 0
+    same_distance_same_class_close = 0
+    exact_condition_win = False
+    for record in records:
+        margin = survival_margin(record)
+        if margin is None:
+            continue
+
+        same_venue = bool(conditions.venue and record.venue == conditions.venue)
+        same_distance = bool(conditions.distance and record.distance == conditions.distance)
+        same_class = bool(
+            conditions.race_class
+            and record.race_class
+            and abs(class_score(record.race_class) - class_score(conditions.race_class)) <= 1.0
+        )
+
+        if same_venue and same_distance:
+            if margin <= 1.2:
+                exact_condition_close += 1
+            if record.finish == 1:
+                exact_condition_win = True
+
+        if same_distance and same_class and margin <= 1.0:
+            same_distance_same_class_close += 1
+
+    exact_condition_margins = [
+        survival_margin(record)
+        for record in records
+        if conditions.venue
+        and conditions.distance
+        and record.venue == conditions.venue
+        and record.distance == conditions.distance
+    ]
+    exact_condition_margins = [m for m in exact_condition_margins if m is not None]
+
+    if exact_condition_margins and min(exact_condition_margins) <= 0.5:
+        condition_component += 4.0
+        reasons.append("同場同距離0.5秒内")
+    elif same_distance_same_class_close >= 1:
+        condition_component += 3.0
+        reasons.append("同距離同クラス1.0秒内")
+
+    if exact_condition_close >= 2:
+        condition_component += 2.0
+        reasons.append("同条件で複数好走")
+    if exact_condition_win:
+        condition_component += 1.0
+        reasons.append("同条件勝利")
+
+    # 3) 近走上昇・安定
+    margins = [survival_margin(record) for record in records[:3]]
+    margins = [margin for margin in margins if margin is not None]
+    if margins:
+        if margins[0] <= 0.5:
+            form_component += 4.0
+            reasons.append("前走0.5秒内")
+        elif margins[0] <= 1.0:
+            form_component += 2.0
+            reasons.append("前走1.0秒内")
+
+        if sum(margin <= 1.0 for margin in margins) >= 2:
+            form_component += 3.0
+            reasons.append("近3走で2回好走")
+
+        if len(margins) >= 2 and margins[1] - margins[0] >= 1.0:
+            form_component += 1.0
+            reasons.append("前走内容が大幅改善")
+
+        if (
+            len(margins) >= 3
+            and margins[2] > margins[1] > margins[0]
+            and margins[2] - margins[0] >= 0.8
+        ):
+            form_component += 1.0
+            reasons.append("近3走連続改善")
+
+    # 4) 五ランキングによる最低限の裏付け（固定枠ではなく補助材料）
+    ranks = sorted(rank_list(horse))
+    if sum(rank <= 3 for rank in ranks) >= 2:
+        support_component += 2.0
+        reasons.append("複数ランキング上位")
+    elif ranks and ranks[0] <= 2 and len(ranks) >= 2 and ranks[1] <= 6:
+        support_component += 1.0
+        reasons.append("特化＋裏付け")
+
+    # 5) リスク減点
+    latest = records[0] if records else None
+    has_current_level_proof = False
+    if current_level is not None:
+        has_current_level_proof = any(
+            record.race_class
+            and class_score(record.race_class) >= current_level - 1.0
+            and survival_margin(record) is not None
+            and survival_margin(record) <= 1.0
+            for record in records
+        )
+
+    if latest is not None and current_level is not None and latest.race_class:
+        latest_level = class_score(latest.race_class)
+        class_gap = current_level - latest_level
+        if class_gap > 8.0:
+            risk_component += 3.0
+            reasons.append("二段階以上の相手強化")
+        elif class_gap > 1.0 and not has_current_level_proof:
+            risk_component += 2.0
+            reasons.append("昇級実績不足")
+
+    if latest is not None and conditions.distance and latest.distance:
+        distance_change = abs(conditions.distance - latest.distance)
+        if distance_change >= 500:
+            risk_component += 2.0
+            reasons.append("大幅距離変更")
+        if (
+            conditions.venue
+            and latest.venue
+            and conditions.venue != latest.venue
+            and distance_change > 0
+        ):
+            risk_component += 1.0
+            reasons.append("競馬場＋距離変更")
+
+    if horse.layoff_weeks >= 20:
+        risk_component += 2.0
+        reasons.append("長期休養")
+
+    last_two_margins = [survival_margin(record) for record in records[:2]]
+    if (
+        len(last_two_margins) >= 2
+        and all(margin is not None and margin >= 2.0 for margin in last_two_margins)
+    ):
+        risk_component += 2.0
+        reasons.append("近2走大敗")
+
+    score = max(
+        0.0,
+        class_component
+        + condition_component
+        + form_component
+        + support_component
+        - risk_component,
+    )
+
+    horse.score.survival_class_component = round(class_component, 1)
+    horse.score.survival_condition_component = round(condition_component, 1)
+    horse.score.survival_form_component = round(form_component, 1)
+    horse.score.survival_support_component = round(support_component, 1)
+    horse.score.survival_risk_component = round(risk_component, 1)
+    horse.score.survival_score = round(score, 1)
+    horse.score.survival_reason = "・".join(reasons) if reasons else "明確な生存根拠なし"
+    return horse.score.survival_score, reasons
+
+
+def select_ranking_v1(
+    horses: Dict[int, Horse],
+    conditions: RaceConditions,
+) -> List[Horse]:
+    """
+    Ranking v1.1 選定強化版。
+
+    AI総合上位4頭を確保し、残り3枠は未選定馬全頭の生存指数で競わせる。生存指数4点未満しか残らない場合だけAI総合順位で補完する。
+    特化型・穴価値型・補完型の固定枠は廃止し、それぞれの根拠を
+    生存指数の構成要素として取り込む。
+    """
     for horse in horses.values():
         horse.mark = ""
         horse.comment = ""
         horse.score.selection_route = ""
         horse.score.selection_reason = ""
+        horse.score.survival_score = 0.0
+        horse.score.survival_reason = ""
+        calculate_selection_survival_index(horse, conditions)
 
     all_horses = list(horses.values())
     if not all_horses:
         return []
 
     target_count = min(7, len(all_horses))
+    general_count = min(4, target_count)
     selected: List[Horse] = []
     selected_numbers = set()
 
-    overall = sorted(all_horses, key=overall_selection_order, reverse=True)
-
-    # 1) 総合型4頭：複数ランキングで上位。
-    general_candidates = [horse for horse in overall if horse.score.top5_count >= 2]
-    for horse in general_candidates:
-        if len([h for h in selected if h.score.selection_route == "総合型"]) >= min(4, target_count):
-            break
-        horse.score.selection_route = "総合型"
-        selected.append(horse)
-        selected_numbers.add(horse.number)
-
-    # 足りない場合だけポイント上位で補完。
-    for horse in overall:
-        if len([h for h in selected if h.score.selection_route == "総合型"]) >= min(4, target_count):
-            break
-        if horse.number in selected_numbers:
-            continue
-        horse.score.selection_route = "総合型"
-        selected.append(horse)
-        selected_numbers.add(horse.number)
-
-    # 2) 特化型2頭：一つの突出だけでなく、二つ目の裏付けも必要。
-    specialist_candidates = [
-        horse for horse in all_horses
-        if horse.number not in selected_numbers
-        and qualifies_specialist(horse, len(all_horses))
-    ]
-    specialist_candidates.sort(key=specialist_order, reverse=True)
-    for horse in specialist_candidates[:max(0, min(2, target_count - len(selected)))]:
-        horse.score.selection_route = "特化型"
-        selected.append(horse)
-        selected_numbers.add(horse.number)
-
-    # 特化枠が不足したら、未選出の最小順位が優秀な馬で補う。
-    while len([h for h in selected if h.score.selection_route == "特化型"]) < 2 and len(selected) < target_count:
-        remaining = [h for h in all_horses if h.number not in selected_numbers]
-        if not remaining:
-            break
-        horse = max(remaining, key=specialist_order)
-        horse.score.selection_route = "特化型"
-        selected.append(horse)
-        selected_numbers.add(horse.number)
-
-    # 3) 穴価値型：本来の条件を満たす馬がいる場合だけ選ぶ。
-    if len(selected) < target_count:
-        value_candidates = [
-            horse for horse in all_horses
-            if horse.number not in selected_numbers and qualifies_value(horse)
-        ]
-        if value_candidates:
-            value_horse = max(
-                value_candidates,
-                key=lambda horse: (
-                    horse.score.value_gap,
-                    horse.score.ranking_points,
-                    horse.score.top5_count,
-                    horse.score.in_money_score,
-                    horse.popularity,
-                ),
-            )
-            value_horse.score.selection_route = "穴価値型"
-            selected.append(value_horse)
-            selected_numbers.add(value_horse.number)
-
-    # 穴条件が不成立、またはまだ7頭未満ならAI総合順位の上位から補完する。
-    overall_by_ai_rank = sorted(
+    # 1) AI総合上位4頭を総合型として確保。
+    ai_order = sorted(
         all_horses,
         key=lambda horse: (
             horse.score.ai_overall_rank,
+            -horse.score.ranking_points,
             -horse.score.in_money_score,
-            -horse.score.first_place_score,
             horse.number,
         ),
     )
-    for horse in overall_by_ai_rank:
+    for horse in ai_order[:general_count]:
+        horse.score.selection_route = "総合型"
+        selected.append(horse)
+        selected_numbers.add(horse.number)
+
+    # 2) 残り3枠は、格・条件・近走・リスクをまとめた生存指数で選ぶ。
+    survival_candidates = [
+        horse for horse in all_horses
+        if horse.number not in selected_numbers
+    ]
+    survival_candidates.sort(
+        key=lambda horse: (
+            horse.score.survival_score,
+            horse.score.survival_class_component
+            + horse.score.survival_condition_component
+            + horse.score.survival_form_component,
+            horse.score.in_money_score,
+            -horse.score.ai_overall_rank,
+            horse.score.ranking_points,
+            -horse.number,
+        ),
+        reverse=True,
+    )
+
+    for horse in survival_candidates:
+        if len(selected) >= target_count:
+            break
+        if horse.score.survival_score < 4.0:
+            continue
+        horse.score.selection_route = "生存型"
+        selected.append(horse)
+        selected_numbers.add(horse.number)
+
+    # 生存指数4点以上が3頭に満たない場合だけ、AI総合順位で不足分を補う。
+    for horse in ai_order:
         if len(selected) >= target_count:
             break
         if horse.number in selected_numbers:
@@ -5139,16 +5356,30 @@ def select_ranking_v1(horses: Dict[int, Horse]) -> List[Horse]:
 
     # 選定理由。
     for horse in selected:
-        reasons = [horse.score.selection_route]
-        reasons.extend(top_ranking_reasons(horse, 2))
-        if horse.score.selection_route == "穴価値型":
-            reasons.append(f"人気{horse.popularity}位−AI{horse.score.ai_overall_rank}位")
-        elif horse.score.selection_route == "補完型":
-            reasons.append(f"AI総合{horse.score.ai_overall_rank}位")
+        if horse.score.selection_route == "総合型":
+            reasons = [
+                "総合型",
+                f"AI総合{horse.score.ai_overall_rank}位",
+                *top_ranking_reasons(horse, 2),
+            ]
+            if horse.score.survival_score >= 4:
+                reasons.append(f"生存指数{horse.score.survival_score:.1f}")
+        elif horse.score.selection_route == "生存型":
+            reasons = [
+                "生存型",
+                f"生存指数{horse.score.survival_score:.1f}",
+                horse.score.survival_reason,
+            ]
+        else:
+            reasons = [
+                "補完型",
+                f"AI総合{horse.score.ai_overall_rank}位",
+                f"生存指数{horse.score.survival_score:.1f}",
+            ]
         horse.score.selection_reason = "・".join(reasons)
         horse.comment = horse.score.selection_reason
 
-    # ◎は1着指数。穴価値型または補完型は専用印へ固定し、残りは馬券内指数順。
+    # ◎ロジックは検証を分離するため現行の1着期待指数を維持。
     first = max(
         selected,
         key=lambda horse: (
@@ -5159,37 +5390,19 @@ def select_ranking_v1(horses: Dict[int, Horse]) -> List[Horse]:
     )
     first.mark = "◎"
 
-    value_horse = next(
-        (horse for horse in selected if horse.score.selection_route == "穴価値型"),
-        None,
-    )
-    complement_horse = next(
-        (horse for horse in selected if horse.score.selection_route == "補完型"),
-        None,
-    )
-    route_horse = value_horse or complement_horse
-    route_mark = "穴" if value_horse is not None else "補"
-
     partners = [horse for horse in selected if horse.number != first.number]
     partners.sort(
         key=lambda horse: (
             horse.score.in_money_score,
             horse.score.ranking_points,
+            horse.score.survival_score,
             -horse.score.average_rank,
             -horse.popularity,
         ),
         reverse=True,
     )
-
-    if route_horse is not None and route_horse.number != first.number:
-        route_horse.mark = route_mark
-        normal_partners = [horse for horse in partners if horse.number != route_horse.number]
-        for mark, horse in zip(("○", "▲", "△", "☆", "注"), normal_partners):
-            horse.mark = mark
-    else:
-        # 専用ルート馬が◎になった場合は、残る6頭の最後を補助印で表示する。
-        for mark, horse in zip(("○", "▲", "△", "☆", "注", "補"), partners):
-            horse.mark = mark
+    for mark, horse in zip(("○", "▲", "△", "☆", "注", "補"), partners):
+        horse.mark = mark
 
     mark_order = {mark: index for index, mark in enumerate(MARKS)}
     return sorted(selected, key=lambda horse: mark_order.get(horse.mark, 99))
@@ -5206,6 +5419,7 @@ def ranking_result_dataframe(selected: List[Horse]) -> pd.DataFrame:
             "ランキング点": horse.score.ranking_points,
             "上位5項目数": horse.score.top5_count,
             "AI総合順位": horse.score.ai_overall_rank,
+            "生存指数": horse.score.survival_score,
             "基礎能力": f"{horse.score.basic_rank_score:.1f}（{horse.score.basic_rank}位）",
             "近走状態": f"{horse.score.form_rank_score:.1f}（{horse.score.form_rank}位）",
             "条件適性": f"{horse.score.condition_rank_score:.1f}（{horse.score.condition_rank}位）",
@@ -5252,6 +5466,7 @@ def ranking_matrix_dataframe(horses: Dict[int, Horse]) -> pd.DataFrame:
             "ランキング点": horse.score.ranking_points,
             "上位5項目数": horse.score.top5_count,
             "AI総合順位": horse.score.ai_overall_rank,
+            "生存指数": horse.score.survival_score,
             "人気差": horse.score.value_gap,
             "選定ルート": horse.score.selection_route or "選外",
         }
@@ -5281,6 +5496,13 @@ def ranking_diagnostic_dataframe(horses: Dict[int, Horse]) -> pd.DataFrame:
             "脚質": horse.running_style,
             "上がり評価": horse.score.closing_power,
             "先行候補数": horse.front_competitors,
+            "生存指数": horse.score.survival_score,
+            "格・絶対能力": horse.score.survival_class_component,
+            "今回条件実証": horse.score.survival_condition_component,
+            "近走上昇安定": horse.score.survival_form_component,
+            "ランキング裏付け": horse.score.survival_support_component,
+            "リスク減点": horse.score.survival_risk_component,
+            "生存根拠": horse.score.survival_reason,
         }
         for horse in sorted(horses.values(), key=lambda h: h.number)
     ])
@@ -5298,9 +5520,9 @@ def clear_inputs():
     st.session_state["timeindex_input"] = ""
 
 
-st.title("🐎 競馬AI Ranking v1.0.1")
+st.title("🐎 競馬AI Ranking v1.1")
 st.caption("基礎能力・近走状態・今回条件適性・スピード能力・展開適合の5ランキング型")
-st.caption("総合型4頭＋特化型2頭＋穴価値型または補完型1頭。初期検証では7頭を削らず全頭表示します。")
+st.caption("AI総合上位4頭＋生存指数上位3頭。格・同条件・近走上昇を使って7頭選定を強化します。")
 
 conditions_text = st.text_input(
     "レース条件（任意）",
@@ -5364,19 +5586,15 @@ if predict_clicked:
         )
 
     horses = score_horses_ranking_v1(horses, conditions, time_mode)
-    selected = select_ranking_v1(horses)
+    selected = select_ranking_v1(horses, conditions)
 
     first = next((horse for horse in selected if horse.mark == "◎"), None)
     overall_leader = min(horses.values(), key=lambda h: h.score.ai_overall_rank)
-    value_horse = next(
-        (horse for horse in selected if horse.score.selection_route == "穴価値型"),
-        None,
+    rescue_horse = max(
+        (horse for horse in selected if horse.score.selection_route != "総合型"),
+        key=lambda horse: horse.score.survival_score,
+        default=None,
     )
-    complement_horse = next(
-        (horse for horse in selected if horse.score.selection_route == "補完型"),
-        None,
-    )
-    value_or_complement = value_horse or complement_horse
     scenario = pace_scenario(next(iter(horses.values())).front_competitors) if horses else "不明"
 
     st.divider()
@@ -5394,33 +5612,26 @@ if predict_clicked:
             f"{overall_leader.score.ranking_points}点",
         )
     with metric3:
-        metric3_label = "穴価値型" if value_horse else "補完型"
-        metric3_delta = (
-            f"人気差 +{value_horse.score.value_gap}"
-            if value_horse and value_horse.score.value_gap > 0
-            else (
-                f"AI総合 {complement_horse.score.ai_overall_rank}位"
-                if complement_horse
-                else "該当なし"
-            )
-        )
         st.metric(
-            metric3_label,
+            rescue_horse.score.selection_route if rescue_horse else "救済枠",
             (
-                f"{value_or_complement.number}番 {value_or_complement.name}"
-                if value_or_complement
+                f"{rescue_horse.number}番 {rescue_horse.name}"
+                if rescue_horse
                 else "該当なし"
             ),
-            metric3_delta,
+            (
+                f"生存指数 {rescue_horse.score.survival_score:.1f}"
+                if rescue_horse
+                else ""
+            ),
         )
     with metric4:
         st.metric("展開想定", scenario)
 
     st.subheader("最終選定 7頭")
     st.caption(
-        "総合点だけでは選ばず、総合型・特化型に加え、条件成立時のみ穴価値型、"
-        "不成立時はAI総合上位の補完型から拾っています。"
-        "初期検証中は予備へ削らず、選定された7頭をすべて表示します。"
+        "AI総合上位4頭を確保し、残り3頭は格・今回条件実績・近走上昇・リスクを"
+        "まとめた生存指数で選びます。4点未満しか残らない場合だけAI総合順位で補完します。"
     )
     st.dataframe(
         ranking_result_dataframe(selected),
@@ -5430,12 +5641,44 @@ if predict_clicked:
 
     route_counts = {
         route: sum(h.score.selection_route == route for h in selected)
-        for route in ("総合型", "特化型", "穴価値型", "補完型")
+        for route in ("総合型", "生存型", "補完型")
     }
     st.caption(
         "選定内訳："
         + "／".join(f"{route}{count}頭" for route, count in route_counts.items() if count)
     )
+
+    # 7頭目と選外最上位の生存指数が僅差なら、難解レースとして警戒馬を表示。
+    selected_rescue = [
+        horse for horse in selected
+        if horse.score.selection_route != "総合型"
+    ]
+    unselected = [
+        horse for horse in horses.values()
+        if not horse.score.selection_route
+    ]
+    boundary_selected = min(
+        selected_rescue,
+        key=lambda horse: horse.score.survival_score,
+        default=None,
+    )
+    boundary_watch = max(
+        unselected,
+        key=lambda horse: (
+            horse.score.survival_score,
+            horse.score.in_money_score,
+            -horse.score.ai_overall_rank,
+        ),
+        default=None,
+    )
+    if boundary_selected and boundary_watch:
+        boundary_gap = boundary_selected.score.survival_score - boundary_watch.score.survival_score
+        if boundary_watch.score.survival_score >= 3.0 and boundary_gap <= 1.5:
+            st.warning(
+                f"選外警戒馬：{boundary_watch.number}番 {boundary_watch.name} "
+                f"（生存指数{boundary_watch.score.survival_score:.1f}／"
+                f"7頭目との差{boundary_gap:.1f}）。選定境界が僅差です。"
+            )
 
     st.subheader("5ランキング 上位5頭")
     tabs = st.tabs([label for label, _score, _rank in RANKING_SPECS])
