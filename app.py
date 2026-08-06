@@ -6036,98 +6036,67 @@ def format_number_group(numbers: List[int], sep: str = ".") -> str:
 
 
 def build_betting_plan(selected: List[Horse], axis_grade: str) -> Dict[str, object]:
+    """投稿用の買い目を、指定されたシンプルな3系統に整理する。"""
     axis = find_mark_horse(selected, "◎") or selected[0]
-    others = [horse for horse in selected if horse.number != axis.number]
-    others_sorted = sorted(
-        others,
-        key=lambda horse: MARKS.index(horse.mark) if horse.mark in MARKS else 99,
-    )
+    circle = find_mark_horse(selected, "○")
+    triangle = find_mark_horse(selected, "▲")
+    delta = find_mark_horse(selected, "△")
 
-    if axis_grade == "軸なし":
-        box = [horse.number for horse in selected[:4]]
-        return {
-            "mode": "box",
-            "axis": axis.number,
-            "box": box,
-        }
+    top_opponents = [
+        horse.number
+        for horse in (circle, triangle, delta)
+        if horse is not None and horse.number != axis.number
+    ]
 
-    second_group = [horse.number for horse in others_sorted[:3]]
-    if len(second_group) < 3:
-        second_group = [horse.number for horse in others_sorted]
+    # ◎○▲△以外の選定馬は、投稿上ではまとめて「穴」として扱う。
+    hole_horses = [
+        horse.number
+        for horse in selected
+        if horse.number != axis.number
+        and horse.mark not in ("○", "▲", "△")
+    ]
 
-    third_group = [horse.number for horse in others_sorted[:5]]
-    if len(third_group) < len(second_group):
-        third_group = second_group[:]
-
-    trio_third = [axis.number] + third_group
-    trio_third = list(dict.fromkeys(trio_third))
+    third_group = []
+    if delta is not None and delta.number != axis.number:
+        third_group.append(delta.number)
+    third_group.extend(hole_horses)
+    third_group = list(dict.fromkeys(third_group))
 
     return {
-        "mode": "axis",
         "axis": axis.number,
-        "second_group": second_group,
+        "top_opponents": top_opponents,
         "third_group": third_group,
-        "trio_third": trio_third,
+        "hole_horses": hole_horses,
     }
 
 
 def betting_plan_lines(plan: Dict[str, object], axis_grade: str, style: str = "x") -> List[str]:
-    if plan.get("mode") == "box":
-        box = plan.get("box", [])
-        box_str = format_number_group(box)
-        if style == "x":
-            return [
-                f"ワイドBOX {box_str}",
-                f"馬連BOX {box_str}",
-                f"3連複BOX {box_str}",
-            ]
-        return [
-            "【ワイドBOX】",
-            box_str,
-            "",
-            "【馬連BOX】",
-            box_str,
-            "",
-            "【3連複BOX】",
-            box_str,
-        ]
-
+    """単複・馬連ワイド・三連系だけを出力する。保険買い目は作らない。"""
     axis = int(plan["axis"])
-    second_group = format_number_group(plan.get("second_group", []))
+    top_opponents = format_number_group(plan.get("top_opponents", []))
     third_group = format_number_group(plan.get("third_group", []))
-    trio_third = format_number_group(plan.get("trio_third", []))
 
     if style == "x":
-        lines = []
-        if axis_grade in ("A", "B"):
-            lines.append(f"単勝 {axis}")
-        else:
-            lines.append(f"複勝 {axis}")
-        lines.append(f"馬連/ワイド {axis}-{second_group}")
-        lines.append(f"3連複 {axis}-{second_group}-{trio_third}")
-        if axis_grade in ("A", "B", "C"):
-            lines.append(f"3連単 {axis}→{third_group}（1頭軸マルチ）")
-        return lines
+        return [
+            f"単勝/複勝 {axis}",
+            f"馬連/ワイド {axis}＝{top_opponents}",
+            f"3連複 {axis}－{top_opponents}－{third_group}",
+            f"3連単 {axis}→{top_opponents}→{third_group}",
+        ]
 
-    lines = []
-    if axis_grade in ("A", "B"):
-        lines.extend(["【単勝・複勝】", str(axis), ""])
-    else:
-        lines.extend(["【複勝】", str(axis), ""])
-    lines.extend([
+    return [
+        "【単勝・複勝】",
+        str(axis),
+        "",
         "【馬連・ワイド】",
-        f"{axis}－{second_group}",
+        f"{axis}＝{top_opponents}",
         "",
         "【3連複】",
-        f"{axis}－{second_group}－{trio_third}",
+        f"{axis}－{top_opponents}－{third_group}",
         "",
-    ])
-    if axis_grade in ("A", "B", "C"):
-        lines.extend([
-            "【3連単】",
-            f"{axis}→{third_group}（1頭軸マルチ）",
-        ])
-    return lines
+        "【3連単】",
+        f"{axis}→{top_opponents}→{third_group}",
+    ]
 
 
 def build_x_post_text(
@@ -6147,7 +6116,7 @@ def build_x_post_text(
         lines.append(f"{horse.mark}{horse.number} {horse.name}")
     remainder = [horse.number for horse in selected[4:]]
     if remainder:
-        lines.append(f"△候補 {format_number_group(remainder)}")
+        lines.append(f"穴 {format_number_group(remainder)}")
 
     lines.extend(["", "買い目"])
     lines.extend(betting_plan_lines(plan, axis_grade, style="x"))
@@ -6205,7 +6174,8 @@ def build_note_post_text(
     for horse in selected:
         if horse.number == first.number:
             continue
-        lines.append(f"{horse.mark}{horse.number} {horse.name}")
+        display_mark = horse.mark if horse.mark in ("○", "▲", "△") else "穴"
+        lines.append(f"{display_mark}{horse.number} {horse.name}")
 
     lines.extend([
         "",
@@ -6246,9 +6216,9 @@ def clear_inputs():
     st.session_state["post_title_input"] = ""
 
 
-st.title("🐎 競馬AI Ranking v1.0.8")
+st.title("🐎 競馬AI Ranking v1.0.10")
 st.caption("基礎能力・近走状態・今回条件適性・スピード能力・展開適合の5ランキング型")
-st.caption("有効な5項目1位を保護してAI総合上位で7頭まで補完。展開矛盾軸ガードに加え、X・NOTE投稿文と買い目を自動生成。")
+st.caption("有効な5項目1位を保護してAI総合上位で7頭まで補完。展開矛盾軸ガードに加え、X・NOTE投稿文と、単複・馬連ワイド・三連系のシンプルな買い目を自動生成。")
 
 conditions_text = st.text_input(
     "レース条件（任意）",
