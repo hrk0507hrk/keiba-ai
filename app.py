@@ -1,3 +1,4 @@
+import math
 import re
 import statistics
 from dataclasses import dataclass, field
@@ -208,6 +209,10 @@ class ScoreDetail:
     local_class_condition_adjustment: float = 0.0
     local_mixed_unproven: bool = False
     local_class_note: str = ""
+    # v1.0.6: 極端な展開想定と◎候補の脚質が真逆の場合の軸専用ガード。
+    pace_axis_conflict: bool = False
+    pace_axis_penalty: float = 0.0
+    pace_axis_conflict_note: str = ""
     upset_boundary_promoted: bool = False
     upset_boundary_demoted: bool = False
     upset_boundary_rule: str = ""
@@ -5283,19 +5288,102 @@ def assign_ranking_expectancy(
         horse.score.in_money_rank = rank
 
 
+
+def apply_selected_pace_axis_guard(
+    selected: List[Horse],
+    field_size: int,
+) -> None:
+    """
+    v1.0.6 展開矛盾軸ガード。
+
+    最終選定と印は変えず、実際に◎となった馬だけを対象にする。
+    明確なハイ想定で逃げ・先行、または明確なスロー想定で追込なのに、
+    展開順位が全頭の下位20%なら◎補正を-2し、軸Aを禁止する。
+    """
+    for horse in selected:
+        horse.score.pace_axis_conflict = False
+        horse.score.pace_axis_penalty = 0.0
+        horse.score.pace_axis_conflict_note = ""
+
+    first = next((horse for horse in selected if horse.mark == "◎"), None)
+    if first is None or field_size <= 0 or first.score.pace_rank <= 0:
+        return
+
+    scenario = pace_scenario(first.front_competitors)
+    bottom_count = max(1, math.ceil(field_size * 0.20))
+    bottom_cut = max(1, field_size - bottom_count + 1)
+
+    conflict = False
+    style_reason = ""
+    if (
+        scenario == "ハイ想定"
+        and first.running_style in ("逃げ", "先行")
+        and first.score.pace_rank >= bottom_cut
+    ):
+        conflict = True
+        style_reason = f"ハイ想定×{first.running_style}"
+    elif (
+        scenario == "スロー想定"
+        and first.running_style == "追込"
+        and first.score.pace_rank >= bottom_cut
+    ):
+        conflict = True
+        style_reason = "スロー想定×追込"
+
+    if not conflict:
+        return
+
+    penalty = -2.0
+    first.score.pace_axis_conflict = True
+    first.score.pace_axis_penalty = penalty
+    first.score.pace_axis_conflict_note = (
+        f"{style_reason}・展開{first.score.pace_rank}位/全{field_size}頭"
+        f"（下位20%）"
+    )
+    first.score.first_place_adjustment = round(
+        clamp(first.score.first_place_adjustment + penalty, -8.0, 8.0),
+        1,
+    )
+    first.score.first_place_score = round(
+        clamp(first.score.first_place_score + penalty),
+        1,
+    )
+
+    caution = f"軸展開注意:{first.score.pace_axis_conflict_note}・補正{penalty:+.0f}"
+    if caution not in first.score.selection_reason:
+        first.score.selection_reason = "・".join(
+            part for part in (first.score.selection_reason, caution) if part
+        )
+        first.comment = first.score.selection_reason
+
 def ranking_axis_judgement(horses: List[Horse]) -> Tuple[str, str, float, float]:
     """◎候補と、実際に軸として使えるかを分離する。"""
-    ranked = sorted(
-        horses,
+    if not horses:
+        return "軸なし", "見送り", 0.0, 0.0
+
+    # v1.0.6では展開矛盾補正後も印を変えないため、実際の◎を判定対象に固定する。
+    first = next((horse for horse in horses if horse.mark == "◎"), None)
+    if first is None:
+        first = max(
+            horses,
+            key=lambda h: (h.score.first_place_score, h.score.ranking_points, -h.popularity),
+        )
+
+    others = sorted(
+        (horse for horse in horses if horse.number != first.number),
         key=lambda h: (h.score.first_place_score, h.score.ranking_points, -h.popularity),
         reverse=True,
     )
-    if not ranked:
-        return "軸なし", "見送り", 0.0, 0.0
-
-    first = ranked[0]
-    second = ranked[1].score.first_place_score if len(ranked) >= 2 else first.score.first_place_score - 10
-    third = ranked[2].score.first_place_score if len(ranked) >= 3 else second - 5
+    second = (
+        others[0].score.first_place_score
+        if len(others) >= 1
+        else first.score.first_place_score - 10
+    )
+    third = (
+        others[1].score.first_place_score
+        if len(others) >= 2
+        else second - 5
+    )
     gap12 = first.score.first_place_score - second
     gap13 = first.score.first_place_score - third
 
@@ -5307,6 +5395,8 @@ def ranking_axis_judgement(horses: List[Horse]) -> Tuple[str, str, float, float]
     ):
         if first.score.local_mixed_unproven:
             return "B", "古馬同級未経験・最大B", gap12, gap13
+        if first.score.pace_axis_conflict:
+            return "B", "展開矛盾・最大B", gap12, gap13
         return "A", "単独軸候補", gap12, gap13
     if (
         first.score.first_place_score >= 66
@@ -5314,10 +5404,14 @@ def ranking_axis_judgement(horses: List[Horse]) -> Tuple[str, str, float, float]
         and gap13 >= 3.0
         and first.score.first_place_adjustment > -4.0
     ):
+        if first.score.pace_axis_conflict:
+            return "B", "展開矛盾・軸候補", gap12, gap13
         return "B", "軸候補", gap12, gap13
     if first.score.first_place_score < 60 or gap13 <= 2.5:
-        return "軸なし", "見送り", gap12, gap13
-    return "C", "相手向き", gap12, gap13
+        operation = "展開矛盾・見送り" if first.score.pace_axis_conflict else "見送り"
+        return "軸なし", operation, gap12, gap13
+    operation = "展開矛盾・相手向き" if first.score.pace_axis_conflict else "相手向き"
+    return "C", operation, gap12, gap13
 
 def score_horses_ranking_v1(
     horses: Dict[int, Horse],
@@ -5792,6 +5886,8 @@ def ranking_result_dataframe(selected: List[Horse]) -> pd.DataFrame:
             "展開適合": f"{horse.score.pace_rank_score:.1f}（{horse.score.pace_rank}位）",
             "1着期待": horse.score.first_place_score,
             "◎補正": horse.score.first_place_adjustment,
+            "軸展開補正": horse.score.pace_axis_penalty,
+            "軸展開注意": horse.score.pace_axis_conflict_note,
             "馬券内期待": horse.score.in_money_score,
             "評価理由": horse.score.selection_reason,
         }
@@ -5871,6 +5967,8 @@ def ranking_diagnostic_dataframe(horses: Dict[int, Horse]) -> pd.DataFrame:
             "古馬同級未経験": "○" if horse.score.local_mixed_unproven else "",
             "地方補正理由": horse.score.local_class_note,
             "◎補正": horse.score.first_place_adjustment,
+            "軸展開補正": horse.score.pace_axis_penalty,
+            "軸展開注意": horse.score.pace_axis_conflict_note,
             "脚質": horse.running_style,
             "上がり評価": horse.score.closing_power,
             "先行候補数": horse.front_competitors,
@@ -5891,9 +5989,9 @@ def clear_inputs():
     st.session_state["timeindex_input"] = ""
 
 
-st.title("🐎 競馬AI Ranking v1.0.5")
+st.title("🐎 競馬AI Ranking v1.0.6")
 st.caption("基礎能力・近走状態・今回条件適性・スピード能力・展開適合の5ランキング型")
-st.caption("有効な5項目1位を重複なしで保護し、7頭になるまでAI総合上位で補完。5項目の採点と◎再現性判定はv1.0.3を維持。")
+st.caption("有効な5項目1位を保護してAI総合上位で7頭まで補完。極端な展開と◎の脚質が真逆かつ展開下位20%なら、印を変えず軸補正-2・A判定を禁止。")
 
 conditions_text = st.text_input(
     "レース条件（任意）",
@@ -5958,6 +6056,8 @@ if predict_clicked:
 
     horses = score_horses_ranking_v1(horses, conditions, time_mode)
     selected = select_ranking_v1(horses, conditions)
+    # 選定と印を確定した後、◎だけに展開矛盾の軸ガードを適用する。
+    apply_selected_pace_axis_guard(selected, len(horses))
 
     first = next((horse for horse in selected if horse.mark == "◎"), None)
     overall_leader = min(horses.values(), key=lambda h: h.score.ai_overall_rank)
@@ -5998,6 +6098,12 @@ if predict_clicked:
             "軸判定",
             axis_grade,
             f"{axis_operation}／1-2位差 {gap12:.1f}",
+        )
+
+    if first and first.score.pace_axis_conflict:
+        st.warning(
+            f"展開矛盾ガード発動：{first.score.pace_axis_conflict_note}。"
+            f" ◎補正{first.score.pace_axis_penalty:+.0f}、軸判定Aは禁止します。"
         )
 
     if axis_grade == "軸なし":
