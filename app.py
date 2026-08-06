@@ -5438,8 +5438,11 @@ def gap_bonus_reason(horse: Horse) -> str:
         for label, bonus in horse.score.ranking_gap_bonuses.items()
     )
 
-def select_ranking_v1(horses: Dict[int, Horse]) -> List[Horse]:
-    """総合型4＋強化特化型2＋5項目補完型1で7頭を選ぶ。"""
+def select_ranking_v1(
+    horses: Dict[int, Horse],
+    conditions: Optional[RaceConditions] = None,
+) -> List[Horse]:
+    """有効な5項目1位を保護し、7頭になるまでAI総合上位で補完する。"""
     for horse in horses.values():
         horse.mark = ""
         horse.comment = ""
@@ -5456,110 +5459,96 @@ def select_ranking_v1(horses: Dict[int, Horse]) -> List[Horse]:
     target_count = min(7, len(all_horses))
     selected: List[Horse] = []
     selected_numbers = set()
+    leader_labels: Dict[int, List[str]] = {}
 
+    # 1) 各項目1位を重複なしで保護。
+    # 全馬同点・首位同点、または元データ不足の項目は保護対象にしない。
+    for label, score_field, _rank_field in RANKING_SPECS:
+        ranked = sorted(
+            all_horses,
+            key=lambda horse: (
+                getattr(horse.score, score_field),
+                horse.score.ranking_points,
+                horse.score.top3_count,
+                -horse.popularity,
+                -horse.number,
+            ),
+            reverse=True,
+        )
+        if not ranked:
+            continue
+
+        leader = ranked[0]
+        leader_score = float(getattr(leader.score, score_field))
+        second_score = (
+            float(getattr(ranked[1].score, score_field))
+            if len(ranked) >= 2
+            else leader_score - 1.0
+        )
+
+        # 取得条件が不明な場合、条件適性1位は保護しない。
+        if (
+            label == "今回条件適性"
+            and conditions is not None
+            and not has_known_conditions(conditions)
+        ):
+            continue
+
+        if not ranking_item_reliable(leader, label):
+            continue
+
+        # 小数1桁へ丸めた得点が同点なら、人気などで作られた見かけ上の1位を保護しない。
+        if len(ranked) >= 2 and abs(leader_score - second_score) < 0.05:
+            continue
+
+        leader_labels.setdefault(leader.number, []).append(label)
+
+    # 複数項目1位の馬は1頭として扱う。代表馬同士はAI総合順で並べる。
+    protected = sorted(
+        (horses[number] for number in leader_labels),
+        key=overall_selection_order,
+        reverse=True,
+    )
+    for horse in protected:
+        if len(selected) >= target_count:
+            break
+        horse.score.selection_route = "項目代表"
+        horse.score.specialist_label = "/".join(leader_labels[horse.number])
+        horse.score.specialist_type = "1位保護"
+        selected.append(horse)
+        selected_numbers.add(horse.number)
+
+    # 通常は最大5頭だが、将来項目数が増えて7頭を超えた場合はAI総合順で7頭に制限。
+    # 2) 残り枠はAI総合順位で補完。
     overall = sorted(all_horses, key=overall_selection_order, reverse=True)
-
-    # 1) 総合型4頭：順位点＋項目内点差ボーナス＋上位登場回数。
-    general_target = min(4, target_count)
-    general_candidates = [horse for horse in overall if horse.score.top5_count >= 2]
-    for horse in general_candidates:
-        if len([h for h in selected if h.score.selection_route == "総合型"]) >= general_target:
-            break
-        horse.score.selection_route = "総合型"
-        selected.append(horse)
-        selected_numbers.add(horse.number)
-
-    # 足りない場合だけAI総合上位で補完。
     for horse in overall:
-        if len([h for h in selected if h.score.selection_route == "総合型"]) >= general_target:
+        if len(selected) >= target_count:
             break
         if horse.number in selected_numbers:
             continue
-        horse.score.selection_route = "総合型"
-        selected.append(horse)
-        selected_numbers.add(horse.number)
-
-    # 2) 強化特化型2頭。
-    # 強特化（1位かつ明確な点差）または裏付け特化（1～2位＋別項目6位以内）。
-    specialist_target = min(2, max(0, target_count - len(selected)))
-    specialist_pool: List[Tuple[Horse, Dict[str, object]]] = []
-    for horse in all_horses:
-        if horse.number in selected_numbers:
-            continue
-        profile = best_specialist_profile(horse, len(all_horses))
-        if profile is not None:
-            specialist_pool.append((horse, profile))
-
-    chosen_specialist_labels: List[str] = []
-    while len(chosen_specialist_labels) < specialist_target and specialist_pool:
-        # 2頭目以降は、可能なら違う項目の特化馬を優先する。
-        different_item_pool = [
-            item for item in specialist_pool
-            if str(item[1]["label"]) not in chosen_specialist_labels
-        ]
-        candidates = different_item_pool or specialist_pool
-        horse, profile = max(
-            candidates,
-            key=lambda item: specialist_candidate_order(item[0], item[1]),
-        )
-        horse.score.selection_route = "特化型"
-        horse.score.specialist_label = str(profile["label"])
-        horse.score.specialist_type = str(profile["type"])
-        selected.append(horse)
-        selected_numbers.add(horse.number)
-        chosen_specialist_labels.append(horse.score.specialist_label)
-        specialist_pool = [
-            item for item in specialist_pool if item[0].number != horse.number
-        ]
-
-    # 条件成立馬が不足した場合のみ、5項目順位が最も優秀な未選出馬で特化枠を埋める。
-    while len(chosen_specialist_labels) < specialist_target and len(selected) < target_count:
-        remaining = [h for h in all_horses if h.number not in selected_numbers]
-        if not remaining:
-            break
-        horse = max(remaining, key=fallback_specialist_order)
-        best_label, _score, _rank = min(
-            ranking_values(horse), key=lambda item: (item[2], -item[1])
-        )
-        horse.score.selection_route = "特化型"
-        horse.score.specialist_label = best_label
-        horse.score.specialist_type = "順位補完"
-        selected.append(horse)
-        selected_numbers.add(horse.number)
-        chosen_specialist_labels.append(best_label)
-
-    # 3) 5項目補完型1頭。
-    # AI総合順位点＋トップ5回数＋トップ3回数×2で、惜しく落ちた馬を拾う。
-    while len(selected) < target_count:
-        remaining = [h for h in all_horses if h.number not in selected_numbers]
-        if not remaining:
-            break
-        horse = max(remaining, key=complement_order)
-        horse.score.selection_route = "補完型"
+        horse.score.selection_route = "総合補完"
         selected.append(horse)
         selected_numbers.add(horse.number)
 
     # 選定理由。
     for horse in selected:
         reasons = [horse.score.selection_route]
-        if horse.score.selection_route == "特化型":
-            reasons.append(
-                f"{horse.score.specialist_type}:{horse.score.specialist_label}"
-            )
+        if horse.score.selection_route == "項目代表":
+            labels = leader_labels.get(horse.number, [])
+            reasons.append("/".join(f"{label}1位" for label in labels))
+        else:
+            reasons.extend([
+                f"AI総合{horse.score.ai_overall_rank}位",
+                f"ランキング{horse.score.ranking_points}点",
+            ])
         reasons.extend(top_ranking_reasons(horse, 2))
         gap_reason = gap_bonus_reason(horse)
         if gap_reason:
             reasons.append(gap_reason)
-        if horse.score.selection_route == "補完型":
-            reasons.extend([
-                f"補完点{horse.score.complement_score}",
-                f"上位3項目{horse.score.top3_count}",
-                f"AI総合{horse.score.ai_overall_rank}位",
-            ])
-        horse.score.selection_reason = "・".join(reasons)
+        horse.score.selection_reason = "・".join(dict.fromkeys(reasons))
         horse.comment = horse.score.selection_reason
 
-    # ◎は現行の1着指数を維持。補完型は専用印へ固定し、残りは馬券内指数順。
+    # ◎は1着指数、残る6頭は馬券内指数順。印の「補」は単なる7番手表示。
     first = max(
         selected,
         key=lambda horse: (
@@ -5569,11 +5558,6 @@ def select_ranking_v1(horses: Dict[int, Horse]) -> List[Horse]:
         ),
     )
     first.mark = "◎"
-
-    complement_horse = next(
-        (horse for horse in selected if horse.score.selection_route == "補完型"),
-        None,
-    )
 
     partners = [horse for horse in selected if horse.number != first.number]
     partners.sort(
@@ -5586,19 +5570,8 @@ def select_ranking_v1(horses: Dict[int, Horse]) -> List[Horse]:
         ),
         reverse=True,
     )
-
-    if complement_horse is not None and complement_horse.number != first.number:
-        complement_horse.mark = "補"
-        normal_partners = [
-            horse for horse in partners
-            if horse.number != complement_horse.number
-        ]
-        for mark, horse in zip(("○", "▲", "△", "☆", "注"), normal_partners):
-            horse.mark = mark
-    else:
-        # 補完型が◎になった場合は、残る6頭の最後を補助印で表示する。
-        for mark, horse in zip(("○", "▲", "△", "☆", "注", "補"), partners):
-            horse.mark = mark
+    for mark, horse in zip(("○", "▲", "△", "☆", "注", "補"), partners):
+        horse.mark = mark
 
     mark_order = {mark: index for index, mark in enumerate(MARKS)}
     return sorted(selected, key=lambda horse: mark_order.get(horse.mark, 99))
@@ -5720,9 +5693,9 @@ def clear_inputs():
     st.session_state["timeindex_input"] = ""
 
 
-st.title("🐎 競馬AI Ranking v1.0.3")
+st.title("🐎 競馬AI Ranking v1.0.4")
 st.caption("基礎能力・近走状態・今回条件適性・スピード能力・展開適合の5ランキング型")
-st.caption("総合型4頭＋強化特化型2頭＋5項目補完型1頭。5項目の採点と◎再現性判定を過去検証ベースで調整。")
+st.caption("有効な5項目1位を重複なしで保護し、7頭になるまでAI総合上位で補完。5項目の採点と◎再現性判定はv1.0.3を維持。")
 
 conditions_text = st.text_input(
     "レース条件（任意）",
@@ -5786,13 +5759,16 @@ if predict_clicked:
         )
 
     horses = score_horses_ranking_v1(horses, conditions, time_mode)
-    selected = select_ranking_v1(horses)
+    selected = select_ranking_v1(horses, conditions)
 
     first = next((horse for horse in selected if horse.mark == "◎"), None)
     overall_leader = min(horses.values(), key=lambda h: h.score.ai_overall_rank)
-    complement_horse = next(
-        (horse for horse in selected if horse.score.selection_route == "補完型"),
-        None,
+    item_representatives = [
+        horse for horse in selected if horse.score.selection_route == "項目代表"
+    ]
+    protected_item_count = sum(
+        len([label for label in horse.score.specialist_label.split("/") if label])
+        for horse in item_representatives
     )
     scenario = pace_scenario(next(iter(horses.values())).front_competitors) if horses else "不明"
     axis_grade, axis_operation, gap12, gap13 = ranking_axis_judgement(selected)
@@ -5813,17 +5789,9 @@ if predict_clicked:
         )
     with metric3:
         st.metric(
-            "5項目補完型",
-            (
-                f"{complement_horse.number}番 {complement_horse.name}"
-                if complement_horse
-                else "該当なし"
-            ),
-            (
-                f"補完スコア {complement_horse.score.complement_score}"
-                if complement_horse
-                else ""
-            ),
+            "5項目1位保護",
+            f"代表馬 {len(item_representatives)}頭",
+            f"有効項目 {protected_item_count}個",
         )
     with metric4:
         st.metric("展開想定", scenario)
@@ -5847,9 +5815,8 @@ if predict_clicked:
 
     st.subheader("最終選定 7頭")
     st.caption(
-        "総合型は順位点と項目内点差を反映。特化型は突出度または別項目の裏付けを必須とし、"
-        "最後の1頭はAI総合順位・上位3/5項目数による5項目補完型から拾います。"
-        "選定された7頭は削らずすべて表示します。"
+        "正常に計算された基礎能力・近走状態・今回条件適性・スピード能力・展開適合の各1位を、"
+        "重複なしで先に保護します。残り枠はAI総合上位から補完し、選定された7頭は削らず表示します。"
     )
     st.dataframe(
         ranking_result_dataframe(selected),
@@ -5859,7 +5826,7 @@ if predict_clicked:
 
     route_counts = {
         route: sum(h.score.selection_route == route for h in selected)
-        for route in ("総合型", "特化型", "補完型")
+        for route in ("項目代表", "総合補完")
     }
     st.caption(
         "選定内訳："
