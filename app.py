@@ -5979,6 +5979,262 @@ def ranking_diagnostic_dataframe(horses: Dict[int, Horse]) -> pd.DataFrame:
 
 
 # =========================================================
+# X / NOTE output
+# =========================================================
+
+def posting_race_title(
+    post_title_text: str,
+    conditions_text: str,
+    conditions: RaceConditions,
+) -> str:
+    """投稿用のレース名を、専用入力→条件入力→解析条件の順で作る。"""
+    if post_title_text.strip():
+        return normalize_text(post_title_text)
+    if conditions_text.strip():
+        return normalize_text(conditions_text)
+
+    parts = []
+    if conditions.venue:
+        parts.append(conditions.venue)
+    if conditions.surface or conditions.distance:
+        course = f"{conditions.surface}{conditions.distance or ''}m"
+        parts.append(course.replace("m", "m", 1))
+    if conditions.race_class:
+        parts.append(conditions.race_class)
+    return " ".join(parts) if parts else "競馬予想"
+
+
+def horse_mark_line(horse: Horse, include_popularity: bool = False) -> str:
+    popularity = ""
+    if include_popularity and horse.popularity != 99:
+        popularity = f"（{horse.popularity}人気）"
+    return f"{horse.mark}{horse.number} {horse.name}{popularity}"
+
+
+def horse_top_rank_labels(horse: Horse, limit: int = 3) -> List[str]:
+    ranked = []
+    for label, _score_field, rank_field in RANKING_SPECS:
+        rank = getattr(horse.score, rank_field)
+        if rank > 0:
+            ranked.append((rank, label))
+    ranked.sort(key=lambda item: item[0])
+    return [f"{label}{rank}位" for rank, label in ranked[:limit]]
+
+
+def find_mark_horse(selected: List[Horse], mark: str) -> Optional[Horse]:
+    return next((horse for horse in selected if horse.mark == mark), None)
+
+
+def format_number_group(numbers: List[int], sep: str = ".") -> str:
+    uniq = []
+    seen = set()
+    for number in numbers:
+        if number not in seen:
+            uniq.append(number)
+            seen.add(number)
+    return sep.join(str(number) for number in uniq)
+
+
+def build_betting_plan(selected: List[Horse], axis_grade: str) -> Dict[str, object]:
+    axis = find_mark_horse(selected, "◎") or selected[0]
+    others = [horse for horse in selected if horse.number != axis.number]
+    others_sorted = sorted(
+        others,
+        key=lambda horse: MARKS.index(horse.mark) if horse.mark in MARKS else 99,
+    )
+
+    if axis_grade == "軸なし":
+        box = [horse.number for horse in selected[:4]]
+        return {
+            "mode": "box",
+            "axis": axis.number,
+            "box": box,
+        }
+
+    second_group = [horse.number for horse in others_sorted[:3]]
+    if len(second_group) < 3:
+        second_group = [horse.number for horse in others_sorted]
+
+    third_group = [horse.number for horse in others_sorted[:5]]
+    if len(third_group) < len(second_group):
+        third_group = second_group[:]
+
+    trio_third = [axis.number] + third_group
+    trio_third = list(dict.fromkeys(trio_third))
+
+    return {
+        "mode": "axis",
+        "axis": axis.number,
+        "second_group": second_group,
+        "third_group": third_group,
+        "trio_third": trio_third,
+    }
+
+
+def betting_plan_lines(plan: Dict[str, object], axis_grade: str, style: str = "x") -> List[str]:
+    if plan.get("mode") == "box":
+        box = plan.get("box", [])
+        box_str = format_number_group(box)
+        if style == "x":
+            return [
+                f"ワイドBOX {box_str}",
+                f"馬連BOX {box_str}",
+                f"3連複BOX {box_str}",
+            ]
+        return [
+            "【ワイドBOX】",
+            box_str,
+            "",
+            "【馬連BOX】",
+            box_str,
+            "",
+            "【3連複BOX】",
+            box_str,
+        ]
+
+    axis = int(plan["axis"])
+    second_group = format_number_group(plan.get("second_group", []))
+    third_group = format_number_group(plan.get("third_group", []))
+    trio_third = format_number_group(plan.get("trio_third", []))
+
+    if style == "x":
+        lines = []
+        if axis_grade in ("A", "B"):
+            lines.append(f"単勝 {axis}")
+        else:
+            lines.append(f"複勝 {axis}")
+        lines.append(f"馬連/ワイド {axis}-{second_group}")
+        lines.append(f"3連複 {axis}-{second_group}-{trio_third}")
+        if axis_grade in ("A", "B", "C"):
+            lines.append(f"3連単 {axis}→{third_group}（1頭軸マルチ）")
+        return lines
+
+    lines = []
+    if axis_grade in ("A", "B"):
+        lines.extend(["【単勝・複勝】", str(axis), ""])
+    else:
+        lines.extend(["【複勝】", str(axis), ""])
+    lines.extend([
+        "【馬連・ワイド】",
+        f"{axis}－{second_group}",
+        "",
+        "【3連複】",
+        f"{axis}－{second_group}－{trio_third}",
+        "",
+    ])
+    if axis_grade in ("A", "B", "C"):
+        lines.extend([
+            "【3連単】",
+            f"{axis}→{third_group}（1頭軸マルチ）",
+        ])
+    return lines
+
+
+def build_x_post_text(
+    title: str,
+    selected: List[Horse],
+    scenario: str,
+    axis_grade: str,
+    axis_operation: str,
+    time_mode: str,
+) -> str:
+    """Xへそのまま貼れる短文。印と買い目をコンパクトに出力する。"""
+    short_title = title if len(title) <= 36 else title[:35] + "…"
+    plan = build_betting_plan(selected, axis_grade)
+
+    lines = [f"【{short_title} 予想】", ""]
+    for horse in selected[:4]:
+        lines.append(f"{horse.mark}{horse.number} {horse.name}")
+    remainder = [horse.number for horse in selected[4:]]
+    if remainder:
+        lines.append(f"△候補 {format_number_group(remainder)}")
+
+    lines.extend(["", "買い目"])
+    lines.extend(betting_plan_lines(plan, axis_grade, style="x"))
+    lines.extend([
+        "",
+        f"展開 {scenario}｜軸評価 {axis_grade}",
+    ])
+    hashtags = ["#競馬予想", "#独自指数"]
+    hashtags.append("#中央競馬" if time_mode == "central" else "#地方競馬")
+    lines.append(" ".join(hashtags))
+    return "\n".join(lines)
+
+
+def note_axis_comment(axis_grade: str, axis_operation: str) -> str:
+    if axis_grade == "A":
+        return f"◎を中心に組み立てやすいレース。買い目は『{axis_operation}』寄りで組み立てます。"
+    if axis_grade == "B":
+        return f"◎から入れる形は可能ですが、相手との組み合わせも重視したいレース。買い目は『{axis_operation}』寄り。"
+    if axis_grade == "C":
+        return f"上位差が小さいため、単独軸より組み合わせ向き。買い目は『{axis_operation}』寄りで考えます。"
+    return f"上位が接戦のため、単独軸は無理せずボックス・組み合わせ重視。目安は『{axis_operation}』です。"
+
+
+def build_note_post_text(
+    title: str,
+    selected: List[Horse],
+    horses: Dict[int, Horse],
+    scenario: str,
+    axis_grade: str,
+    axis_operation: str,
+    overall_leader: Horse,
+    item_representatives: List[Horse],
+    protected_item_count: int,
+) -> str:
+    """NOTEへ貼れる、印＋買い目中心の本文を作る。"""
+    first = find_mark_horse(selected, "◎") or selected[0]
+    plan = build_betting_plan(selected, axis_grade)
+    first_strengths = horse_top_rank_labels(first, 4)
+    strength_text = "、".join(first_strengths) if first_strengths else "総合バランス上位"
+
+    lines = [
+        f"# 【{title}】独自ランキング予想",
+        "",
+        "✨有力馬✨",
+        f"◎{first.number} {first.name}",
+        "",
+        f"・1着期待は{first.score.first_place_score:.1f}、馬券内期待は{first.score.in_money_score:.1f}。",
+        f"・主な強みは {strength_text}。",
+        f"・選定ルートは{first.score.selection_route}。展開想定は{scenario}、軸評価は{axis_grade}。",
+    ]
+    if first.score.pace_axis_conflict_note:
+        lines.append(f"・展開面の注意：{first.score.pace_axis_conflict_note}。")
+
+    lines.extend(["", "印まとめ"])
+    for horse in selected:
+        if horse.number == first.number:
+            continue
+        lines.append(f"{horse.mark}{horse.number} {horse.name}")
+
+    lines.extend([
+        "",
+        "------------------------------",
+        "",
+        "▼買い目▼",
+        "",
+    ])
+    lines.extend(betting_plan_lines(plan, axis_grade, style="note"))
+
+    lines.extend([
+        "",
+        "------------------------------",
+        "",
+        "【補足】",
+        f"・展開想定：{scenario}",
+        f"・軸評価：{axis_grade}",
+        f"・運用目安：{axis_operation}",
+        f"・ランキング総合1位：{overall_leader.number}番 {overall_leader.name}",
+        f"・5項目1位保護：代表馬{len(item_representatives)}頭／有効項目{protected_item_count}個",
+        "",
+        note_axis_comment(axis_grade, axis_operation),
+        "",
+        "※発走前の馬場・気配・オッズ変動で最終判断は調整してください。",
+    ])
+    return "\n".join(lines)
+
+
+# =========================================================
 # UI
 # =========================================================
 
@@ -5987,16 +6243,23 @@ def clear_inputs():
     st.session_state["racecard_input"] = ""
     st.session_state["past_input"] = ""
     st.session_state["timeindex_input"] = ""
+    st.session_state["post_title_input"] = ""
 
 
-st.title("🐎 競馬AI Ranking v1.0.6")
+st.title("🐎 競馬AI Ranking v1.0.8")
 st.caption("基礎能力・近走状態・今回条件適性・スピード能力・展開適合の5ランキング型")
-st.caption("有効な5項目1位を保護してAI総合上位で7頭まで補完。極端な展開と◎の脚質が真逆かつ展開下位20%なら、印を変えず軸補正-2・A判定を禁止。")
+st.caption("有効な5項目1位を保護してAI総合上位で7頭まで補完。展開矛盾軸ガードに加え、X・NOTE投稿文と買い目を自動生成。")
 
 conditions_text = st.text_input(
     "レース条件（任意）",
     placeholder="例：新潟 1勝 芝1800 良　※分かる項目だけでもOK",
     key="conditions_input",
+)
+
+post_title_text = st.text_input(
+    "投稿用レース名（任意）",
+    placeholder="例：船橋11R ○○特別　※X・NOTEの見出しに使用",
+    key="post_title_input",
 )
 
 racecard_text = st.text_area(
@@ -6136,6 +6399,36 @@ if predict_clicked:
         "選定内訳："
         + "／".join(f"{route}{count}頭" for route, count in route_counts.items() if count)
     )
+
+    post_title = posting_race_title(post_title_text, conditions_text, conditions)
+    x_post_text = build_x_post_text(
+        post_title,
+        selected,
+        scenario,
+        axis_grade,
+        axis_operation,
+        time_mode,
+    )
+    note_post_text = build_note_post_text(
+        post_title,
+        selected,
+        horses,
+        scenario,
+        axis_grade,
+        axis_operation,
+        overall_leader,
+        item_representatives,
+        protected_item_count,
+    )
+
+    st.subheader("X・NOTE投稿用出力")
+    st.caption("各欄の右上にあるコピーアイコンから、そのまま投稿文をコピーできます。")
+    x_tab, note_tab = st.tabs(["X投稿用", "NOTE投稿用"])
+    with x_tab:
+        st.code(x_post_text, language=None)
+        st.caption(f"文字数目安：{len(x_post_text)}文字")
+    with note_tab:
+        st.code(note_post_text, language="markdown")
 
     st.subheader("5ランキング 上位5頭")
     tabs = st.tabs([label for label, _score, _rank in RANKING_SPECS])
