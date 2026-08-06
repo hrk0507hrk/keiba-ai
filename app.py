@@ -144,6 +144,10 @@ class ScoreDetail:
     condition_rank_score: float = 50.0
     speed_rank_score: float = 50.0
     pace_rank_score: float = 50.0
+    # v1.0.11: 距離別の印決定専用スコア。選定7頭は変えず、印だけを距離特性で並べ替える。
+    distance_mark_score: float = 0.0
+    distance_mark_rank: int = 0
+    distance_mark_profile: str = ""
     clock_score: float = 50.0
     clock_data_count: int = 0
     basic_rank: int = 0
@@ -5369,23 +5373,25 @@ def ranking_axis_judgement(horses: List[Horse]) -> Tuple[str, str, float, float]
             key=lambda h: (h.score.first_place_score, h.score.ranking_points, -h.popularity),
         )
 
+    # 距離別印スコアで◎と相手の差を判定する。
     others = sorted(
         (horse for horse in horses if horse.number != first.number),
-        key=lambda h: (h.score.first_place_score, h.score.ranking_points, -h.popularity),
+        key=lambda h: (h.score.distance_mark_score, h.score.first_place_score, -h.popularity),
         reverse=True,
     )
+    first_mark_score = first.score.distance_mark_score or first.score.first_place_score
     second = (
-        others[0].score.first_place_score
+        (others[0].score.distance_mark_score or others[0].score.first_place_score)
         if len(others) >= 1
-        else first.score.first_place_score - 10
+        else first_mark_score - 10
     )
     third = (
-        others[1].score.first_place_score
+        (others[1].score.distance_mark_score or others[1].score.first_place_score)
         if len(others) >= 2
         else second - 5
     )
-    gap12 = first.score.first_place_score - second
-    gap13 = first.score.first_place_score - third
+    gap12 = first_mark_score - second
+    gap13 = first_mark_score - third
 
     if (
         first.score.first_place_score >= 72
@@ -5724,6 +5730,81 @@ def gap_bonus_reason(horse: Horse) -> str:
         for label, bonus in horse.score.ranking_gap_bonuses.items()
     )
 
+def distance_mark_profile(distance: int) -> Tuple[str, Dict[str, float]]:
+    """レース距離に応じた印決定用の5項目比重を返す。"""
+    if distance <= 0:
+        return "距離不明・標準型", {
+            "basic": 0.25,
+            "form": 0.20,
+            "condition": 0.20,
+            "speed": 0.20,
+            "pace": 0.15,
+        }
+    if distance <= 1400:
+        return "短距離型（1000〜1400m）", {
+            "basic": 0.10,
+            "form": 0.15,
+            "condition": 0.15,
+            "speed": 0.35,
+            "pace": 0.25,
+        }
+    if distance == 1500:
+        return "1500m中間型", {
+            "basic": 0.20,
+            "form": 0.20,
+            "condition": 0.20,
+            "speed": 0.25,
+            "pace": 0.15,
+        }
+    if distance <= 2200:
+        return "中距離型（1600〜2200m）", {
+            "basic": 0.25,
+            "form": 0.20,
+            "condition": 0.20,
+            "speed": 0.20,
+            "pace": 0.15,
+        }
+    return "長距離型（2300m以上）", {
+        "basic": 0.25,
+        "form": 0.20,
+        "condition": 0.30,
+        "speed": 0.05,
+        "pace": 0.20,
+    }
+
+
+def assign_distance_marks(selected: List[Horse], conditions: Optional[RaceConditions]) -> None:
+    """選定馬は変えず、距離別スコア順で◎○▲△☆注補を付ける。"""
+    distance = conditions.distance if conditions is not None else 0
+    profile_name, weights = distance_mark_profile(distance)
+
+    for horse in selected:
+        score = (
+            horse.score.basic_rank_score * weights["basic"]
+            + horse.score.form_rank_score * weights["form"]
+            + horse.score.condition_rank_score * weights["condition"]
+            + horse.score.speed_rank_score * weights["speed"]
+            + horse.score.pace_rank_score * weights["pace"]
+        )
+        horse.score.distance_mark_score = round(score, 1)
+        horse.score.distance_mark_profile = profile_name
+
+    ranked = sorted(
+        selected,
+        key=lambda horse: (
+            horse.score.distance_mark_score,
+            horse.score.first_place_score,
+            horse.score.in_money_score,
+            horse.score.ranking_points,
+            -horse.popularity,
+        ),
+        reverse=True,
+    )
+    for rank, horse in enumerate(ranked, 1):
+        horse.score.distance_mark_rank = rank
+        horse.mark = ("◎", "○", "▲", "△", "☆", "注", "補")[rank - 1]
+
+
 def select_ranking_v1(
     horses: Dict[int, Horse],
     conditions: Optional[RaceConditions] = None,
@@ -5836,30 +5917,8 @@ def select_ranking_v1(
         horse.score.selection_reason = "・".join(dict.fromkeys(reasons))
         horse.comment = horse.score.selection_reason
 
-    # ◎は1着指数、残る6頭は馬券内指数順。印の「補」は単なる7番手表示。
-    first = max(
-        selected,
-        key=lambda horse: (
-            horse.score.first_place_score,
-            horse.score.ranking_points,
-            -horse.popularity,
-        ),
-    )
-    first.mark = "◎"
-
-    partners = [horse for horse in selected if horse.number != first.number]
-    partners.sort(
-        key=lambda horse: (
-            horse.score.in_money_score,
-            horse.score.ranking_points,
-            horse.score.top3_count,
-            -horse.score.average_rank,
-            -horse.popularity,
-        ),
-        reverse=True,
-    )
-    for mark, horse in zip(("○", "▲", "△", "☆", "注", "補"), partners):
-        horse.mark = mark
+    # v1.0.11: 選定7頭は固定し、レース距離に応じた5項目比重で印だけを付け直す。
+    assign_distance_marks(selected, conditions)
 
     mark_order = {mark: index for index, mark in enumerate(MARKS)}
     return sorted(selected, key=lambda horse: mark_order.get(horse.mark, 99))
@@ -5879,6 +5938,9 @@ def ranking_result_dataframe(selected: List[Horse]) -> pd.DataFrame:
             "上位5項目数": horse.score.top5_count,
             "補完スコア": horse.score.complement_score,
             "AI総合順位": horse.score.ai_overall_rank,
+            "距離別印型": horse.score.distance_mark_profile,
+            "距離別印点": horse.score.distance_mark_score,
+            "距離別印順位": horse.score.distance_mark_rank,
             "基礎能力": f"{horse.score.basic_rank_score:.1f}（{horse.score.basic_rank}位）",
             "近走状態": f"{horse.score.form_rank_score:.1f}（{horse.score.form_rank}位）",
             "条件適性": f"{horse.score.condition_rank_score:.1f}（{horse.score.condition_rank}位）",
@@ -5932,6 +5994,9 @@ def ranking_matrix_dataframe(horses: Dict[int, Horse]) -> pd.DataFrame:
             "上位5項目数": horse.score.top5_count,
             "補完スコア": horse.score.complement_score,
             "AI総合順位": horse.score.ai_overall_rank,
+            "距離別印型": horse.score.distance_mark_profile,
+            "距離別印点": horse.score.distance_mark_score,
+            "距離別印順位": horse.score.distance_mark_rank,
             "人気差": horse.score.value_gap,
             "選定ルート": horse.score.selection_route or "選外",
         }
@@ -6216,9 +6281,9 @@ def clear_inputs():
     st.session_state["post_title_input"] = ""
 
 
-st.title("🐎 競馬AI Ranking v1.0.10")
+st.title("🐎 競馬AI Ranking v1.0.11")
 st.caption("基礎能力・近走状態・今回条件適性・スピード能力・展開適合の5ランキング型")
-st.caption("有効な5項目1位を保護してAI総合上位で7頭まで補完。展開矛盾軸ガードに加え、X・NOTE投稿文と、単複・馬連ワイド・三連系のシンプルな買い目を自動生成。")
+st.caption("有効な5項目1位を保護してAI総合上位で7頭まで補完。展開矛盾軸ガードに加え、選定7頭は維持し、レース距離ごとの特性で印を付け替えます。X・NOTE投稿文とシンプルな買い目も自動生成。")
 
 conditions_text = st.text_input(
     "レース条件（任意）",
@@ -6303,6 +6368,7 @@ if predict_clicked:
     )
     scenario = pace_scenario(next(iter(horses.values())).front_competitors) if horses else "不明"
     axis_grade, axis_operation, gap12, gap13 = ranking_axis_judgement(selected)
+    mark_profile_name = selected[0].score.distance_mark_profile if selected else "距離不明"
 
     st.divider()
     metric1, metric2, metric3, metric4, metric5 = st.columns(5)
@@ -6332,6 +6398,8 @@ if predict_clicked:
             axis_grade,
             f"{axis_operation}／1-2位差 {gap12:.1f}",
         )
+
+    st.caption(f"印決定ロジック：{mark_profile_name}（選定7頭は変更せず、印だけ距離別に再配分）")
 
     if first and first.score.pace_axis_conflict:
         st.warning(
