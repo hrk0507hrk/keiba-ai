@@ -106,6 +106,9 @@ class RaceRecord:
     passing: str = ""
     last3f: float = 0.0
     race_time_sec: float = 0.0
+    female_only: bool = False
+    special_condition: bool = False
+    raw_text: str = ""
 
 
 @dataclass
@@ -770,6 +773,14 @@ def record_from_block(lines: List[str]) -> Optional[RaceRecord]:
         date, venue, surface, distance, going, race_class, age_limited
     ) = parse_record_conditions(lines)
 
+    joined_record_text = " ".join(lines)
+    female_only = bool(re.search(r"(?:牝馬限定|\(牝\)|牝限定)", joined_record_text))
+    special_condition = bool(re.search(
+        r"(千直|直線競馬|障害|海外|交流|JRA交流|ダートグレード|小回り専用|特殊条件)",
+        joined_record_text,
+        re.I,
+    ))
+
     return RaceRecord(
         date=date,
         venue=venue,
@@ -784,6 +795,9 @@ def record_from_block(lines: List[str]) -> Optional[RaceRecord]:
         passing=passing,
         last3f=last3f,
         race_time_sec=race_time_sec,
+        female_only=female_only,
+        special_condition=special_condition,
+        raw_text=joined_record_text,
     )
 
 
@@ -6298,6 +6312,189 @@ def build_note_post_text(
 
 
 # =========================================================
+# 1〜3番人気限定・危険材料減点式の軸選定
+# =========================================================
+
+LOCAL_JRA_VENUES = {"札幌", "函館", "福島", "新潟", "小倉"}
+STEEP_VENUES = {"中山", "阪神", "中京"}
+RIGHT_HANDED_VENUES = {
+    "札幌", "函館", "福島", "中山", "京都", "阪神", "小倉",
+    "門別", "大井", "川崎", "金沢", "名古屋", "園田", "姫路",
+    "高知", "佐賀",
+}
+LEFT_HANDED_VENUES = {
+    "新潟", "東京", "中京", "盛岡", "浦和", "船橋", "笠松",
+}
+
+
+def venue_turn_direction(venue: str) -> str:
+    if venue in RIGHT_HANDED_VENUES:
+        return "右"
+    if venue in LEFT_HANDED_VENUES:
+        return "左"
+    return ""
+
+
+def record_is_good(record: RaceRecord) -> bool:
+    return bool(record.finish_known and 1 <= record.finish <= 3)
+
+
+def record_was_front_running(record: RaceRecord) -> bool:
+    if not record.passing:
+        return False
+    positions = [safe_int(v, 99) for v in re.findall(r"\d+", record.passing)]
+    return bool(positions and positions[0] == 1)
+
+
+def top3_popularity_risk_axis(
+    horses: Dict[int, Horse],
+    conditions: RaceConditions,
+    race_month: int = 0,
+    is_handicap: bool = False,
+) -> Tuple[pd.DataFrame, Optional[Horse], bool, str]:
+    """1〜3番人気だけを危険材料で減点し、減点最少馬を補助軸候補にする。"""
+    candidates = sorted(
+        [horse for horse in horses.values() if horse.popularity in (1, 2, 3)],
+        key=lambda horse: horse.popularity,
+    )
+
+    if not candidates:
+        empty = pd.DataFrame(columns=["人気", "馬番", "馬名", "減点合計", "該当項目"])
+        return empty, None, False, "1〜3番人気を取得できませんでした。"
+
+    top_weight = max(
+        (horse.carried_weight for horse in horses.values() if horse.carried_weight > 0),
+        default=0.0,
+    )
+    current_turn = venue_turn_direction(conditions.venue)
+    is_obstacle = "障害" in (conditions.race_class or "") or conditions.surface == "障害"
+
+    rows = []
+    scored = []
+
+    for horse in candidates:
+        penalties = []
+        total = 0
+        previous = horse.records[0] if horse.records else None
+
+        def add(points: int, label: str):
+            nonlocal total
+            total -= points
+            penalties.append(f"−{points} {label}")
+
+        # −5
+        if previous and record_is_good(previous) and record_was_front_running(previous):
+            add(5, "前走で逃げて好走")
+
+        known_surfaces = {record.surface for record in horse.records if record.surface}
+        if conditions.surface == "ダ" and known_surfaces and "ダ" not in known_surfaces:
+            add(5, "初ダート")
+        if conditions.surface == "芝" and known_surfaces and "芝" not in known_surfaces:
+            add(5, "初芝")
+
+        if (
+            not is_obstacle
+            and previous
+            and conditions.distance > 0
+            and previous.distance > 0
+            and conditions.distance > previous.distance
+        ):
+            add(5, "距離延長ローテ")
+
+        if (
+            not is_obstacle
+            and conditions.surface == "ダ"
+            and previous
+            and previous.female_only
+        ):
+            add(5, "ダート戦で前走が牝馬限定戦")
+
+        # −4
+        if (
+            previous
+            and conditions.race_class
+            and previous.race_class
+            and class_score(conditions.race_class) > class_score(previous.race_class) + 0.1
+        ):
+            add(4, "昇級初戦")
+
+        if previous and previous.special_condition:
+            add(4, "前走が特殊条件")
+
+        if previous and previous.venue in LOCAL_JRA_VENUES:
+            add(4, "前走がローカル競馬場")
+
+        # −3
+        if horse.layoff_weeks >= 26:
+            add(3, "6か月以上の休み明け")
+
+        if not is_obstacle and conditions.surface == "芝" and horse.frame in (7, 8):
+            add(3, "芝の外枠")
+
+        if not is_obstacle and conditions.surface == "ダ" and horse.frame in (1, 2, 3):
+            add(3, "ダートの内枠")
+
+        if (
+            is_handicap
+            and top_weight > 0
+            and horse.carried_weight > 0
+            and abs(horse.carried_weight - top_weight) < 0.01
+        ):
+            add(3, "トップハンデ")
+
+        # −2
+        if conditions.venue in STEEP_VENUES:
+            steep_good = any(
+                record.venue in STEEP_VENUES and record_is_good(record)
+                for record in horse.records
+            )
+            if horse.records and not steep_good:
+                add(2, "急坂コース好走実績なし")
+
+        if abs(horse.weight_change) >= 15:
+            add(2, "馬体重が前走比±15kg以上")
+
+        # −1
+        if current_turn:
+            same_turn_good = any(
+                venue_turn_direction(record.venue) == current_turn and record_is_good(record)
+                for record in horse.records
+                if record.venue
+            )
+            if horse.records and not same_turn_good:
+                add(1, f"同じ{current_turn}回りで好走実績なし")
+
+        if race_month in (12, 1, 2) and horse.sex == "牝":
+            add(1, "冬の牝馬")
+        if race_month in (6, 7, 8) and horse.sex == "牡":
+            add(1, "夏の牡馬")
+
+        rows.append({
+            "人気": horse.popularity,
+            "馬番": horse.number,
+            "馬名": horse.name,
+            "減点合計": total,
+            "該当項目": "／".join(penalties) if penalties else "減点なし",
+        })
+        scored.append((total, horse.popularity, horse))
+
+    # 0点に最も近い＝合計値が最大。同点は人気上位。
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    best_total = scored[0][0]
+    tied = [item for item in scored if item[0] == best_total]
+    selected_axis = tied[0][2]
+    has_tie = len(tied) >= 2
+
+    if has_tie:
+        tied_pops = "・".join(f"{item[2].popularity}番人気" for item in tied)
+        reason = f"{tied_pops}が{best_total}点で同点のため、人気上位を採用"
+    else:
+        reason = f"減点合計が最も0点に近い（{best_total}点）"
+
+    return pd.DataFrame(rows), selected_axis, has_tie, reason
+
+
+# =========================================================
 # UI
 # =========================================================
 
@@ -6307,9 +6504,11 @@ def clear_inputs():
     st.session_state["past_input"] = ""
     st.session_state["timeindex_input"] = ""
     st.session_state["post_title_input"] = ""
+    st.session_state["risk_race_month"] = 0
+    st.session_state["risk_is_handicap"] = False
 
 
-st.title("🐎 競馬AI Ranking v1.0.12")
+st.title("🐎 競馬AI Ranking v1.0.13")
 st.caption("基礎能力・近走状態・今回条件適性・スピード能力・展開適合の5ランキング型")
 st.caption("有効な5項目1位を保護してAI総合上位で7頭まで補完。展開矛盾軸ガードに加え、選定7頭は維持し、レース距離ごとの特性で印を付け替えます。X・NOTE投稿文とシンプルな買い目も自動生成。")
 
@@ -6324,6 +6523,21 @@ post_title_text = st.text_input(
     placeholder="例：船橋11R ○○特別　※X・NOTEの見出しに使用",
     key="post_title_input",
 )
+
+risk_col1, risk_col2 = st.columns(2)
+with risk_col1:
+    race_month = st.selectbox(
+        "レース月（危険材料判定用・任意）",
+        options=[0] + list(range(1, 13)),
+        format_func=lambda value: "判定しない" if value == 0 else f"{value}月",
+        key="risk_race_month",
+    )
+with risk_col2:
+    is_handicap_race = st.checkbox(
+        "ハンデ戦としてトップハンデを判定",
+        value=False,
+        key="risk_is_handicap",
+    )
 
 racecard_text = st.text_area(
     "① 出走表",
@@ -6465,6 +6679,54 @@ if predict_clicked:
         "選定内訳："
         + "／".join(f"{route}{count}頭" for route, count in route_counts.items() if count)
     )
+
+
+    # 1〜3番人気限定・危険材料減点式の補助軸判定
+    risk_df, limited_axis, risk_tied, risk_reason = top3_popularity_risk_axis(
+        horses,
+        conditions,
+        race_month=race_month,
+        is_handicap=is_handicap_race,
+    )
+    conventional_axis = next((horse for horse in selected if horse.mark == "◎"), None)
+
+    st.subheader("1〜3番人気限定・危険材料減点式 軸判定")
+    st.caption(
+        "能力順位や相手選定は変更せず、1〜3番人気の中で危険材料が最も少ない馬を補助軸候補として表示します。"
+        "判断できない項目は減点しません。"
+    )
+    st.dataframe(risk_df, use_container_width=True, hide_index=True)
+
+    if limited_axis:
+        compare_text = (
+            "一致"
+            if conventional_axis and conventional_axis.number == limited_axis.number
+            else "不一致"
+        )
+        limited_col1, limited_col2, limited_col3 = st.columns(3)
+        with limited_col1:
+            st.metric(
+                "限定方式の軸候補",
+                f"{limited_axis.number}番 {limited_axis.name}",
+                f"{limited_axis.popularity}番人気",
+            )
+        with limited_col2:
+            st.metric(
+                "同点判定",
+                "同点あり" if risk_tied else "単独",
+                risk_reason,
+            )
+        with limited_col3:
+            st.metric(
+                "従来AI軸との比較",
+                compare_text,
+                (
+                    f"従来◎ {conventional_axis.number}番 {conventional_axis.name}"
+                    if conventional_axis else "従来◎なし"
+                ),
+            )
+    else:
+        st.warning(risk_reason)
 
     post_title = posting_race_title(post_title_text, conditions_text, conditions)
     x_post_text = build_x_post_text(
