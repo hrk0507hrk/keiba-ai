@@ -97,6 +97,8 @@ class RaceRecord:
     distance: int = 0
     going: str = ""
     race_class: str = ""
+    # 「3歳」「2歳」限定戦。中央の「3歳以上」は対象外。
+    age_limited: bool = False
     finish: int = 99
     finish_known: bool = False
     margin: Optional[float] = None
@@ -201,6 +203,11 @@ class ScoreDetail:
     first_place_adjustment: float = 0.0
     first_place_rank: int = 0
     first_place_tiebreak_promoted: bool = False
+    # v1.0.5 地方クラス補正の診断値。
+    local_class_basic_adjustment: float = 0.0
+    local_class_condition_adjustment: float = 0.0
+    local_mixed_unproven: bool = False
+    local_class_note: str = ""
     upset_boundary_promoted: bool = False
     upset_boundary_demoted: bool = False
     upset_boundary_rule: str = ""
@@ -690,8 +697,10 @@ def parse_record_conditions(lines: List[str]):
         going = match.group(1)
 
     race_class = parse_race_class_label(joined)
+    # 「3歳以上」は古馬混合なので除外し、年齢限定戦だけを記録する。
+    age_limited = bool(re.search(r"(?:2歳|3歳)(?!以上)", joined))
 
-    return date, venue, surface, distance, going, race_class
+    return date, venue, surface, distance, going, race_class, age_limited
 
 
 def is_non_start_record(lines: List[str]) -> bool:
@@ -748,7 +757,9 @@ def record_from_block(lines: List[str]) -> Optional[RaceRecord]:
         finish = 1
         finish_known = True
 
-    date, venue, surface, distance, going, race_class = parse_record_conditions(lines)
+    (
+        date, venue, surface, distance, going, race_class, age_limited
+    ) = parse_record_conditions(lines)
 
     return RaceRecord(
         date=date,
@@ -757,6 +768,7 @@ def record_from_block(lines: List[str]) -> Optional[RaceRecord]:
         distance=distance,
         going=going,
         race_class=race_class,
+        age_limited=age_limited,
         finish=finish,
         finish_known=finish_known,
         margin=margin,
@@ -1046,6 +1058,160 @@ def class_score(label: str) -> float:
         )
 
     return 52.0
+
+
+
+def is_local_class_label(label: str) -> bool:
+    """地方のA/B/Cクラス表記かを判定する。"""
+    if not label:
+        return False
+    upper = normalize_text(label).upper()
+    return bool(
+        re.fullmatch(r"(?:[ABC]\d{1,2}|[ABC]|BC|[ABC]\d{1,2}[ABC]\d{1,2})", upper)
+    )
+
+
+def local_direct_class_evidence(
+    horse: Horse,
+    conditions: RaceConditions,
+) -> Tuple[int, int, int]:
+    """
+    地方競馬で今回クラスへ直接通用した実績を数える。
+
+    戻り値:
+      same_class_close  同クラスで0.5秒差以内
+      exact_close       同クラス・同場・同距離・同馬場区分で0.5秒差以内
+      upper_close       上位クラスで0.8秒差以内
+    """
+    if not is_local_class_label(conditions.race_class):
+        return 0, 0, 0
+
+    current_level = class_score(conditions.race_class)
+    same_class_close = 0
+    exact_close = 0
+    upper_close = 0
+
+    for record in horse.records[:5]:
+        if not record.race_class or record.margin is None:
+            continue
+        if not is_local_class_label(record.race_class):
+            continue
+
+        prior_level = class_score(record.race_class)
+        # 「同場・同距離」ボーナスは条件が実際に取得できた場合だけ付与する。
+        same_surface = bool(
+            conditions.surface
+            and record.surface
+            and record.surface == conditions.surface
+        )
+        same_distance = bool(
+            conditions.distance
+            and record.distance
+            and record.distance == conditions.distance
+        )
+        same_venue = bool(
+            conditions.venue
+            and record.venue
+            and record.venue == conditions.venue
+        )
+
+        if abs(prior_level - current_level) < 0.25 and record.margin <= 0.5:
+            same_class_close += 1
+            if same_surface and same_distance and same_venue:
+                exact_close += 1
+        elif prior_level > current_level + 0.25 and record.margin <= 0.8:
+            upper_close += 1
+
+    return same_class_close, exact_close, upper_close
+
+
+def has_local_current_class_experience(
+    horse: Horse,
+    conditions: RaceConditions,
+) -> bool:
+    """今回と同格以上の地方クラスへ出走した経験があるか。"""
+    if not is_local_class_label(conditions.race_class):
+        return False
+    current_level = class_score(conditions.race_class)
+    return any(
+        record.race_class
+        and is_local_class_label(record.race_class)
+        and class_score(record.race_class) >= current_level - 0.25
+        for record in horse.records[:5]
+    )
+
+
+def local_class_context_adjustment(
+    horse: Horse,
+    conditions: RaceConditions,
+    mode: str,
+    older_mixed: bool,
+) -> Tuple[float, float, Optional[float], bool, str]:
+    """
+    地方競馬のクラス比較を5項目へ補う。
+
+    ・今回と同クラス・同場・同距離での僅差実績を優先
+    ・3歳限定戦から古馬B/C級へ初挑戦する馬を過大評価しない
+    ・古馬同クラスで既に通用している3歳馬は減点しない
+    """
+    if mode != "local" or not is_local_class_label(conditions.race_class):
+        return 0.0, 0.0, None, False, ""
+
+    same_close, exact_close, upper_close = local_direct_class_evidence(
+        horse, conditions
+    )
+
+    basic_adjustment = 0.0
+    condition_adjustment = 0.0
+    notes: List[str] = []
+
+    # 同クラスへ直接通用した実績を、C1勝ち・年齢限定戦より優先する。
+    if exact_close >= 1:
+        basic_adjustment += 4.0
+        condition_adjustment += 6.0
+        notes.append("同級同場同距離0.5秒内")
+        if exact_close >= 2:
+            basic_adjustment += 2.0
+            condition_adjustment += 2.0
+            notes.append("同条件複数")
+    elif same_close >= 1:
+        basic_adjustment += 2.5
+        condition_adjustment += 3.0
+        notes.append("同級0.5秒内")
+        if same_close >= 2:
+            basic_adjustment += 1.0
+            condition_adjustment += 1.5
+
+    if upper_close >= 1:
+        basic_adjustment += 3.0
+        notes.append("上位級0.8秒内")
+
+    has_age_limited_recent = any(
+        record.age_limited for record in horse.records[:3]
+    )
+    has_current_class = has_local_current_class_experience(horse, conditions)
+    unproven_mixed = bool(
+        older_mixed
+        and horse.age == 3
+        and has_age_limited_recent
+        and not has_current_class
+    )
+
+    condition_cap: Optional[float] = None
+    if unproven_mixed:
+        # 年齢限定戦の勝利を古馬B/C級へそのまま移さない。
+        basic_adjustment -= 6.0
+        condition_adjustment -= 6.0
+        condition_cap = 72.0
+        notes.append("3歳限定→古馬初挑戦")
+
+    return (
+        basic_adjustment,
+        condition_adjustment,
+        condition_cap,
+        unproven_mixed,
+        "/".join(notes),
+    )
 
 
 def recent_high_class_win_bonus(horse: Horse) -> float:
@@ -5038,6 +5204,10 @@ def calculate_first_place_adjustment(
                 class_penalty *= 0.5
             adjustment -= class_penalty
 
+    # 地方の3歳限定戦から古馬B/C級へ初挑戦する馬は、◎だけ追加で慎重に扱う。
+    if horse.score.local_mixed_unproven:
+        adjustment -= 2.5
+
     # 明確な展開では、適合する脚質を◎判定で追加評価する。
     if scenario == "ハイ想定":
         if horse.running_style in ("差し", "追込") and horse.score.pace_rank_score >= 75:
@@ -5135,6 +5305,8 @@ def ranking_axis_judgement(horses: List[Horse]) -> Tuple[str, str, float, float]
         and gap13 >= 4.0
         and first.score.first_place_adjustment > -3.0
     ):
+        if first.score.local_mixed_unproven:
+            return "B", "古馬同級未経験・最大B", gap12, gap13
         return "A", "単独軸候補", gap12, gap13
     if (
         first.score.first_place_score >= 66
@@ -5210,11 +5382,31 @@ def score_horses_ranking_v1(
         horse.score.clock_score = round(clock_scores.get(horse.number, 50.0), 1)
         horse.score.clock_data_count = clock_counts.get(horse.number, 0)
 
-        horse.score.basic_rank_score = round(calculate_basic_ranking_score(horse), 1)
-        horse.score.form_rank_score = round(calculate_form_ranking_score(horse), 1)
-        horse.score.condition_rank_score = round(
-            calculate_condition_ranking_score(horse, conditions), 1
+        basic_score = calculate_basic_ranking_score(horse)
+        condition_score = calculate_condition_ranking_score(horse, conditions)
+        older_mixed = any(other.age >= 4 for other in horses.values())
+        (
+            local_basic_adj,
+            local_condition_adj,
+            local_condition_cap,
+            local_mixed_unproven,
+            local_class_note,
+        ) = local_class_context_adjustment(
+            horse, conditions, mode, older_mixed
         )
+        horse.score.local_class_basic_adjustment = round(local_basic_adj, 1)
+        horse.score.local_class_condition_adjustment = round(local_condition_adj, 1)
+        horse.score.local_mixed_unproven = local_mixed_unproven
+        horse.score.local_class_note = local_class_note
+
+        basic_score = clamp(basic_score + local_basic_adj)
+        condition_score = clamp(condition_score + local_condition_adj)
+        if local_condition_cap is not None:
+            condition_score = min(condition_score, local_condition_cap)
+
+        horse.score.basic_rank_score = round(basic_score, 1)
+        horse.score.form_rank_score = round(calculate_form_ranking_score(horse), 1)
+        horse.score.condition_rank_score = round(condition_score, 1)
         horse.score.speed_rank_score = round(
             calculate_speed_ranking_score(
                 horse,
@@ -5545,6 +5737,8 @@ def select_ranking_v1(
         gap_reason = gap_bonus_reason(horse)
         if gap_reason:
             reasons.append(gap_reason)
+        if horse.score.local_class_note:
+            reasons.append(f"地方補正:{horse.score.local_class_note}")
         horse.score.selection_reason = "・".join(dict.fromkeys(reasons))
         horse.comment = horse.score.selection_reason
 
@@ -5672,6 +5866,10 @@ def ranking_diagnostic_dataframe(horses: Dict[int, Horse]) -> pd.DataFrame:
             "同条件近走": horse.score.same_condition_score,
             "同条件件数": horse.score.same_condition_count,
             "同条件ピーク": horse.score.same_condition_peak_score,
+            "地方基礎補正": horse.score.local_class_basic_adjustment,
+            "地方条件補正": horse.score.local_class_condition_adjustment,
+            "古馬同級未経験": "○" if horse.score.local_mixed_unproven else "",
+            "地方補正理由": horse.score.local_class_note,
             "◎補正": horse.score.first_place_adjustment,
             "脚質": horse.running_style,
             "上がり評価": horse.score.closing_power,
@@ -5693,7 +5891,7 @@ def clear_inputs():
     st.session_state["timeindex_input"] = ""
 
 
-st.title("🐎 競馬AI Ranking v1.0.4")
+st.title("🐎 競馬AI Ranking v1.0.5")
 st.caption("基礎能力・近走状態・今回条件適性・スピード能力・展開適合の5ランキング型")
 st.caption("有効な5項目1位を重複なしで保護し、7頭になるまでAI総合上位で補完。5項目の採点と◎再現性判定はv1.0.3を維持。")
 
