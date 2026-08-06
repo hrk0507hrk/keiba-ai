@@ -5731,7 +5731,7 @@ def gap_bonus_reason(horse: Horse) -> str:
     )
 
 def distance_mark_profile(distance: int) -> Tuple[str, Dict[str, float]]:
-    """レース距離に応じた印決定用の5項目比重を返す。"""
+    """レース距離に応じて、印決定だけを強めに特化した5項目比重を返す。"""
     if distance <= 0:
         return "距離不明・標準型", {
             "basic": 0.25,
@@ -5740,36 +5740,64 @@ def distance_mark_profile(distance: int) -> Tuple[str, Dict[str, float]]:
             "speed": 0.20,
             "pace": 0.15,
         }
+
+    # 1000〜1200m：純粋なスピード決着を最優先。
+    if distance <= 1200:
+        return "超短距離特化型（1000〜1200m）", {
+            "basic": 0.05,
+            "form": 0.10,
+            "condition": 0.10,
+            "speed": 0.55,
+            "pace": 0.20,
+        }
+
+    # 1300〜1400m：スピードを軸に、展開適合も強く見る。
     if distance <= 1400:
-        return "短距離型（1000〜1400m）", {
-            "basic": 0.10,
-            "form": 0.15,
-            "condition": 0.15,
-            "speed": 0.35,
+        return "短距離特化型（1300〜1400m）", {
+            "basic": 0.08,
+            "form": 0.10,
+            "condition": 0.12,
+            "speed": 0.45,
             "pace": 0.25,
         }
+
+    # 1500m：短距離とマイルの中間。
     if distance == 1500:
-        return "1500m中間型", {
+        return "1500m移行型", {
             "basic": 0.20,
-            "form": 0.20,
+            "form": 0.15,
             "condition": 0.20,
+            "speed": 0.35,
+            "pace": 0.10,
+        }
+
+    # 1600〜1800m：能力とスピードの両立を重視。
+    if distance <= 1800:
+        return "マイル・中距離前半特化型（1600〜1800m）", {
+            "basic": 0.35,
+            "form": 0.15,
+            "condition": 0.15,
             "speed": 0.25,
-            "pace": 0.15,
+            "pace": 0.10,
         }
+
+    # 1900〜2200m：基礎能力と条件適性・近走の総合力を重視。
     if distance <= 2200:
-        return "中距離型（1600〜2200m）", {
-            "basic": 0.25,
+        return "中距離後半特化型（1900〜2200m）", {
+            "basic": 0.35,
             "form": 0.20,
-            "condition": 0.20,
-            "speed": 0.20,
+            "condition": 0.25,
+            "speed": 0.05,
             "pace": 0.15,
         }
-    return "長距離型（2300m以上）", {
-        "basic": 0.25,
-        "form": 0.20,
-        "condition": 0.30,
-        "speed": 0.05,
-        "pace": 0.20,
+
+    # 2300m以上：同距離・条件適性と展開適合をスタミナ／折り合いの代用として最重視。
+    return "長距離特化型（2300m以上）", {
+        "basic": 0.20,
+        "form": 0.10,
+        "condition": 0.45,
+        "speed": 0.00,
+        "pace": 0.25,
     }
 
 
@@ -6281,7 +6309,7 @@ def clear_inputs():
     st.session_state["post_title_input"] = ""
 
 
-st.title("🐎 競馬AI Ranking v1.0.11")
+st.title("🐎 競馬AI Ranking v1.0.12")
 st.caption("基礎能力・近走状態・今回条件適性・スピード能力・展開適合の5ランキング型")
 st.caption("有効な5項目1位を保護してAI総合上位で7頭まで補完。展開矛盾軸ガードに加え、選定7頭は維持し、レース距離ごとの特性で印を付け替えます。X・NOTE投稿文とシンプルな買い目も自動生成。")
 
@@ -6399,7 +6427,7 @@ if predict_clicked:
             f"{axis_operation}／1-2位差 {gap12:.1f}",
         )
 
-    st.caption(f"印決定ロジック：{mark_profile_name}（選定7頭は変更せず、印だけ距離別に再配分）")
+    st.caption(f"印決定ロジック：{mark_profile_name}（選定7頭は変更せず、印だけ距離別の強い特化配点で再配分）")
 
     if first and first.score.pace_axis_conflict:
         st.warning(
