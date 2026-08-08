@@ -12,7 +12,7 @@ import pandas as pd
 import streamlit as st
 
 
-APP_NAME = "競馬AI Fixed Selection v1.2"
+APP_NAME = "競馬AI Fixed Selection v1.3"
 LOCAL_TRACKS = {"福島", "新潟", "小倉", "札幌", "函館"}
 STEEP_TRACKS = {"中山", "阪神", "中京"}
 SUMMER_MONTHS = {6, 7, 8}
@@ -799,6 +799,7 @@ with pred_tab:
         st.caption(f"解析結果：出馬表 {len(entries)}頭 / 馬柱 {len(histories)}頭")
 
         problems = []
+        notices = []
         if not race.surface or not race.distance:
             problems.append("レース情報から芝/ダート・距離を取得できませんでした。")
         if not race.track:
@@ -806,9 +807,22 @@ with pred_tab:
         if len(entries) < 3:
             problems.append("出馬表から十分な頭数を取得できませんでした。")
         if race.field_size and len(entries) != race.field_size:
-            problems.append(f"頭数不一致：レース情報 {race.field_size}頭 / 出馬表解析 {len(entries)}頭")
+            diff = race.field_size - len(entries)
+            if diff > 0:
+                notices.append(
+                    f"レース情報は{race.field_size}頭ですが、出馬表では{len(entries)}頭を確認しました。"
+                    f" 取消・除外などで{diff}頭減っている可能性があるため、実出走{len(entries)}頭として予想を続行します。"
+                )
+            else:
+                notices.append(
+                    f"レース情報は{race.field_size}頭ですが、出馬表では{len(entries)}頭を確認しました。"
+                    " 出馬表の解析頭数を優先して予想します。"
+                )
         if len(histories) < min(len(entries), 3):
             problems.append(f"馬柱の解析頭数が少ないです（{len(histories)}頭）。")
+
+        if notices:
+            st.warning("\n".join(notices))
 
         if problems:
             st.error("\n".join(problems))
