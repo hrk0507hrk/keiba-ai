@@ -12,7 +12,7 @@ import pandas as pd
 import streamlit as st
 
 
-APP_NAME = "競馬AI Fixed Selection v1.0"
+APP_NAME = "競馬AI Fixed Selection v1.1"
 LOCAL_TRACKS = {"福島", "新潟", "小倉", "札幌", "函館"}
 STEEP_TRACKS = {"中山", "阪神", "中京"}
 SUMMER_MONTHS = {6, 7, 8}
@@ -161,7 +161,15 @@ def parse_race_info(text: str) -> RaceInfo:
 
 
 def parse_entries(text: str) -> List[Entry]:
+    """Parse netkeiba entry text.
+
+    Supports both:
+    1) Markdown table pasted from ChatGPT/browser source (contains /horse/ links)
+    2) Plain text copied directly from the rendered netkeiba page (URLs stripped)
+    """
     entries: List[Entry] = []
+
+    # ---- Mode 1: Markdown table ----
     for line in text.splitlines():
         if "/horse/" not in line or not line.lstrip().startswith("|"):
             continue
@@ -188,7 +196,6 @@ def parse_entries(text: str) -> List[Entry]:
             odds = parse_float(raw[horse_idx + 6]) if horse_idx + 6 < len(raw) else None
             popularity = parse_int(raw[horse_idx + 7]) if horse_idx + 7 < len(raw) else None
             if popularity is None:
-                # fallback: search for a standalone popularity value after odds
                 tail = [clean_md(c) for c in raw[horse_idx + 6:]]
                 for c in tail:
                     if re.fullmatch(r"\d+", c):
@@ -198,122 +205,231 @@ def parse_entries(text: str) -> List[Entry]:
                 continue
 
             entries.append(Entry(
-                frame=frame,
-                number=number,
-                name=name,
-                sex=sex,
-                age=age,
-                weight=weight,
-                bodyweight=bodyweight,
-                body_change=body_change,
-                odds=odds,
-                popularity=popularity,
+                frame=frame, number=number, name=name, sex=sex, age=age,
+                weight=weight, bodyweight=bodyweight, body_change=body_change,
+                odds=odds, popularity=popularity,
             ))
         except (IndexError, ValueError):
             continue
 
-    # dedupe by horse number, keep first
+    # ---- Mode 2: Plain text copied from rendered page ----
+    # If Markdown parsing already found enough rows we still run fallback and de-duplicate,
+    # because some browsers can produce a mixed format.
+    plain = clean_md(text)
+    sexage_matches = list(re.finditer(r"(牡|牝|セ)\s*(\d+)", plain))
+    last_anchor_end = 0
+    for idx, m in enumerate(sexage_matches):
+        # Look back to the last frame/horse-number pair before this sex-age token.
+        before = plain[max(last_anchor_end, m.start() - 350):m.start()]
+        pair_matches = list(re.finditer(r"(?<!\d)([1-8])\s+([1-9]|1[0-9]|2[0-9])(?!\d)", before))
+        if not pair_matches:
+            continue
+        pm = pair_matches[-1]
+        frame = int(pm.group(1))
+        number = int(pm.group(2))
+        if number < 1 or number > 30:
+            continue
+
+        between = before[pm.end():].strip()
+        # Remove UI/mark tokens, then take the last remaining token as the horse name.
+        toks = [t for t in re.split(r"\s+", between) if t]
+        junk = {"--", "編集", "消", "保存", "閉じる"}
+        toks = [t for t in toks if t not in junk and not re.fullmatch(r"[-◎◯○▲△☆✓✔消]+", t)]
+        if not toks:
+            continue
+        name = toks[-1]
+        if name in {"馬メモ", "レース別馬メモ"}:
+            continue
+
+        sex, age = m.group(1), int(m.group(2))
+        next_start = sexage_matches[idx + 1].start() if idx + 1 < len(sexage_matches) else min(len(plain), m.end() + 500)
+        after = plain[m.end():next_start]
+
+        mw = re.search(r"(?<!\d)(\d{2}(?:\.\d)?)(?!\d)", after)
+        weight = float(mw.group(1)) if mw else 0.0
+        mb = re.search(r"(\d{3})(?:kg)?\(([+-]?\d+)\)", after)
+        bodyweight = int(mb.group(1)) if mb else None
+        body_change = int(mb.group(2)) if mb else None
+
+        odds = None
+        popularity = None
+        if mb:
+            tail = after[mb.end():]
+            mop = re.search(r"(?<!\d)(\d+(?:\.\d+)?)\s+(?:\(|（)?\s*(\d{1,2})\s*(?:人気)?(?:\)|）)?", tail)
+            if mop:
+                odds = float(mop.group(1))
+                popularity = int(mop.group(2))
+
+        # Another common copy form is: bodyweight  68.5  13
+        if popularity is None and mb:
+            nums = re.findall(r"(?<!\d)(\d+(?:\.\d+)?)(?!\d)", after[mb.end():mb.end()+120])
+            if len(nums) >= 2:
+                try:
+                    odds = float(nums[0])
+                    popularity = int(float(nums[1]))
+                except ValueError:
+                    pass
+
+        if popularity is None or not (1 <= popularity <= 30):
+            continue
+
+        entries.append(Entry(
+            frame=frame, number=number, name=name, sex=sex, age=age,
+            weight=weight, bodyweight=bodyweight, body_change=body_change,
+            odds=odds, popularity=popularity,
+        ))
+        last_anchor_end = m.end()
+
+    # de-dupe by horse number. Prefer rows with a sensible name/bodyweight/popularity.
     out: Dict[int, Entry] = {}
     for e in entries:
-        out.setdefault(e.number, e)
+        old = out.get(e.number)
+        if old is None:
+            out[e.number] = e
+        else:
+            old_quality = int(bool(old.name)) + int(old.bodyweight is not None) + int(old.popularity > 0)
+            new_quality = int(bool(e.name)) + int(e.bodyweight is not None) + int(e.popularity > 0)
+            if new_quality > old_quality:
+                out[e.number] = e
     return sorted(out.values(), key=lambda x: x.number)
-
 
 def normalize_going(g: str) -> str:
     return {"稍": "稍重", "不": "不良"}.get(g, g)
 
 
-def parse_horse_histories(text: str) -> Dict[int, HorseHistory]:
-    histories: Dict[int, HorseHistory] = {}
+def _parse_races_from_segment(segment: str) -> List[PastRace]:
+    """Parse past races from one horse segment without relying on Markdown pipes."""
+    cleaned = clean_md(segment)
     track_alt = "|".join(sorted(ALL_TRACKS, key=len, reverse=True))
-    race_start_re = re.compile(rf"(\d{{4}}\.\d{{2}}\.\d{{2}})\s*({track_alt})\s*(\d+)")
+    race_start_re = re.compile(rf"(\d{{4}}\.\d{{2}}\.\d{{2}})\s*({track_alt})\s*(\d{{1,2}})")
+    matches = list(race_start_re.finditer(cleaned))
+    races: List[PastRace] = []
 
+    for i, m in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(cleaned)
+        seg = cleaned[m.end():end].strip()
+        try:
+            race_date = datetime.strptime(m.group(1), "%Y.%m.%d").date()
+        except ValueError:
+            race_date = None
+        track = m.group(2)
+        finish = int(m.group(3))
+
+        mc = re.search(r"(芝|ダ|障)\s*(\d{3,4})", seg)
+        surface = mc.group(1) if mc else ""
+        distance = int(mc.group(2)) if mc else None
+        race_name = seg[:mc.start()].strip() if mc else ""
+        # Remove obvious table/UI fragments before race name.
+        race_name = re.sub(r"^(?:映像を見る\s*)+", "", race_name).strip()
+
+        going = ""
+        if mc:
+            # Going normally appears shortly after distance/time.
+            after_cond = seg[mc.end():mc.end()+80]
+            mg = re.search(r"(良|稍重|稍|重|不良|不)", after_cond)
+            if mg:
+                going = normalize_going(mg.group(1))
+
+        fourth_corner = None
+        # Search the whole race segment for a position chain such as 3-4-4-3 or 4-3.
+        pos_all = re.findall(r"(?<!\d)(\d{1,2}(?:-\d{1,2}){1,3})(?!\d)", seg)
+        if pos_all:
+            # The race-position chain is usually the first/only hyphen chain.
+            fourth_corner = int(pos_all[0].split("-")[-1])
+
+        margin = None
+        parens = re.findall(r"\((-?\d+(?:\.\d+)?)\)", seg)
+        if parens:
+            vals = [float(x) for x in parens]
+            # Winner margin is generally the last parenthesized numeric value.
+            plausible = [v for v in vals if -10.0 <= v <= 20.0]
+            if plausible:
+                margin = plausible[-1]
+
+        races.append(PastRace(
+            race_date=race_date, track=track, finish=finish, race_name=race_name,
+            class_rank=class_rank_from_text(race_name), surface=surface,
+            distance=distance, going=going, margin=margin, fourth_corner=fourth_corner,
+        ))
+    return races
+
+
+def parse_horse_histories(text: str, entries: Optional[List[Entry]] = None) -> Dict[int, HorseHistory]:
+    """Parse horse histories from Markdown or plain browser copy.
+
+    When entry rows are available, their horse names/bodyweights are used to locate each
+    current-horse header. This avoids confusing a horse name mentioned as an opponent in
+    another horse's past race with the horse's own row.
+    """
+    histories: Dict[int, HorseHistory] = {}
+
+    # ---- Mode 1: Markdown rows ----
     for line in text.splitlines():
         if "/horse/" not in line or not line.lstrip().startswith("|"):
             continue
         raw = split_cells(line)
-        # Horse table has a sire link before the horse link. Find the horse link by locating the link
-        # followed later by dam / trainer cells. Using the second /horse/ link is generally reliable.
         horse_cells = [i for i, c in enumerate(raw) if "/horse/" in c]
         if not horse_cells:
             continue
-
-        # Current horse link usually has bold name and is the first /horse/ link in pasted horse rows.
-        # Sire is plain text in examples. Use the first /horse/ link.
         horse_idx = horse_cells[0]
         number = parse_int(raw[1]) if len(raw) > 1 else None
         if number is None:
             continue
         name = clean_md(raw[horse_idx])
-
         style = ""
-        # In horse table: horse + dam + damsire + trainer + interval/style
         if horse_idx + 4 < len(raw):
             interval = clean_md(raw[horse_idx + 4])
-            m_style = re.match(r"(逃|先|差|追)", interval)
-            if m_style:
-                style = m_style.group(1)
-
-        cleaned_line = clean_md(line)
-        matches = list(race_start_re.finditer(cleaned_line))
-        races: List[PastRace] = []
-        for i, m in enumerate(matches):
-            end = matches[i + 1].start() if i + 1 < len(matches) else len(cleaned_line)
-            segment = cleaned_line[m.start():end]
-            tokens = [t.strip() for t in segment.split("|") if t.strip()]
-
-            try:
-                race_date = datetime.strptime(m.group(1), "%Y.%m.%d").date()
-            except ValueError:
-                race_date = None
-            track = m.group(2)
-            finish = int(m.group(3))
-            race_name = tokens[1] if len(tokens) > 1 else ""
-            condition = tokens[2] if len(tokens) > 2 else ""
-
-            surface = ""
-            distance = None
-            going = ""
-            mc = re.search(r"(芝|ダ|障)(\d{3,4})", condition)
-            if mc:
-                surface = mc.group(1)
-                distance = int(mc.group(2))
-            mg = re.search(r"(良|稍重|稍|重|不良|不)", condition)
-            if mg:
-                going = normalize_going(mg.group(1))
-
-            fourth_corner = None
-            if len(tokens) > 4:
-                mp = re.search(r"\b(\d+(?:-\d+){1,3})\b", tokens[4])
-                if mp:
-                    fourth_corner = int(mp.group(1).split("-")[-1])
-
-            margin = None
-            # Usually winner/margin is token 5. Search first few tokens after condition to be robust.
-            margin_text = " | ".join(tokens[3:7])
-            mm_all = re.findall(r"\((-?\d+(?:\.\d+)?)\)", margin_text)
-            if mm_all:
-                # Bodyweight changes also use parentheses. Margin is usually the last numeric parenthesis.
-                # Filter out implausibly large bodyweight-change-like integers when possible.
-                vals = [float(x) for x in mm_all]
-                plausible = [v for v in vals if -10.0 <= v <= 20.0]
-                if plausible:
-                    margin = plausible[-1]
-
-            races.append(PastRace(
-                race_date=race_date,
-                track=track,
-                finish=finish,
-                race_name=race_name,
-                class_rank=class_rank_from_text(race_name),
-                surface=surface,
-                distance=distance,
-                going=going,
-                margin=margin,
-                fourth_corner=fourth_corner,
-            ))
-
+            ms = re.match(r"(逃|先|差|追)", interval)
+            if ms:
+                style = ms.group(1)
+        races = _parse_races_from_segment(line)
         histories[number] = HorseHistory(number=number, name=name, style=style, races=races)
+
+    # ---- Mode 2: Plain text ----
+    if entries:
+        plain = clean_md(text)
+        header_positions: List[Tuple[int, Entry]] = []
+        for e in entries:
+            candidates = [m.start() for m in re.finditer(re.escape(e.name), plain)]
+            best_pos = None
+            best_score = -1
+            body_token = None
+            if e.bodyweight is not None and e.body_change is not None:
+                body_token = f"{e.bodyweight}({e.body_change:+d})"
+                # netkeiba often writes zero as (0), not (+0)
+                if e.body_change == 0:
+                    body_token = f"{e.bodyweight}(0)"
+            sexage_token = f"{e.sex}{e.age}"
+            for pos in candidates:
+                window = plain[pos:pos+500]
+                score = 0
+                if body_token:
+                    bw_pat = re.escape(body_token).replace(r"\(", r"(?:kg)?\(")
+                    if re.search(bw_pat, window):
+                        score += 4
+                if sexage_token in window:
+                    score += 2
+                if e.odds is not None and str(e.odds) in window:
+                    score += 1
+                if re.search(r"(?:逃|先|差|追)中\d+週", window):
+                    score += 2
+                if score > best_score:
+                    best_score = score
+                    best_pos = pos
+            if best_pos is not None and best_score >= 2:
+                header_positions.append((best_pos, e))
+
+        header_positions.sort(key=lambda x: x[0])
+        for i, (pos, e) in enumerate(header_positions):
+            end = header_positions[i + 1][0] if i + 1 < len(header_positions) else len(plain)
+            segment = plain[pos:end]
+            ms = re.search(r"(?:^|\s)(逃|先|差|追)中\d+週", segment[:500])
+            style = ms.group(1) if ms else ""
+            races = _parse_races_from_segment(segment)
+            # Prefer plain parse when it found race rows; otherwise keep Markdown result.
+            if races or e.number not in histories:
+                histories[e.number] = HorseHistory(number=e.number, name=e.name, style=style, races=races)
+
     return histories
 
 
@@ -609,7 +725,7 @@ def verify_result(pred: Dict, result_text: str) -> Dict:
 # -----------------------------
 
 st.set_page_config(page_title=APP_NAME, page_icon="🏇", layout="wide")
-st.title("🏇 競馬AI Fixed Selection v1.0")
+st.title("🏇 競馬AI Fixed Selection v1.1")
 st.caption("完全固定版 v3.0 × 相手C改良版＋人気帯3-2-1｜予想時点で選定をロック")
 
 if "locked_prediction" not in st.session_state:
@@ -667,7 +783,9 @@ with pred_tab:
     if predict_clicked:
         race = parse_race_info(race_text)
         entries = parse_entries(entry_text)
-        histories = parse_horse_histories(history_text)
+        histories = parse_horse_histories(history_text, entries)
+
+        st.caption(f"解析結果：出馬表 {len(entries)}頭 / 馬柱 {len(histories)}頭")
 
         problems = []
         if not race.surface or not race.distance:
