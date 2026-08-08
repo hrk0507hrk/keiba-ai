@@ -12,7 +12,7 @@ import pandas as pd
 import streamlit as st
 
 
-APP_NAME = "競馬AI Fixed Selection v1.4"
+APP_NAME = "競馬AI Fixed Selection v1.5"
 LOCAL_TRACKS = {"福島", "新潟", "小倉", "札幌", "函館"}
 STEEP_TRACKS = {"中山", "阪神", "中京"}
 SUMMER_MONTHS = {6, 7, 8}
@@ -160,12 +160,76 @@ def parse_race_info(text: str) -> RaceInfo:
     return info
 
 
+def _reconcile_popularity_with_odds(entries: List[Entry]) -> Tuple[List[Entry], bool]:
+    """Repair popularity when a plain-copy parser accidentally grabs row numbers.
+
+    netkeiba popularity must follow win odds: lower odds = higher popularity.
+    If parsed popularity contradicts distinct odds, rebuild popularity from odds.
+    Exact displayed-odds ties keep parsed order where possible, then horse number.
+    """
+    if len(entries) < 2:
+        return entries, False
+
+    valid = [e for e in entries if e.odds is not None and e.odds > 0]
+    if len(valid) < max(2, int(len(entries) * 0.8)):
+        return entries, False
+
+    # Parsed popularity should be unique and within the number of actual starters.
+    pops = [e.popularity for e in entries]
+    invalid_shape = (
+        len(set(pops)) != len(pops)
+        or any(p < 1 or p > len(entries) for p in pops)
+    )
+
+    # For distinct displayed odds, popularity must be monotonic.
+    contradiction = False
+    for i, a in enumerate(valid):
+        for b in valid[i + 1:]:
+            if a.odds is None or b.odds is None or abs(a.odds - b.odds) < 1e-9:
+                continue
+            if a.odds < b.odds and not (a.popularity < b.popularity):
+                contradiction = True
+                break
+            if b.odds < a.odds and not (b.popularity < a.popularity):
+                contradiction = True
+                break
+        if contradiction:
+            break
+
+    if not (invalid_shape or contradiction):
+        return entries, False
+
+    # Rebuild ranks from odds. Within an exact displayed tie, use parsed popularity
+    # only as a tie-break if it is sane, otherwise horse number.
+    ranked = sorted(
+        entries,
+        key=lambda e: (
+            float('inf') if e.odds is None else e.odds,
+            e.popularity if 1 <= e.popularity <= len(entries) else 999,
+            e.number,
+        ),
+    )
+    rank_by_num = {e.number: i + 1 for i, e in enumerate(ranked)}
+    repaired = [
+        Entry(
+            frame=e.frame, number=e.number, name=e.name, sex=e.sex, age=e.age,
+            weight=e.weight, bodyweight=e.bodyweight, body_change=e.body_change,
+            odds=e.odds, popularity=rank_by_num[e.number],
+        )
+        for e in entries
+    ]
+    return repaired, True
+
+
 def parse_entries(text: str) -> List[Entry]:
     """Parse netkeiba entry text.
 
     Supports both:
     1) Markdown table pasted from ChatGPT/browser source (contains /horse/ links)
     2) Plain text copied directly from the rendered netkeiba page (URLs stripped)
+
+    v1.5 fixes a plain-copy bug where the next row's frame/horse number could be
+    mistaken for the current horse's odds/popularity.
     """
     entries: List[Entry] = []
 
@@ -213,25 +277,29 @@ def parse_entries(text: str) -> List[Entry]:
             continue
 
     # ---- Mode 2: Plain text copied from rendered page ----
-    # If Markdown parsing already found enough rows we still run fallback and de-duplicate,
-    # because some browsers can produce a mixed format.
     plain = clean_md(text)
     sexage_matches = list(re.finditer(r"(牡|牝|セ)\s*(\d+)", plain))
-    last_anchor_end = 0
-    for idx, m in enumerate(sexage_matches):
-        # Look back to the last frame/horse-number pair before this sex-age token.
-        before = plain[max(last_anchor_end, m.start() - 350):m.start()]
-        pair_matches = list(re.finditer(r"(?<!\d)([1-8])\s+([1-9]|1[0-9]|2[0-9])(?!\d)", before))
+
+    # Locate the true start of every horse row first. This is the key v1.5 fix:
+    # the previous implementation ended a row at the next sex/age token, which
+    # accidentally left the NEXT row's frame + horse number inside the current row.
+    anchors = []
+    search_floor = 0
+    for m in sexage_matches:
+        look_start = max(search_floor, m.start() - 350)
+        before = plain[look_start:m.start()]
+        pair_matches = list(re.finditer(r"(?<!\d)([1-8])\s+([1-9]|1[0-9]|2[0-9])\s+(?=(?:--|[-◎◯○▲△☆✓✔消]+))", before))
         if not pair_matches:
             continue
         pm = pair_matches[-1]
+        row_start = look_start + pm.start()
+        pair_end = look_start + pm.end()
         frame = int(pm.group(1))
         number = int(pm.group(2))
-        if number < 1 or number > 30:
+        if not (1 <= number <= 30):
             continue
 
-        between = before[pm.end():].strip()
-        # Remove UI/mark tokens, then take the last remaining token as the horse name.
+        between = plain[pair_end:m.start()].strip()
         toks = [t for t in re.split(r"\s+", between) if t]
         junk = {"--", "編集", "消", "保存", "閉じる"}
         toks = [t for t in toks if t not in junk and not re.fullmatch(r"[-◎◯○▲△☆✓✔消]+", t)]
@@ -240,11 +308,15 @@ def parse_entries(text: str) -> List[Entry]:
         name = toks[-1]
         if name in {"馬メモ", "レース別馬メモ"}:
             continue
+        anchors.append((row_start, m, frame, number, name))
+        search_floor = row_start + 1
+
+    for idx, (row_start, m, frame, number, name) in enumerate(anchors):
+        row_end = anchors[idx + 1][0] if idx + 1 < len(anchors) else min(len(plain), m.end() + 450)
+        row = plain[row_start:row_end]
+        after = plain[m.end():row_end]
 
         sex, age = m.group(1), int(m.group(2))
-        next_start = sexage_matches[idx + 1].start() if idx + 1 < len(sexage_matches) else min(len(plain), m.end() + 500)
-        after = plain[m.end():next_start]
-
         mw = re.search(r"(?<!\d)(\d{2}(?:\.\d)?)(?!\d)", after)
         weight = float(mw.group(1)) if mw else 0.0
         mb = re.search(r"(\d{3})(?:kg)?\(([+-]?\d+)\)", after)
@@ -253,6 +325,8 @@ def parse_entries(text: str) -> List[Entry]:
 
         odds = None
         popularity = None
+
+        # Standard rendered copy with bodyweight: 460(-2) 26.6 9
         if mb:
             tail = after[mb.end():]
             mop = re.search(r"(?<!\d)(\d+(?:\.\d+)?)\s+(?:\(|（)?\s*(\d{1,2})\s*(?:人気)?(?:\)|）)?", tail)
@@ -260,35 +334,24 @@ def parse_entries(text: str) -> List[Entry]:
                 odds = float(mop.group(1))
                 popularity = int(mop.group(2))
 
-        # Another common copy form is: bodyweight  68.5  13
-        if popularity is None and mb:
-            nums = re.findall(r"(?<!\d)(\d+(?:\.\d+)?)(?!\d)", after[mb.end():mb.end()+120])
-            if len(nums) >= 2:
-                try:
-                    odds = float(nums[0])
-                    popularity = int(float(nums[1]))
-                except ValueError:
-                    pass
-
-        # Some netkeiba rendered-copy layouts omit current bodyweight entirely.
-        # Example: "牡3 57.0 騎手 栗東厩舎 5.0 3".
-        # In that case, use the final odds/popularity pair in the current horse block.
+        # Bodyweight omitted: use the LAST plausible odds/popularity pair INSIDE
+        # this row only. Because row_end is now the next row start, no next-row
+        # frame/horse number can leak into this parse.
         if popularity is None:
-            short_after = after[:220]
-            nums = re.findall(r"(?<!\d)(\d+(?:\.\d+)?)(?!\d)", short_after)
-            if len(nums) >= 3:
-                # First numeric token is usually assigned weight (e.g. 57.0).
-                # Search backward for a plausible popularity integer and the odds immediately before it.
-                for j in range(len(nums) - 1, 0, -1):
-                    try:
-                        pop_cand = int(float(nums[j]))
-                        odds_cand = float(nums[j - 1])
-                    except ValueError:
+            nums = re.findall(r"(?<!\d)(\d+(?:\.\d+)?)(?!\d)", after)
+            for j in range(len(nums) - 1, 0, -1):
+                try:
+                    pop_cand = int(float(nums[j]))
+                    odds_cand = float(nums[j - 1])
+                except ValueError:
+                    continue
+                if 1 <= pop_cand <= 30 and odds_cand >= 1.0:
+                    # Do not treat assigned weight (e.g. 57.0) as odds.
+                    if abs(odds_cand - weight) < 1e-9:
                         continue
-                    if 1 <= pop_cand <= 30 and odds_cand >= 1.0:
-                        popularity = pop_cand
-                        odds = odds_cand
-                        break
+                    popularity = pop_cand
+                    odds = odds_cand
+                    break
 
         if popularity is None or not (1 <= popularity <= 30):
             continue
@@ -298,20 +361,24 @@ def parse_entries(text: str) -> List[Entry]:
             weight=weight, bodyweight=bodyweight, body_change=body_change,
             odds=odds, popularity=popularity,
         ))
-        last_anchor_end = m.end()
 
-    # de-dupe by horse number. Prefer rows with a sensible name/bodyweight/popularity.
+    # De-dupe by horse number. Prefer rows with bodyweight and sensible odds/popularity.
     out: Dict[int, Entry] = {}
     for e in entries:
         old = out.get(e.number)
         if old is None:
             out[e.number] = e
         else:
-            old_quality = int(bool(old.name)) + int(old.bodyweight is not None) + int(old.popularity > 0)
-            new_quality = int(bool(e.name)) + int(e.bodyweight is not None) + int(e.popularity > 0)
+            old_quality = int(bool(old.name)) + int(old.bodyweight is not None) + int(old.odds is not None) + int(old.popularity > 0)
+            new_quality = int(bool(e.name)) + int(e.bodyweight is not None) + int(e.odds is not None) + int(e.popularity > 0)
             if new_quality > old_quality:
                 out[e.number] = e
-    return sorted(out.values(), key=lambda x: x.number)
+
+    result = sorted(out.values(), key=lambda x: x.number)
+    result, repaired = _reconcile_popularity_with_odds(result)
+    # Store a lightweight flag for the UI without changing the Entry dataclass.
+    st.session_state["popularity_auto_repaired"] = repaired
+    return result
 
 def normalize_going(g: str) -> str:
     return {"稍": "稍重", "不": "不良"}.get(g, g)
@@ -746,7 +813,7 @@ def verify_result(pred: Dict, result_text: str) -> Dict:
 
 st.set_page_config(page_title=APP_NAME, page_icon="🏇", layout="wide")
 st.title("🏇 競馬AI Fixed Selection v1.2")
-st.caption("完全固定版 v3.0 × 相手C改良版＋人気帯3-2-1｜予想時点で選定をロック｜v1.2 クリア動作修正")
+st.caption("完全固定版 v3.0 × 相手C改良版＋人気帯3-2-1｜予想時点で選定をロック｜v1.5 人気解析修正")
 
 if "locked_prediction" not in st.session_state:
     st.session_state.locked_prediction = None
@@ -815,6 +882,17 @@ with pred_tab:
         race = parse_race_info(race_text)
         entries = parse_entries(entry_text)
         histories = parse_horse_histories(history_text, entries)
+
+        if st.session_state.get("popularity_auto_repaired", False):
+            st.warning("出馬表の人気数字にオッズ順位との矛盾を検出したため、オッズ順から人気を自動補正しました。")
+
+        if entries:
+            with st.expander("解析した人気順を確認", expanded=False):
+                pop_preview = pd.DataFrame([
+                    {"人気": e.popularity, "馬番": e.number, "馬名": e.name, "オッズ": e.odds}
+                    for e in sorted(entries, key=lambda x: (x.popularity, x.number))
+                ])
+                st.dataframe(pop_preview, use_container_width=True, hide_index=True)
 
         st.caption(f"解析結果：出馬表 {len(entries)}頭 / 馬柱 {len(histories)}頭")
 
