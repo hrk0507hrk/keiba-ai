@@ -12,7 +12,7 @@ import pandas as pd
 import streamlit as st
 
 
-APP_NAME = "競馬AI Fixed Selection v1.1"
+APP_NAME = "競馬AI Fixed Selection v1.2"
 LOCAL_TRACKS = {"福島", "新潟", "小倉", "札幌", "函館"}
 STEEP_TRACKS = {"中山", "阪神", "中京"}
 SUMMER_MONTHS = {6, 7, 8}
@@ -725,13 +725,24 @@ def verify_result(pred: Dict, result_text: str) -> Dict:
 # -----------------------------
 
 st.set_page_config(page_title=APP_NAME, page_icon="🏇", layout="wide")
-st.title("🏇 競馬AI Fixed Selection v1.1")
-st.caption("完全固定版 v3.0 × 相手C改良版＋人気帯3-2-1｜予想時点で選定をロック")
+st.title("🏇 競馬AI Fixed Selection v1.2")
+st.caption("完全固定版 v3.0 × 相手C改良版＋人気帯3-2-1｜予想時点で選定をロック｜v1.2 クリア動作修正")
 
 if "locked_prediction" not in st.session_state:
     st.session_state.locked_prediction = None
 if "history" not in st.session_state:
     st.session_state.history = []
+
+# 入力欄は明示的なkeyで管理。ボタンのon_click内で消すことで、
+# Streamlitの「widget作成後はsession_stateを書き換えられない」制約を回避する。
+def clear_prediction_inputs():
+    st.session_state.locked_prediction = None
+    st.session_state.race_date_input = date.today()
+    st.session_state.race_text_input = ""
+    st.session_state.entry_text_input = ""
+    st.session_state.history_text_input = ""
+    st.session_state.result_text_input = ""
+
 
 with st.sidebar:
     st.subheader("固定ルール")
@@ -760,25 +771,25 @@ pred_tab, hist_tab, rule_tab = st.tabs(["予想・結果検証", "検証履歴",
 
 with pred_tab:
     st.subheader("① 入力")
-    race_date = st.date_input("レース日", value=date.today())
+    race_date = st.date_input("レース日", value=date.today(), key="race_date_input")
 
     c1, c2, c3 = st.columns(3)
     with c1:
-        race_text = st.text_area("レース情報", height=220, placeholder="# 3歳未勝利\n18:30発走 / 芝1400m ...")
+        race_text = st.text_area("レース情報", height=220, placeholder="# 3歳未勝利\n18:30発走 / 芝1400m ...", key="race_text_input")
     with c2:
-        entry_text = st.text_area("出馬表", height=220, placeholder="netkeibaの出馬表をそのまま貼り付け")
+        entry_text = st.text_area("出馬表", height=220, placeholder="netkeibaの出馬表をそのまま貼り付け", key="entry_text_input")
     with c3:
-        history_text = st.text_area("馬柱", height=220, placeholder="全馬の馬柱をそのまま貼り付け")
+        history_text = st.text_area("馬柱", height=220, placeholder="全馬の馬柱をそのまま貼り付け", key="history_text_input")
 
     b1, b2 = st.columns([1, 1])
     with b1:
         predict_clicked = st.button("予想する（この時点でロック）", type="primary", use_container_width=True)
     with b2:
-        clear_clicked = st.button("ロック解除 / クリア", use_container_width=True)
-
-    if clear_clicked:
-        st.session_state.locked_prediction = None
-        st.rerun()
+        st.button(
+            "入力・予想をすべてクリア",
+            use_container_width=True,
+            on_click=clear_prediction_inputs,
+        )
 
     if predict_clicked:
         race = parse_race_info(race_text)
@@ -850,7 +861,7 @@ with pred_tab:
 
         st.divider()
         st.subheader("③ 結果検証")
-        result_text = st.text_input("1〜3着の馬番", placeholder="例：15-7-4")
+        result_text = st.text_input("1〜3着の馬番", placeholder="例：15-7-4", key="result_text_input")
         if st.button("結果を照合して履歴に保存", use_container_width=True):
             try:
                 record = verify_result(pred, result_text)
