@@ -12,7 +12,7 @@ import pandas as pd
 import streamlit as st
 
 
-APP_NAME = "競馬AI Fixed Selection v1.3"
+APP_NAME = "競馬AI Fixed Selection v1.4"
 LOCAL_TRACKS = {"福島", "新潟", "小倉", "札幌", "函館"}
 STEEP_TRACKS = {"中山", "阪神", "中京"}
 SUMMER_MONTHS = {6, 7, 8}
@@ -269,6 +269,26 @@ def parse_entries(text: str) -> List[Entry]:
                     popularity = int(float(nums[1]))
                 except ValueError:
                     pass
+
+        # Some netkeiba rendered-copy layouts omit current bodyweight entirely.
+        # Example: "牡3 57.0 騎手 栗東厩舎 5.0 3".
+        # In that case, use the final odds/popularity pair in the current horse block.
+        if popularity is None:
+            short_after = after[:220]
+            nums = re.findall(r"(?<!\d)(\d+(?:\.\d+)?)(?!\d)", short_after)
+            if len(nums) >= 3:
+                # First numeric token is usually assigned weight (e.g. 57.0).
+                # Search backward for a plausible popularity integer and the odds immediately before it.
+                for j in range(len(nums) - 1, 0, -1):
+                    try:
+                        pop_cand = int(float(nums[j]))
+                        odds_cand = float(nums[j - 1])
+                    except ValueError:
+                        continue
+                    if 1 <= pop_cand <= 30 and odds_cand >= 1.0:
+                        popularity = pop_cand
+                        odds = odds_cand
+                        break
 
         if popularity is None or not (1 <= popularity <= 30):
             continue
@@ -808,12 +828,13 @@ with pred_tab:
             problems.append("出馬表から十分な頭数を取得できませんでした。")
         if race.field_size and len(entries) != race.field_size:
             diff = race.field_size - len(entries)
-            if diff > 0:
+            # Zero/fewer-than-3 parsed rows is a parser failure, not a plausible scratch/withdrawal case.
+            if len(entries) >= 3 and diff > 0:
                 notices.append(
                     f"レース情報は{race.field_size}頭ですが、出馬表では{len(entries)}頭を確認しました。"
                     f" 取消・除外などで{diff}頭減っている可能性があるため、実出走{len(entries)}頭として予想を続行します。"
                 )
-            else:
+            elif len(entries) >= 3 and diff < 0:
                 notices.append(
                     f"レース情報は{race.field_size}頭ですが、出馬表では{len(entries)}頭を確認しました。"
                     " 出馬表の解析頭数を優先して予想します。"
