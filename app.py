@@ -12,13 +12,14 @@ import pandas as pd
 import streamlit as st
 
 
-APP_NAME = "競馬AI Fixed Selection v1.5"
+APP_NAME = "競馬AI Fixed Selection v1.6"
 LOCAL_TRACKS = {"福島", "新潟", "小倉", "札幌", "函館"}
 STEEP_TRACKS = {"中山", "阪神", "中京"}
 SUMMER_MONTHS = {6, 7, 8}
 WINTER_MONTHS = {12, 1, 2}
 JRA_TRACKS = {"札幌", "函館", "福島", "新潟", "東京", "中山", "中京", "京都", "阪神", "小倉"}
-ALL_TRACKS = JRA_TRACKS | {"園田", "船橋", "浦和", "佐賀", "金沢", "高知", "大井", "川崎", "門別"}
+NAR_TRACKS = {"盛岡", "水沢", "浦和", "船橋", "大井", "川崎", "金沢", "笠松", "名古屋", "園田", "姫路", "高知", "佐賀", "門別"}
+ALL_TRACKS = JRA_TRACKS | NAR_TRACKS
 
 
 @dataclass
@@ -130,7 +131,7 @@ def parse_race_info(text: str) -> RaceInfo:
         info.surface = m.group(1)
         info.distance = int(m.group(2))
 
-    for tr in JRA_TRACKS:
+    for tr in ALL_TRACKS:
         if re.search(rf"(?:\d+回\s*)?{tr}(?:\s*\d+日目)?", text):
             info.track = tr
             break
@@ -812,8 +813,8 @@ def verify_result(pred: Dict, result_text: str) -> Dict:
 # -----------------------------
 
 st.set_page_config(page_title=APP_NAME, page_icon="🏇", layout="wide")
-st.title("🏇 競馬AI Fixed Selection v1.2")
-st.caption("完全固定版 v3.0 × 相手C改良版＋人気帯3-2-1｜予想時点で選定をロック｜v1.5 人気解析修正")
+st.title("🏇 競馬AI Fixed Selection v1.6")
+st.caption("完全固定版 v3.0 × 相手C改良版＋人気帯3-2-1｜予想時点で選定をロック｜v1.6 地方競馬場解析対応")
 
 if "locked_prediction" not in st.session_state:
     st.session_state.locked_prediction = None
