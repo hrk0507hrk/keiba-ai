@@ -10,7 +10,7 @@ import pandas as pd
 import streamlit as st
 
 
-APP_NAME = "競馬AI 時計選定 v2.0"
+APP_NAME = "競馬AI 時計選定 v2.0.1-B"
 LOCAL_TRACKS = {"福島", "新潟", "小倉", "札幌", "函館"}
 STEEP_TRACKS = {"中山", "阪神", "中京"}
 WINTER_MONTHS = {12, 1, 2}
@@ -568,9 +568,8 @@ def axis_penalty(
         score -= 3
         reasons.append("ハンデ戦トップハンデ -3")
 
-    if not has_steep_good_run(history):
-        score -= 2
-        reasons.append("急坂好走なし -2")
+    # B運用版：急坂好走なしは減点に使用しない。
+    # 時計TOP6を絞った後は、確認しやすい明確な危険条件だけでグループ分けする。
 
     if entry.body_change is not None and abs(entry.body_change) >= 15:
         score -= 2
@@ -1243,7 +1242,7 @@ with rule_tab:
 - −3：芝14番以降
 - −3：ダート1枠 / 2枠
 - −3：ハンデ戦トップハンデ
-- −2：急坂好走なし
+- 急坂好走なし：**B運用版では減点しない**
 - −2：馬体重±15kg以上
 - −1：距離延長
 - −1：冬牝 / 8月の牡馬
