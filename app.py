@@ -780,6 +780,7 @@ def build_profiles(race: RaceInfo, entries: List[Entry], histories: Dict[int, Ho
             "exact_quality_time": quality_time(exact),
             "exact_quality_margin": quality_r.margin if quality_r else None,
             "exact_recent": recent_time(exact),
+            "exact_recent_date": max([r.race_date for r in exact if r.race_date is not None], default=None),
             "exact_second": second_best_time(exact),
             "exact_going_best": best_time(exact_going),
 
@@ -806,7 +807,7 @@ def build_profiles(race: RaceInfo, entries: List[Entry], histories: Dict[int, Ho
 
 
 
-def base_clock_order(race: RaceInfo, profiles: Dict[int, Dict]) -> List[int]:
+def base_clock_order(race: RaceInfo, profiles: Dict[int, Dict], race_date: date) -> List[int]:
     """
     現チャット検証に合わせた順位決定。
 
@@ -832,10 +833,29 @@ def base_clock_order(race: RaceInfo, profiles: Dict[int, Dict]) -> List[int]:
 
             # 再現性は「時計が近い馬同士」の微調整だけにする
             repeat_bonus = 0.0
-            repeat_bonus -= min(0.35, p["exact_close_count"] * 0.10)
-            repeat_bonus -= min(0.25, p["exact_win_count"] * 0.08)
-            repeat_bonus -= min(0.20, p["exact_competitive"] * 0.06)
-            repeat_bonus -= min(0.15, p["going_competitive"] * 0.05)
+            repeat_bonus -= min(0.20, p["exact_close_count"] * 0.06)
+            repeat_bonus -= min(0.16, p["exact_win_count"] * 0.05)
+            repeat_bonus -= min(0.15, p["exact_competitive"] * 0.05)
+
+            # 今回と同じ馬場で好走時計がある馬を優先
+            going_bonus = 0.0
+            if p["exact_going_best"] is not None:
+                going_bonus -= 0.18
+                going_bonus -= min(0.10, p["going_competitive"] * 0.05)
+
+            # 直近性。半年近く前の時計より、直近の同場同距離を優先。
+            recency_penalty = 0.0
+            rd = p.get("exact_recent_date")
+            if rd is not None:
+                days = (race_date - rd).days
+                if days <= 30:
+                    recency_penalty -= 0.15
+                elif days <= 60:
+                    recency_penalty -= 0.08
+                elif days >= 150:
+                    recency_penalty += 0.30
+                elif days >= 100:
+                    recency_penalty += 0.18
 
             # 上位クラスは小さく補助
             class_bonus = 0.0
@@ -856,6 +876,8 @@ def base_clock_order(race: RaceInfo, profiles: Dict[int, Dict]) -> List[int]:
             adjusted = (
                 (q if q is not None else 999.0)
                 + repeat_bonus
+                + going_bonus
+                + recency_penalty
                 + class_bonus
                 + rise_bonus
             )
@@ -908,10 +930,13 @@ def guard_lists(race: RaceInfo, entries: List[Entry], histories: Dict[int, Horse
 
     absolute, boundary, transfer, debut, first_distance, fast_big = [], [], [], [], [], []
 
-    # TOP6境界時計。境界候補がここから極端に遅い場合は保護しない。
-    base6 = base_order[:min(6, len(base_order))]
-    base6_times = [profiles[n]["exact_best"] for n in base6 if profiles[n]["exact_best"] is not None]
-    boundary_clock = max(base6_times) if base6_times else None
+    # 境界ガードは「0.3秒以内」だけで拾いすぎない。
+    # 同場同距離の上位3番手時計から大きく離れる馬は対象外。
+    exact_times_all = sorted(
+        p["exact_best"] for p in profiles.values()
+        if p["exact_best"] is not None
+    )
+    top3_clock_line = exact_times_all[min(2, len(exact_times_all) - 1)] if exact_times_all else None
 
     for n in base_order:
         p = profiles[n]
@@ -935,7 +960,10 @@ def guard_lists(race: RaceInfo, entries: List[Entry], histories: Dict[int, Horse
             and p["exact_best"] is not None
             and (p["exact_win_count"] > 0 or p["exact_close_count"] > 0)
         ):
-            close_enough = boundary_clock is None or p["exact_best"] <= boundary_clock + 1.0
+            close_enough = (
+                top3_clock_line is None
+                or p["exact_best"] <= top3_clock_line + 1.2
+            )
             if close_enough:
                 boundary.append(n)
 
@@ -1108,7 +1136,7 @@ def build_clock_prediction(race: RaceInfo, entries: List[Entry], histories: Dict
         raise ValueError("出馬表から3頭以上を読み取れませんでした。")
 
     profiles = build_profiles(race, entries, histories)
-    base_order = base_clock_order(race, profiles)
+    base_order = base_clock_order(race, profiles, race_date)
     guards = guard_lists(race, entries, histories, profiles, base_order)
     top6 = apply_top6_guards(base_order, guards)
     four, roles = pick_four(base_order, top6, profiles, guards)
@@ -1206,9 +1234,9 @@ def verify_result(pred: Dict, result_text: str) -> Dict:
 # UI
 # ============================================================
 
-APP_NAME = "競馬AI 時計分析 v3.2"
+APP_NAME = "競馬AI 時計分析 v3.3"
 st.set_page_config(page_title=APP_NAME, page_icon="⏱️", layout="wide")
-st.title("⏱️ 競馬AI 時計分析 v3.2")
+st.title("⏱️ 競馬AI 時計分析 v3.3")
 st.caption("時計分析単独｜4頭絞り【2連系用】＋時計TOP6【三連系用】＋検証ガード")
 
 if "locked_prediction" not in st.session_state:
@@ -1360,7 +1388,7 @@ with hist_tab:
         st.info("まだ検証履歴はありません。")
 
 with rule_tab:
-    st.subheader("時計分析 v3.2")
+    st.subheader("時計分析 v3.3")
     st.markdown("""
 ### ベース
 - **同競馬場・同距離の実時計を最優先**
