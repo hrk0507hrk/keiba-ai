@@ -1196,31 +1196,6 @@ def pick_four(base_order: List[int], top6: List[int], profiles: Dict[int, Dict],
                 roles.pop(old, None)
                 roles[n] = "地方転入人気馬ガード"
 
-    # 境界ガードは、通常順位7～8位からTOP6へ昇格し、
-    # かつ「上昇度・再現性」が強い場合のみ4頭保護候補。
-    for n in guards["boundary"]:
-        if n not in selected and n in top6:
-            p = profiles[n]
-            strong_boundary = (
-                p["exact_close_count"] > 0
-                or p["exact_win_count"] > 0
-            )
-            if strong_boundary:
-                # TOP1/TOP2は壊さず、最弱の補完枠と比較
-                repl_candidates = [
-                    i for i, x in enumerate(selected)
-                    if roles.get(x) not in {"時計TOP1", "時計TOP2"}
-                ]
-                if repl_candidates:
-                    # base順位が最も低い補完枠を交換
-                    repl = max(repl_candidates, key=lambda i: base_order.index(selected[i]))
-                    old = selected[repl]
-                    # 境界馬が「通常7～8位」だった場合だけ保護
-                    if base_order.index(n) in {6, 7}:
-                        selected[repl] = n
-                        roles.pop(old, None)
-                        roles[n] = "境界ガード"
-
     selected = sorted(selected[:4], key=lambda n: base_order.index(n))
     return selected, roles
 
@@ -1363,9 +1338,9 @@ def verify_result(pred: Dict, result_text: str) -> Dict:
 # UI
 # ============================================================
 
-APP_NAME = "競馬AI 時計分析 v3.6"
+APP_NAME = "競馬AI 時計分析 v3.7"
 st.set_page_config(page_title=APP_NAME, page_icon="⏱️", layout="wide")
-st.title("⏱️ 競馬AI 時計分析 v3.6")
+st.title("⏱️ 競馬AI 時計分析 v3.7")
 st.caption("時計分析単独｜4頭絞り【2連系用】＋時計TOP6【三連系用】＋検証ガード")
 
 if "locked_prediction" not in st.session_state:
@@ -1517,7 +1492,7 @@ with hist_tab:
         st.info("まだ検証履歴はありません。")
 
 with rule_tab:
-    st.subheader("時計分析 v3.6")
+    st.subheader("時計分析 v3.7")
     st.markdown("""
 ### ベース
 - **同競馬場・同距離の実時計を最優先**
