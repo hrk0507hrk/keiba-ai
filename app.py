@@ -823,166 +823,282 @@ def build_profiles(race: RaceInfo, entries: List[Entry], histories: Dict[int, Ho
 
 
 
+
+def race_evidence_score(r: PastRace, race_date: date) -> float:
+    """
+    JRA 1600-1800m用。
+    別競馬場の生時計秒数は比較せず、
+    着差・着順・クラス・直近性から「その走りの価値」を点数化。
+    高いほど強い。
+    """
+    score = 0.0
+
+    # 着差
+    if r.margin is not None:
+        if r.margin <= 0.0:
+            score += 6.0
+        elif r.margin <= 0.3:
+            score += 5.0
+        elif r.margin <= 0.6:
+            score += 3.8
+        elif r.margin <= 1.0:
+            score += 2.5
+        elif r.margin <= 1.5:
+            score += 1.0
+        else:
+            score -= min(3.0, (r.margin - 1.5) * 1.2)
+
+    # 着順
+    if r.finish is not None:
+        if r.finish == 1:
+            score += 2.0
+        elif r.finish == 2:
+            score += 1.4
+        elif r.finish == 3:
+            score += 1.0
+        elif r.finish <= 5:
+            score += 0.3
+        elif r.finish >= 10:
+            score -= 0.7
+
+    # クラス（同時計なら上位クラスを評価）
+    cr = r.class_rank
+    if cr >= 10:
+        score += 3.0
+    elif cr >= 8:
+        score += 2.5
+    elif cr >= 6:
+        score += 2.0
+    elif cr >= 5:
+        score += 1.4
+    elif cr >= 4:
+        score += 0.9
+    elif cr >= 3:
+        score += 0.5
+
+    # 直近性
+    if r.race_date is not None:
+        days = (race_date - r.race_date).days
+        if days <= 30:
+            score += 1.0
+        elif days <= 60:
+            score += 0.7
+        elif days <= 100:
+            score += 0.35
+        elif days >= 200:
+            score -= 0.5
+
+    return score
+
+
+def jra_middle_evidence(profiles: Dict[int, Dict], race_date: date) -> Dict[int, Dict]:
+    """
+    JRA 1600-1800m用の比較材料。
+    各馬の同距離/距離帯の走りを「内容」で比較し、生時計の跨場比較をしない。
+    """
+    out = {}
+    for n, p in profiles.items():
+        h = p.get("history")
+        races = []
+        if h:
+            races = [
+                r for r in h.races
+                if r.surface in {"芝", "ダ"}
+                and r.distance is not None
+                and 1600 <= r.distance <= 1800
+                and r.time_seconds is not None
+            ]
+
+        # current distance is not stored in p; caller supplies all races and uses score only.
+        scored = sorted(
+            [(race_evidence_score(r, race_date), r) for r in races],
+            key=lambda x: x[0],
+            reverse=True,
+        )
+        best_score = scored[0][0] if scored else -99.0
+        second_score = scored[1][0] if len(scored) >= 2 else -99.0
+        close_count = sum(
+            1 for r in races
+            if r.margin is not None and r.margin <= 0.6
+        )
+        top3_count = sum(
+            1 for r in races
+            if r.finish is not None and r.finish <= 3
+        )
+        class_best = max([r.class_rank for r in races], default=-2)
+
+        out[n] = {
+            "best_score": best_score,
+            "second_score": second_score,
+            "close_count": close_count,
+            "top3_count": top3_count,
+            "class_best": class_best,
+            "races": races,
+        }
+    return out
+
+
 def base_clock_order(race: RaceInfo, profiles: Dict[int, Dict], race_date: date) -> List[int]:
     """
-    現チャット検証に合わせた順位決定。
+    TOP6専用・チャット再現ロジック。
 
-    最優先:
-      1. 同競馬場・同距離の時計がある
-      2. 「時計 + その時計を出した時の着差」の実戦価値
-      3. 純粋な絶対時計
-      4. 再現性 / 同馬場 / クラス / 直近性
+    地方：
+      同場同距離の生時計 + 着差 + 再現性を最優先。
 
-    別競馬場の生時計は、同場同距離馬と秒数で直接比較しない。
+    JRA 1600-1800m：
+      別場の生時計を直接比較しない。
+      同距離/近距離の「着差・着順・クラス・直近性・再現性」で比較し、
+      同場同距離時計はタイブレークに使う。
+
+    2000m：
+      同距離そのものを強く優先。
     """
     nums = list(profiles)
 
-    def key(n: int):
-        p = profiles[n]
+    # ------------------------------------------------
+    # JRA 1600-1800m
+    # ------------------------------------------------
+    if race.track in JRA_TRACKS and 1600 <= race.distance <= 1800:
+        ev = {}
+        for n, p in profiles.items():
+            h = p.get("history")
+            relevant = []
+            if h:
+                # 同距離を最優先。材料不足時だけ1600-1800帯を補助。
+                same = [
+                    r for r in h.races
+                    if r.surface == race.surface
+                    and r.distance == race.distance
+                    and r.time_seconds is not None
+                ]
+                band = [
+                    r for r in h.races
+                    if r.surface == race.surface
+                    and r.distance is not None
+                    and 1600 <= r.distance <= 1800
+                    and r.time_seconds is not None
+                ]
+                relevant = same if same else band
 
-        # 2000m専用：
-        # 2000mは同場同距離そのものを最優先。
-        # 1800m/2200m等は補助で、2000m実績馬より上には置かない。
-        if race.distance == 2000:
+            scored = sorted(
+                [(race_evidence_score(r, race_date), r) for r in relevant],
+                key=lambda x: x[0],
+                reverse=True,
+            )
+            best = scored[0][0] if scored else -99.0
+            second = scored[1][0] if len(scored) >= 2 else -99.0
+            close06 = sum(1 for _, r in scored if r.margin is not None and r.margin <= 0.6)
+            close10 = sum(1 for _, r in scored if r.margin is not None and r.margin <= 1.0)
+            wins = sum(1 for _, r in scored if r.finish == 1)
+            class_best = max([r.class_rank for _, r in scored], default=-2)
+
+            # 再現性を加点
+            total = best
+            if second > -90:
+                total += max(0.0, second) * 0.28
+            total += min(2.0, close06 * 0.55)
+            total += min(1.2, close10 * 0.20)
+            total += min(1.0, wins * 0.25)
+
+            ev[n] = {
+                "total": total,
+                "best": best,
+                "second": second,
+                "class_best": class_best,
+                "exact_best": p["exact_best"],
+                "exact_count": p["exact_count"],
+            }
+
+        return sorted(
+            nums,
+            key=lambda n: (
+                -ev[n]["total"],
+                -ev[n]["best"],
+                -ev[n]["second"],
+                -ev[n]["class_best"],
+                0 if ev[n]["exact_count"] > 0 else 1,
+                float("inf") if ev[n]["exact_best"] is None else ev[n]["exact_best"],
+                n,
+            )
+        )
+
+    # ------------------------------------------------
+    # 2000m
+    # ------------------------------------------------
+    if race.distance == 2000:
+        def key2000(n: int):
+            p = profiles[n]
             if p["exact_count"] > 0:
                 q = p["exact_quality_time"] if p["exact_quality_time"] is not None else 999.0
-                raw = p["exact_best"] if p["exact_best"] is not None else 999.0
                 bm = p.get("exact_best_margin")
-
-                # 同距離でも「大敗の遅い時計」まで無条件に保護しない。
-                # 2.5秒超の大敗は、初距離/隣接距離の有力馬と同じ補助グループへ降格。
                 weak_exact = bm is not None and bm > 2.5
-
-                repeat_bonus = (
-                    min(0.24, p["exact_close_count"] * 0.08)
-                    + min(0.18, p["exact_win_count"] * 0.06)
-                    + min(0.15, p["exact_competitive"] * 0.05)
-                )
-
-                going_bonus = 0.10 if p["exact_going_best"] is not None else 0.0
-
-                recency_bonus = 0.0
-                rd = p.get("exact_recent_date")
-                if rd is not None:
-                    days = (race_date - rd).days
-                    if days <= 30:
-                        recency_bonus = 0.08
-                    elif days >= 120:
-                        recency_bonus = -0.12
-
-                class_bonus = 0.0
-                if p["class_best"] >= 4:
-                    class_bonus = 0.08
-                elif p["class_best"] >= 3:
-                    class_bonus = 0.04
-
-                adjusted = q - repeat_bonus - going_bonus - recency_bonus - class_bonus
-
-                if not weak_exact:
-                    return (
-                        0,
-                        adjusted,
-                        raw,
-                        -p["exact_competitive"],
-                        -p["class_best"],
-                        n,
-                    )
-
-                # 弱い同距離実績:
-                # 初距離馬より絶対に上ではなく、時計内容で比較する補助群
+                group = 1 if weak_exact else 0
                 return (
-                    1,
-                    2,
-                    adjusted,
+                    group,
+                    q,
+                    float("inf") if p["exact_best"] is None else p["exact_best"],
+                    -p["exact_competitive"],
                     -p["class_best"],
                     n,
                 )
-
-            # 同場2000mなし。
-            # 別場2000m > 同場隣接 > 別場隣接。
             if p["other_track_same_dist"]:
-                return (
-                    1, 0,
-                    -(p["other_close_count"] + p["other_win_count"]),
-                    -p["class_best"], n
-                )
+                return (1, 0, -(p["other_close_count"] + p["other_win_count"]), -p["class_best"], n)
             if p["adjacent_same_track"]:
                 return (1, 1, -p["class_best"], n)
             if p["adjacent_other"]:
                 return (1, 3, -p["class_best"], n)
             return (1, 4, -p["class_best"], n)
+        return sorted(nums, key=key2000)
 
-        # ----------------------------
-        # A. 同場同距離実績あり
-        # ----------------------------
+    # ------------------------------------------------
+    # 地方・その他
+    # ------------------------------------------------
+    def key_local(n: int):
+        p = profiles[n]
         if p["exact_count"] > 0:
-            q = p["exact_quality_time"]
-            raw = p["exact_best"]
+            q = p["exact_quality_time"] if p["exact_quality_time"] is not None else 999.0
+            raw = p["exact_best"] if p["exact_best"] is not None else 999.0
 
-            # 再現性は「時計が近い馬同士」の微調整だけにする
-            repeat_bonus = 0.0
-            repeat_bonus -= min(0.20, p["exact_close_count"] * 0.06)
-            repeat_bonus -= min(0.16, p["exact_win_count"] * 0.05)
-            repeat_bonus -= min(0.15, p["exact_competitive"] * 0.05)
+            repeat_bonus = (
+                min(0.20, p["exact_close_count"] * 0.06)
+                + min(0.16, p["exact_win_count"] * 0.05)
+                + min(0.15, p["exact_competitive"] * 0.05)
+            )
+            going_bonus = 0.18 if p["exact_going_best"] is not None else 0.0
 
-            # 今回と同じ馬場で好走時計がある馬を優先
-            going_bonus = 0.0
-            if p["exact_going_best"] is not None:
-                going_bonus -= 0.18
-                going_bonus -= min(0.10, p["going_competitive"] * 0.05)
-
-            # 直近性。半年近く前の時計より、直近の同場同距離を優先。
-            recency_penalty = 0.0
+            recency_bonus = 0.0
             rd = p.get("exact_recent_date")
             if rd is not None:
                 days = (race_date - rd).days
                 if days <= 30:
-                    recency_penalty -= 0.15
+                    recency_bonus = 0.15
                 elif days <= 60:
-                    recency_penalty -= 0.08
+                    recency_bonus = 0.08
                 elif days >= 150:
-                    recency_penalty += 0.30
+                    recency_bonus = -0.30
                 elif days >= 100:
-                    recency_penalty += 0.18
+                    recency_bonus = -0.18
 
-            # 上位クラスは小さく補助
             class_bonus = 0.0
             if p["class_best"] >= 6:
-                class_bonus = -0.18
+                class_bonus = 0.18
             elif p["class_best"] >= 4:
-                class_bonus = -0.12
+                class_bonus = 0.12
             elif p["class_best"] >= 3:
-                class_bonus = -0.07
+                class_bonus = 0.07
             elif p["class_best"] >= 2:
-                class_bonus = -0.03
+                class_bonus = 0.03
 
-            # 上昇度も小さく補助
-            rise_bonus = 0.0
-            if p["improvement"] is not None and p["improvement"] >= 0.5:
-                rise_bonus = -min(0.15, p["improvement"] * 0.03)
-
-            adjusted = (
-                (q if q is not None else 999.0)
-                + repeat_bonus
-                + going_bonus
-                + recency_penalty
-                + class_bonus
-                + rise_bonus
-            )
-
+            adjusted = q - repeat_bonus - going_bonus - recency_bonus - class_bonus
             return (
-                0,                                  # 同場同距離ありを最優先
-                adjusted,                           # 着差込みの時計価値
-                raw if raw is not None else 999.0,  # 絶対時計
-                -p["exact_competitive"],            # 再現性
-                -p["class_best"],                   # クラス
+                0,
+                adjusted,
+                raw,
+                -p["exact_competitive"],
+                -p["class_best"],
                 n,
             )
 
-        # ----------------------------
-        # B. 同場同距離なし
-        # ----------------------------
-        # ここでは別場の「1:38.2」などを大井1:41台と直接比較しない。
         support_level = 3
         if p["adjacent_same_track"]:
             support_level = 0
@@ -991,19 +1107,16 @@ def base_clock_order(race: RaceInfo, profiles: Dict[int, Dict], race_date: date)
         elif p["adjacent_other"]:
             support_level = 2
 
-        support_quality = (
+        return (
+            1,
+            support_level,
             -(p["other_close_count"] + p["other_win_count"]),
             -p["class_best"],
-        )
-
-        return (
-            1,                 # exact馬より必ず後ろ
-            support_level,
-            support_quality,
             n,
         )
 
-    return sorted(nums, key=key)
+    return sorted(nums, key=key_local)
+
 
 
 
@@ -1214,24 +1327,18 @@ def build_clock_prediction(race: RaceInfo, entries: List[Entry], histories: Dict
     guards = guard_lists(race, entries, histories, profiles, base_order)
     top6 = apply_top6_guards(base_order, guards)
 
-
-    four, roles = pick_four(base_order, top6, profiles, guards)
     by_num = {e.number: e for e in entries}
 
-    four_rows = [{
-        "馬番": n, "馬名": by_num[n].name, "役割": roles.get(n, ""),
-        "評価": evaluation_text(race, profiles[n])
-    } for n in four]
-
     top6_rows = [{
-        "時計順位": i, "馬番": n, "馬名": by_num[n].name,
+        "時計順位": i,
+        "馬番": n,
+        "馬名": by_num[n].name,
         "同場同距離": format_time(profiles[n]["exact_best"]),
         "ベスト時計時着差": "—" if profiles[n]["exact_best_margin"] is None else f"{profiles[n]['exact_best_margin']:.1f}",
         "着差補正時計": format_time(profiles[n]["exact_quality_time"]),
         "別場同距離参考": format_time(profiles[n]["other_same_dist_best"]),
         "直近同場同距離": format_time(profiles[n]["exact_recent"]),
         "2本目": format_time(profiles[n]["exact_second"]),
-        "最小着差": "—" if profiles[n]["best_margin"] is None else f"{profiles[n]['best_margin']:.1f}",
         "同場0.3以内": profiles[n]["exact_close_count"],
         "同場同距離勝": profiles[n]["exact_win_count"],
         "評価": evaluation_text(race, profiles[n]),
@@ -1248,14 +1355,13 @@ def build_clock_prediction(race: RaceInfo, entries: List[Entry], histories: Dict
         "race": asdict(race),
         "race_date": race_date.isoformat(),
         "base_order": base_order,
-        "four": four,
-        "four_rows": four_rows,
         "top6": top6,
         "top6_rows": top6_rows,
         "top6_status": status,
         "guards": guards,
         "entries": [asdict(e) for e in entries],
     }
+
 
 
 # ============================================================
@@ -1272,9 +1378,7 @@ def verify_result(pred: Dict, result_text: str) -> Dict:
         raise ValueError("結果は『7-5-10』のように1〜3着まで入力してください。")
 
     podium = result[:3]
-    four = set(map(int, pred["four"]))
     top6 = set(map(int, pred["top6"]))
-    four_hits = sum(n in four for n in podium)
     top6_hits = sum(n in top6 for n in podium)
 
     def guard_result(nums):
@@ -1288,11 +1392,6 @@ def verify_result(pred: Dict, result_text: str) -> Dict:
         "条件": f"{pred['race'].get('surface','')}{pred['race'].get('distance',0)}m",
         "頭数": len(pred["entries"]),
         "結果": "-".join(map(str, result)),
-        "4頭": "・".join(map(str, pred["four"])),
-        "4頭勝ち馬": "○" if result[0] in four else "×",
-        "4頭馬券内2頭以上": "○" if four_hits >= 2 else "×",
-        "4頭1・2着": "○" if result[0] in four and result[1] in four else "×",
-        "4頭馬券内数": f"{four_hits}/3",
         "時計TOP6": "・".join(map(str, pred["top6"])),
         "TOP6集計区分": pred["top6_status"],
         "TOP6馬券内": f"{top6_hits}/3",
@@ -1302,23 +1401,24 @@ def verify_result(pred: Dict, result_text: str) -> Dict:
         "地方転入ガード": guard_result(g["transfer"]),
         "初出走警戒": guard_result(g["debut"]),
         "初距離警戒": guard_result(g["first_distance"]),
-        "高速時計大差負け監視": guard_result(g["fast_big_margin"]),
     }
+
 
 
 # ============================================================
 # UI
 # ============================================================
 
-APP_NAME = "競馬AI 時計分析 v3.8"
+APP_NAME = "競馬AI 時計TOP6 v4.0"
 st.set_page_config(page_title=APP_NAME, page_icon="⏱️", layout="wide")
-st.title("⏱️ 競馬AI 時計分析 v3.8")
-st.caption("時計分析単独｜4頭絞り【2連系用】＋時計TOP6【三連系用】＋検証ガード")
+st.title("⏱️ 競馬AI 時計TOP6 v4.0")
+st.caption("チャット検証ルール再現版｜時計TOP6だけに特化｜4頭絞り・固定AXIS・相手Cは不使用")
 
 if "locked_prediction" not in st.session_state:
     st.session_state.locked_prediction = None
 if "history" not in st.session_state:
     st.session_state.history = []
+
 
 def clear_prediction_inputs():
     st.session_state.locked_prediction = None
@@ -1328,24 +1428,29 @@ def clear_prediction_inputs():
     st.session_state.history_text_input = ""
     st.session_state.result_text_input = ""
 
-with st.sidebar:
-    st.subheader("現行ルール")
-    st.markdown("""
-- 人気・オッズは時計順位に不使用
-- 固定AXIS / 相手C / ハイブリッドは廃止
-- **同場同距離**の実時計＋着差＋再現性＋直近性
-- 別競馬場の同距離生時計は直接比較しない
-- 4頭＝最終時計順位の上位4頭を基本
-- 地方転入人気馬ガードのみ4頭へ強制保護
-- 絶対時計 / 境界 / 地方転入ガード
-- 初出走・初距離は警戒表示のみ
-""")
 
-pred_tab, hist_tab, rule_tab = st.tabs(["予想・結果検証", "検証履歴", "ルール"])
+with st.sidebar:
+    st.subheader("TOP6専用ルール")
+    st.markdown(
+        """
+- 人気・オッズは**ベース時計順位に不使用**
+- **地方**：同場同距離の時計＋着差＋再現性
+- **JRA 1600〜1800m**：別場生時計を直接比較せず、着差・クラス・再現性・直近性で比較
+- **2000m**：同距離そのものを最優先
+- 絶対時計ガード / 境界ガード / 地方転入人気馬ガードでTOP6保護
+- 初出走 / 初距離は警戒表示のみ
+- 6頭以下はTOP6参考・ノーカウント
+        """
+    )
+
+pred_tab, hist_tab, rule_tab, regression_tab = st.tabs(
+    ["予想・結果検証", "検証履歴", "ルール", "再現チェック"]
+)
 
 with pred_tab:
     st.subheader("① 入力")
     race_date = st.date_input("レース日", value=date.today(), key="race_date_input")
+
     c1, c2, c3 = st.columns(3)
     with c1:
         race_text = st.text_area("レース情報", height=220, key="race_text_input")
@@ -1356,7 +1461,7 @@ with pred_tab:
 
     b1, b2 = st.columns(2)
     with b1:
-        predict_clicked = st.button("時計分析する（事前固定）", type="primary", use_container_width=True)
+        predict_clicked = st.button("時計TOP6を分析する（事前固定）", type="primary", use_container_width=True)
     with b2:
         st.button("入力・予想をクリア", use_container_width=True, on_click=clear_prediction_inputs)
 
@@ -1364,6 +1469,7 @@ with pred_tab:
         race = parse_race_info(race_text)
         entries = parse_entries(entry_text)
         histories = parse_horse_histories(history_text, entries)
+
         problems = []
         if not race.surface or not race.distance:
             problems.append("芝/ダート・距離を取得できませんでした。")
@@ -1373,26 +1479,24 @@ with pred_tab:
             problems.append("出馬表を十分に解析できませんでした。")
         if len(histories) < min(len(entries), 3):
             problems.append("馬柱解析頭数が不足しています。")
+
         st.caption(f"解析：出馬表 {len(entries)}頭 / 馬柱 {len(histories)}頭")
+
         if problems:
             st.error("\n".join(problems))
         else:
-            try:
-                pred = build_clock_prediction(race, entries, histories, race_date)
-                st.session_state.locked_prediction = pred
-                st.success("事前分析を固定しました。結果入力時に再計算しません。")
-            except Exception as e:
-                st.error(f"分析エラー: {e}")
+            pred = build_clock_prediction(race, entries, histories, race_date)
+            st.session_state.locked_prediction = pred
+            st.success("時計TOP6を事前固定しました。結果入力時に再計算しません。")
 
     pred = st.session_state.locked_prediction
     if pred:
         st.divider()
         st.subheader("② 事前固定")
-        st.success("4頭絞り【2連系用】： " + "・".join(map(str, pred["four"])))
-        st.info(f"時計TOP6【三連系用】： {'・'.join(map(str, pred['top6']))}｜{pred['top6_status']}")
-
-        st.markdown("### 4頭絞り")
-        st.dataframe(pd.DataFrame(pred["four_rows"]), use_container_width=True, hide_index=True)
+        st.info(
+            f"時計TOP6【三連系用】： {'・'.join(map(str, pred['top6']))} "
+            f"｜{pred['top6_status']}"
+        )
 
         st.markdown("### 時計TOP6")
         st.dataframe(pd.DataFrame(pred["top6_rows"]), use_container_width=True, hide_index=True)
@@ -1404,7 +1508,6 @@ with pred_tab:
         st.write("**地方転入人気馬ガード**：" + ("・".join(map(str, g["transfer"])) if g["transfer"] else "該当なし"))
         st.write("**初出走警戒**：" + ("・".join(map(str, g["debut"])) if g["debut"] else "該当なし"))
         st.write("**初距離警戒**：" + ("・".join(map(str, g["first_distance"])) if g["first_distance"] else "該当なし"))
-        st.write("**高速時計＋大差負け監視**：" + ("・".join(map(str, g["fast_big_margin"])) if g["fast_big_margin"] else "該当なし"))
 
         st.divider()
         st.subheader("③ 結果検証")
@@ -1414,14 +1517,15 @@ with pred_tab:
                 record = verify_result(pred, result_text)
                 st.session_state.history.append(record)
                 st.success(
-                    f"結果 {record['結果']}｜4頭勝ち馬 {record['4頭勝ち馬']}｜"
-                    f"4頭1・2着 {record['4頭1・2着']}｜TOP6 {record['TOP6馬券内']}"
+                    f"結果 {record['結果']}｜TOP6馬券内 {record['TOP6馬券内']}｜"
+                    f"完全捕捉 {record['TOP6完全捕捉']}"
                 )
             except Exception as e:
                 st.error(str(e))
 
 with hist_tab:
     st.subheader("検証履歴")
+
     uploaded = st.file_uploader("過去検証CSVを読み込む", type=["csv"])
     if uploaded is not None:
         try:
@@ -1436,28 +1540,24 @@ with hist_tab:
         hdf = pd.DataFrame(st.session_state.history)
         st.dataframe(hdf, use_container_width=True, hide_index=True)
 
-        total4 = len(hdf)
-        win4 = int((hdf["4頭勝ち馬"] == "○").sum())
-        two4 = int((hdf["4頭馬券内2頭以上"] == "○").sum())
-        exact12 = int((hdf["4頭1・2着"] == "○").sum())
-
         counted = hdf[hdf["TOP6集計区分"] == "本集計"] if "TOP6集計区分" in hdf else hdf
-        nr = len(counted)
-        top6_hits = sum(int(str(x).split("/")[0]) for x in counted["TOP6馬券内"]) if nr else 0
-        top6_full = int((counted["TOP6完全捕捉"] == "○").sum()) if nr else 0
+        races = len(counted)
+        hits = sum(int(str(x).split("/")[0]) for x in counted["TOP6馬券内"]) if races else 0
+        full = int((counted["TOP6完全捕捉"] == "○").sum()) if races else 0
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("4頭 勝ち馬捕捉", f"{win4}/{total4}")
-        c2.metric("4頭 馬券内2頭以上", f"{two4}/{total4}")
-        c3.metric("4頭 1・2着両捕捉", f"{exact12}/{total4}")
-        c4, c5 = st.columns(2)
-        c4.metric("TOP6 馬券内", f"{top6_hits}/{nr*3}" if nr else "0/0")
-        c5.metric("TOP6 完全捕捉", f"{top6_full}/{nr}" if nr else "0/0")
+        c1, c2 = st.columns(2)
+        c1.metric("時計TOP6 馬券内捕捉", f"{hits}/{races*3}" if races else "0/0")
+        c2.metric("時計TOP6 完全捕捉", f"{full}/{races}" if races else "0/0")
 
         csv_bytes = hdf.to_csv(index=False).encode("utf-8-sig")
-        st.download_button("検証履歴CSVをダウンロード", data=csv_bytes,
-                           file_name="keiba_clock_v3_history.csv",
-                           mime="text/csv", use_container_width=True)
+        st.download_button(
+            "検証履歴CSVをダウンロード",
+            data=csv_bytes,
+            file_name="keiba_clock_top6_v4_history.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
         if st.button("履歴を全削除"):
             st.session_state.history = []
             st.rerun()
@@ -1465,38 +1565,70 @@ with hist_tab:
         st.info("まだ検証履歴はありません。")
 
 with rule_tab:
-    st.subheader("時計分析 v3.8")
-    st.markdown("""
-### ベース
-- **同競馬場・同距離の実時計を最優先**
-- 別競馬場の同距離生時計は秒数で直接比較しない
-- 同場同距離が無い場合のみ別場同距離・隣接距離を補助
-- 速い時計でも1.0秒超の大差負けは強く抑える
-- 同距離実時計
-- 着差
-- 直近性
-- 再現性
-- 上昇度
-- クラス
-- 同距離材料が薄い場合のみ隣接距離
+    st.subheader("時計TOP6 v4.0")
+    st.markdown(
+        """
+### 共通
+1. 同距離の実戦時計
+2. 勝利 / 0.3秒差以内を強評価
+3. 0.4〜1.0秒差は次点
+4. 大差負け高速時計は評価を落とす
+5. 再現性
+6. 直近性
+7. クラス
+8. 同距離材料不足時のみ隣接距離
 
-### 4頭絞り
-**時計TOP1 + 時計TOP2 + 上昇度突出 + クラス突出**
+### 地方競馬
+- 同競馬場・同距離の生時計を直接比較
+- 別競馬場の生時計はそのまま比較しない
+
+### JRA 1600〜1800m
+- 新潟1:52と阪神1:52などを秒数だけで比較しない
+- 着差 / 着順 / クラス / 直近性 / 好走再現性を中心に比較
+- 同場同距離時計はタイブレーク
 
 ### ガード
-- 絶対時計：同距離TOP3級 + 勝利 / 0.3秒以内
-- 境界：通常7〜8位 + 同距離勝利 / 0.3秒以内
-- 地方転入人気馬：転入初戦相当 + JRA/南関等 + 3番人気以内
-- 初出走：5番人気以内を警戒表示
-- 初距離：隣接距離材料がある場合に警戒表示
-- 高速時計＋0.4〜1.5秒差は監視対象として記録し、現時点では強制加入しない
+- 絶対時計ガード
+- 絶対時計・境界ガード
+- 地方転入人気馬ガード
+- 初出走・初距離は警戒表示のみ
+        """
+    )
 
-### 少頭数
-- 6頭以下：TOP6参考・ノーカウント
-- 7頭：参考
-- 8頭以上：本集計
+with regression_tab:
+    st.subheader("既知レース再現チェック")
+    st.caption("最新版チャット分析で固定したTOP6。入力後、現在の出力と照合するための正解セット。")
 
-### 不使用
-固定AXIS / 相手C / ハイブリッド / 枠順補正 / 脚質補正 /
-騎手 / 調教師 / 血統 / 人気補正 / オッズ補正 / 当日馬場傾向補正
-""")
+    expected = {
+        "R34 新潟 柳都S ダ1800稍": [6, 14, 2, 8, 4, 11],
+        "R35 浦和 盆の月特別 ダ2000不": [3, 2, 10, 6, 7, 8],
+        "R37 大井 武蔵野OP ダ1200不": [3, 5, 6, 9, 10, 11],
+        "R38 門別 リンドウ特別 ダ1200良": [10, 7, 5, 6, 8, 9],
+        "R39 大井 トゥインクルバースデー賞 ダ1600不": [2, 6, 10, 14, 11, 1],
+    }
+
+    rdf = pd.DataFrame([
+        {"レース": k, "正解TOP6": "・".join(map(str, v))}
+        for k, v in expected.items()
+    ])
+    st.dataframe(rdf, use_container_width=True, hide_index=True)
+
+    if st.session_state.locked_prediction:
+        target = st.selectbox("照合する既知レース", list(expected.keys()))
+        actual = list(map(int, st.session_state.locked_prediction["top6"]))
+        exp = expected[target]
+        same_set = set(actual) == set(exp)
+        same_order = actual == exp
+        st.write(f"現在出力：**{'・'.join(map(str, actual))}**")
+        st.write(f"正解：**{'・'.join(map(str, exp))}**")
+        if same_order:
+            st.success("完全一致（6頭＋順番）")
+        elif same_set:
+            st.warning("6頭の集合は一致。順番のみ不一致。")
+        else:
+            missing = [n for n in exp if n not in actual]
+            extra = [n for n in actual if n not in exp]
+            st.error(
+                "不一致｜不足：" + ("・".join(map(str, missing)) if missing else "なし")
+                + "｜余分：" + ("・".join(map(str, extra)) if extra else "なし")
+            )
