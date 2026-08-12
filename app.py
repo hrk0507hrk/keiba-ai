@@ -1125,10 +1125,11 @@ def pick_four(base_order: List[int], top6: List[int], profiles: Dict[int, Dict],
             selected.append(n)
             roles[n] = role
 
+    # 1・2枠目は固定
     add(base_order[0] if base_order else None, "時計TOP1")
     add(base_order[1] if len(base_order) > 1 else None, "時計TOP2")
 
-    # 3頭目：上昇度＋再現性
+    # 3枠目：上昇度＋再現性
     rem = [n for n in top6 if n not in selected]
     if rem:
         def rise_key(n: int):
@@ -1140,37 +1141,48 @@ def pick_four(base_order: List[int], top6: List[int], profiles: Dict[int, Dict],
             )
             imp = -999.0 if p["improvement"] is None else p["improvement"]
             return (repeat, imp, -base_order.index(n))
-
         up = max(rem, key=rise_key)
         add(up, "上昇度・再現性")
 
-    # 4頭目：
-    # 「クラス突出」だけで一発実績馬を上げすぎず、
-    # 同場同距離の再現性・同馬場実績を合わせる。
+    # 4枠目：
+    # まず時計順位上位4頭の未選択馬を優先。
+    # クラスだけで5～6位馬が飛び越えない。
     rem = [n for n in top6 if n not in selected]
     if rem:
-        def class_repeat_key(n: int):
-            p = profiles[n]
-            consistency = (
-                p["exact_competitive"] * 2
-                + p["going_competitive"] * 2
-                + min(p["exact_count"], 3)
+        top4_candidates = [n for n in rem if base_order.index(n) <= 3]
+        if top4_candidates:
+            # 上位4頭内なら、同場同距離の現在値・再現性を優先
+            def top4_key(n: int):
+                p = profiles[n]
+                recent = p["exact_recent"] if p["exact_recent"] is not None else 999.0
+                quality = p["exact_quality_time"] if p["exact_quality_time"] is not None else 999.0
+                return (
+                    -p["exact_competitive"],
+                    quality,
+                    recent,
+                    base_order.index(n),
+                )
+            fourth = min(top4_candidates, key=top4_key)
+            add(fourth, "時計上位補完")
+        else:
+            # 上位4頭がすでに埋まっている場合だけクラス補完
+            cls = max(
+                rem,
+                key=lambda n: (
+                    profiles[n]["class_best"],
+                    profiles[n]["exact_competitive"],
+                    -base_order.index(n),
+                )
             )
-            return (
-                consistency,
-                p["class_best"],
-                -base_order.index(n),
-            )
+            add(cls, "クラス突出")
 
-        cls = max(rem, key=class_repeat_key)
-        add(cls, "クラス・再現性")
-
+    # 埋まらない場合
     for n in top6:
         if len(selected) >= 4:
             break
         add(n, "時計上位補完")
 
-    # 地方転入人気馬ガード
+    # 地方転入人気馬ガードは4頭へ強制保護
     for n in guards["transfer"]:
         if n not in selected and selected:
             repl = None
@@ -1184,8 +1196,34 @@ def pick_four(base_order: List[int], top6: List[int], profiles: Dict[int, Dict],
                 roles.pop(old, None)
                 roles[n] = "地方転入人気馬ガード"
 
+    # 境界ガードは、通常順位7～8位からTOP6へ昇格し、
+    # かつ「上昇度・再現性」が強い場合のみ4頭保護候補。
+    for n in guards["boundary"]:
+        if n not in selected and n in top6:
+            p = profiles[n]
+            strong_boundary = (
+                p["exact_close_count"] > 0
+                or p["exact_win_count"] > 0
+            )
+            if strong_boundary:
+                # TOP1/TOP2は壊さず、最弱の補完枠と比較
+                repl_candidates = [
+                    i for i, x in enumerate(selected)
+                    if roles.get(x) not in {"時計TOP1", "時計TOP2"}
+                ]
+                if repl_candidates:
+                    # base順位が最も低い補完枠を交換
+                    repl = max(repl_candidates, key=lambda i: base_order.index(selected[i]))
+                    old = selected[repl]
+                    # 境界馬が「通常7～8位」だった場合だけ保護
+                    if base_order.index(n) in {6, 7}:
+                        selected[repl] = n
+                        roles.pop(old, None)
+                        roles[n] = "境界ガード"
+
     selected = sorted(selected[:4], key=lambda n: base_order.index(n))
     return selected, roles
+
 
 
 
@@ -1325,9 +1363,9 @@ def verify_result(pred: Dict, result_text: str) -> Dict:
 # UI
 # ============================================================
 
-APP_NAME = "競馬AI 時計分析 v3.5"
+APP_NAME = "競馬AI 時計分析 v3.6"
 st.set_page_config(page_title=APP_NAME, page_icon="⏱️", layout="wide")
-st.title("⏱️ 競馬AI 時計分析 v3.5")
+st.title("⏱️ 競馬AI 時計分析 v3.6")
 st.caption("時計分析単独｜4頭絞り【2連系用】＋時計TOP6【三連系用】＋検証ガード")
 
 if "locked_prediction" not in st.session_state:
@@ -1479,7 +1517,7 @@ with hist_tab:
         st.info("まだ検証履歴はありません。")
 
 with rule_tab:
-    st.subheader("時計分析 v3.5")
+    st.subheader("時計分析 v3.6")
     st.markdown("""
 ### ベース
 - **同競馬場・同距離の実時計を最優先**
