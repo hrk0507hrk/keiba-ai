@@ -644,20 +644,31 @@ def debut_warning_target(e: Entry, h: Optional[HorseHistory]) -> bool:
 
 def margin_penalty(margin: Optional[float]) -> float:
     """
-    チャット検証の着差評価を機械化。
-    同じ時計でも「接戦・勝利」を上、「大差負け高速時計」を下へ。
+    ベスト時計を出した時の着差ペナルティ。
+    生時計を主役に残しつつ、時計差が僅差なら接戦馬を上へ。
+
+    これにより:
+    - 1:41.5 / 1.4差 より 1:41.6 / 0.6差を上げられる
+    - 2:08.5 / 1.7差 と 2:09.8 / 1.9差なら、生時計差1.3秒を維持しやすい
     """
     if margin is None:
-        return 0.8
+        return 0.35
     if margin <= 0.3:
-        return 0.0
+        return 0.00
     if margin <= 0.6:
-        return 0.2
+        return 0.10
     if margin <= 1.0:
-        return 0.6
+        return 0.25
     if margin <= 1.5:
-        return 1.5
-    return 2.5
+        return 0.55
+    if margin <= 2.0:
+        return 0.80
+    if margin <= 2.5:
+        return 1.05
+    if margin <= 3.0:
+        return 1.45
+    return 2.00
+
 
 
 def best_clock_race(rs: List[PastRace]) -> Optional[PastRace]:
@@ -687,10 +698,15 @@ def best_quality_race(rs: List[PastRace]) -> Optional[PastRace]:
 
 
 def quality_time(rs: List[PastRace]) -> Optional[float]:
-    r = best_quality_race(rs)
+    """
+    ベスト時計そのものに、そのレースの着差だけを加味。
+    別の遅い勝ち時計へ置き換えない。
+    """
+    r = best_clock_race(rs)
     if r is None or r.time_seconds is None:
         return None
     return r.time_seconds + margin_penalty(r.margin)
+
 
 
 def clock_margin(rs: List[PastRace]) -> Optional[float]:
@@ -831,47 +847,59 @@ def base_clock_order(race: RaceInfo, profiles: Dict[int, Dict], race_date: date)
             if p["exact_count"] > 0:
                 q = p["exact_quality_time"] if p["exact_quality_time"] is not None else 999.0
                 raw = p["exact_best"] if p["exact_best"] is not None else 999.0
+                bm = p.get("exact_best_margin")
 
-                # 2000mでは着差・再現性を強める
+                # 同距離でも「大敗の遅い時計」まで無条件に保護しない。
+                # 2.5秒超の大敗は、初距離/隣接距離の有力馬と同じ補助グループへ降格。
+                weak_exact = bm is not None and bm > 2.5
+
                 repeat_bonus = (
-                    min(0.30, p["exact_close_count"] * 0.10)
-                    + min(0.24, p["exact_win_count"] * 0.08)
-                    + min(0.18, p["exact_competitive"] * 0.06)
+                    min(0.24, p["exact_close_count"] * 0.08)
+                    + min(0.18, p["exact_win_count"] * 0.06)
+                    + min(0.15, p["exact_competitive"] * 0.05)
                 )
 
-                # 同馬場は小さく加点
-                going_bonus = 0.12 if p["exact_going_best"] is not None else 0.0
+                going_bonus = 0.10 if p["exact_going_best"] is not None else 0.0
 
-                # 直近性は補助
                 recency_bonus = 0.0
                 rd = p.get("exact_recent_date")
                 if rd is not None:
                     days = (race_date - rd).days
                     if days <= 30:
-                        recency_bonus = 0.10
+                        recency_bonus = 0.08
                     elif days >= 120:
-                        recency_bonus = -0.15
+                        recency_bonus = -0.12
 
-                # クラスは時計が近い時だけ小さく
                 class_bonus = 0.0
                 if p["class_best"] >= 4:
-                    class_bonus = 0.10
+                    class_bonus = 0.08
                 elif p["class_best"] >= 3:
-                    class_bonus = 0.05
+                    class_bonus = 0.04
 
                 adjusted = q - repeat_bonus - going_bonus - recency_bonus - class_bonus
 
+                if not weak_exact:
+                    return (
+                        0,
+                        adjusted,
+                        raw,
+                        -p["exact_competitive"],
+                        -p["class_best"],
+                        n,
+                    )
+
+                # 弱い同距離実績:
+                # 初距離馬より絶対に上ではなく、時計内容で比較する補助群
                 return (
-                    0,
+                    1,
+                    2,
                     adjusted,
-                    raw,
-                    -p["exact_competitive"],
                     -p["class_best"],
                     n,
                 )
 
-            # 同場2000mなし。別場2000m > 同場隣接 > 別場隣接。
-            # ただし全部、同場2000m実績馬より後ろ。
+            # 同場2000mなし。
+            # 別場2000m > 同場隣接 > 別場隣接。
             if p["other_track_same_dist"]:
                 return (
                     1, 0,
@@ -881,8 +909,8 @@ def base_clock_order(race: RaceInfo, profiles: Dict[int, Dict], race_date: date)
             if p["adjacent_same_track"]:
                 return (1, 1, -p["class_best"], n)
             if p["adjacent_other"]:
-                return (1, 2, -p["class_best"], n)
-            return (1, 3, -p["class_best"], n)
+                return (1, 3, -p["class_best"], n)
+            return (1, 4, -p["class_best"], n)
 
         # ----------------------------
         # A. 同場同距離実績あり
@@ -1201,36 +1229,6 @@ def build_clock_prediction(race: RaceInfo, entries: List[Entry], histories: Dict
     guards = guard_lists(race, entries, histories, profiles, base_order)
     top6 = apply_top6_guards(base_order, guards)
 
-    # 2000m専用TOP6：
-    # 同場2000m実績馬を先に並べ、初距離馬は残り枠だけ。
-    if race.distance == 2000 and len(entries) > 6:
-        exact_pool = [n for n in base_order if profiles[n]["exact_count"] > 0]
-        other_pool = [n for n in base_order if profiles[n]["exact_count"] == 0]
-
-        rebuilt = []
-        for n in exact_pool + other_pool:
-            if n not in rebuilt:
-                rebuilt.append(n)
-            if len(rebuilt) >= 6:
-                break
-
-        # ガードの強制保護
-        for gkey in ["transfer", "absolute", "boundary"]:
-            for n in guards[gkey]:
-                if n not in rebuilt:
-                    rebuilt[-1] = n
-
-        # 重複除去→base_orderで補充
-        clean = []
-        for n in rebuilt:
-            if n not in clean:
-                clean.append(n)
-        for n in base_order:
-            if len(clean) >= 6:
-                break
-            if n not in clean:
-                clean.append(n)
-        top6 = clean[:6]
 
     four, roles = pick_four(base_order, top6, profiles, guards)
     by_num = {e.number: e for e in entries}
@@ -1327,9 +1325,9 @@ def verify_result(pred: Dict, result_text: str) -> Dict:
 # UI
 # ============================================================
 
-APP_NAME = "競馬AI 時計分析 v3.4"
+APP_NAME = "競馬AI 時計分析 v3.5"
 st.set_page_config(page_title=APP_NAME, page_icon="⏱️", layout="wide")
-st.title("⏱️ 競馬AI 時計分析 v3.4")
+st.title("⏱️ 競馬AI 時計分析 v3.5")
 st.caption("時計分析単独｜4頭絞り【2連系用】＋時計TOP6【三連系用】＋検証ガード")
 
 if "locked_prediction" not in st.session_state:
@@ -1481,7 +1479,7 @@ with hist_tab:
         st.info("まだ検証履歴はありません。")
 
 with rule_tab:
-    st.subheader("時計分析 v3.4")
+    st.subheader("時計分析 v3.5")
     st.markdown("""
 ### ベース
 - **同競馬場・同距離の実時計を最優先**
