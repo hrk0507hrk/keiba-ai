@@ -831,6 +831,7 @@ def build_profiles(race: RaceInfo, entries: List[Entry], histories: Dict[int, Ho
 
 RULESET_ID = "CLOCK_TOP6_COMMON_V1_1_FROZEN_2026-08-13"
 RULESET_NAME = "時計TOP6 完全共通ルール v1.1【固定・変更禁止】"
+IMPLEMENTATION_REV = "impl2"
 
 RULESET_TEXT = """
 【目的】
@@ -1091,6 +1092,149 @@ def _adjacent_strength(rs: List[PastRace], race_date: date) -> Tuple:
     )
 
 
+
+def _shared_race_benchmark(
+    race: RaceInfo,
+    profiles: Dict[int, Dict],
+    race_date: date,
+) -> Dict[int, Tuple]:
+    """
+    同じ過去レースに今回の出走馬が複数いた場合、そのレースは完全に同一条件なので
+    直接比較できる「共通物差し」として使う。
+
+    特にJRA1600〜1800mでは、別場生時計の横比較より信頼度が高い。
+    戻り値は horse_number -> benchmark tuple。
+    tupleは小さいほど強い。
+    """
+    groups = {}
+
+    for n, p in profiles.items():
+        for r in p["same_dist"]:
+            if r.time_seconds is None or r.race_date is None:
+                continue
+            key = (
+                r.race_date,
+                r.track,
+                r.race_name,
+                r.surface,
+                r.distance,
+            )
+            groups.setdefault(key, []).append((n, r))
+
+    out = {}
+
+    for key, members in groups.items():
+        unique_nums = {n for n, _ in members}
+        if len(unique_nums) < 2:
+            continue
+
+        # 同じレースなので実時計を直接比較してよい。
+        ordered = sorted(
+            members,
+            key=lambda x: (
+                x[1].time_seconds,
+                999 if x[1].finish is None else x[1].finish,
+            ),
+        )
+
+        participants = len(unique_nums)
+        for direct_rank, (n, r) in enumerate(ordered, 1):
+            # 今回と同クラス以上の共通レースを最優先。
+            class_gap = max(0, race.class_rank - r.class_rank)
+            margin_bad = 0
+            if r.margin is not None:
+                if r.margin <= 1.0:
+                    margin_bad = 0
+                elif r.margin <= 1.5:
+                    margin_bad = 1
+                elif r.margin <= 2.0:
+                    margin_bad = 2
+                else:
+                    margin_bad = 4
+            else:
+                margin_bad = 2
+
+            candidate = (
+                class_gap,
+                margin_bad,
+                -participants,              # 3頭共通 > 2頭共通
+                direct_rank,                # 同じレース内の直接順位
+                _days_since(r, race_date),
+            )
+
+            if n not in out or candidate < out[n]:
+                out[n] = candidate
+
+    return out
+
+
+def _jra_same_distance_strength(
+    race: RaceInfo,
+    p: Dict,
+    race_date: date,
+) -> Tuple:
+    """
+    JRA1600〜1800mの「時計価値」。
+
+    v1.1の意図どおり、
+    ・今回と同クラス以上で競争になっている同距離実績
+    ・再現性
+    ・直近性
+    を、下級条件の勝利より先に見る。
+    """
+    runs = [
+        r for r in p["same_dist"]
+        if r.time_seconds is not None
+    ]
+
+    if not runs:
+        return (9, 9, 999, 999, 999)
+
+    # 今回と同クラス以上で、大敗ではない走り
+    relevant = [
+        r for r in runs
+        if r.class_rank >= race.class_rank
+        and (r.margin is None or r.margin <= 2.0)
+    ]
+
+    if relevant:
+        ev = _evidence(relevant, race_date)
+        return (
+            0,
+            -ev["repeat_score"],
+            ev["latest_comp_days"],
+            -ev["class_close10"],
+            tuple(-x for x in ev["best_content"]),
+        )
+
+    # 1クラス下でも小差・再現性が高ければ次点
+    lower_close = [
+        r for r in runs
+        if r.class_rank >= race.class_rank - 1
+        and r.margin is not None
+        and r.margin <= 1.0
+    ]
+    if lower_close:
+        ev = _evidence(lower_close, race_date)
+        return (
+            1,
+            -ev["repeat_score"],
+            ev["latest_comp_days"],
+            -ev["class_close10"],
+            tuple(-x for x in ev["best_content"]),
+        )
+
+    # その他の同距離
+    ev = _evidence(runs, race_date)
+    return (
+        2,
+        -ev["repeat_score"],
+        ev["latest_comp_days"],
+        -ev["class_close10"],
+        tuple(-x for x in ev["best_content"]),
+    )
+
+
 # ============================================================
 # 第1エンジン：通常時計順位
 # ============================================================
@@ -1099,12 +1243,17 @@ def _normal_key_jra_middle(
     race: RaceInfo,
     p: Dict,
     race_date: date,
+    shared_benchmark: Optional[Tuple] = None,
 ) -> Tuple:
     """
-    JRA 1600〜1800m:
-    生時計の跨場比較はしない。
-    同距離の小差好走→高クラス好内容→再現性→直近性、
-    最後に同場同距離時計をタイブレーク。
+    JRA 1600〜1800m。
+
+    1) 今回と同クラス以上で競争になった同距離実績
+    2) 同じ過去レースでの直接比較（共通物差し）
+    3) 再現性・直近性
+    4) 同場同距離時計は補助
+
+    別競馬場の生時計だけを横並びにはしない。
     """
     same_ev = _evidence(p["same_dist"], race_date)
     exact_ev = _evidence(p["exact"], race_date)
@@ -1112,37 +1261,37 @@ def _normal_key_jra_middle(
     adj_ev = _evidence(adjacent, race_date)
 
     if same_ev["count"] > 0 and not same_ev["weak_direct"]:
-        source_group = 0
+        strength = _jra_same_distance_strength(race, p, race_date)
+
+        # 共通レースがある場合は、同一条件の直接比較を強いタイブレークにする。
+        # 無い馬を機械的に落とさないよう、strengthの後に置く。
+        shared_key = shared_benchmark if shared_benchmark is not None else (9, 9, 9, 99, 9999)
+
         return (
-            source_group,
-            tuple(-x for x in same_ev["best_content"]),
-            -same_ev["class_close03"],
-            -same_ev["class_close10"],
+            0,
+            strength,
+            shared_key,
             -same_ev["repeat_score"],
             same_ev["latest_comp_days"],
-            # 同場同距離は最後のタイブレーク
             0 if exact_ev["count"] > 0 else 1,
             _quality_clock_key(exact_ev),
             p["entry"].number,
         )
 
-    # 弱い直接実績しかない場合、強い隣接距離に負けることを認める
+    # 強い隣接距離は弱い直接実績を上回れる
     if adj_ev["count"] > 0 and adj_ev["best_content"][0] >= 3:
-        source_group = 1
         return (
-            source_group,
+            1,
             tuple(-x for x in adj_ev["best_content"]),
-            -adj_ev["class_close10"],
             -adj_ev["repeat_score"],
             adj_ev["latest_comp_days"],
             p["entry"].number,
         )
 
     if same_ev["count"] > 0:
-        source_group = 2
         return (
-            source_group,
-            tuple(-x for x in same_ev["best_content"]),
+            2,
+            _jra_same_distance_strength(race, p, race_date),
             -same_ev["repeat_score"],
             same_ev["latest_comp_days"],
             _quality_clock_key(exact_ev),
@@ -1150,9 +1299,8 @@ def _normal_key_jra_middle(
         )
 
     if adj_ev["count"] > 0:
-        source_group = 3
         return (
-            source_group,
+            3,
             tuple(-x for x in adj_ev["best_content"]),
             -adj_ev["repeat_score"],
             adj_ev["latest_comp_days"],
@@ -1160,6 +1308,7 @@ def _normal_key_jra_middle(
         )
 
     return (9, p["entry"].number)
+
 
 
 def _normal_key_2000plus(
@@ -1337,9 +1486,15 @@ def normal_clock_order(
     nums = list(profiles.keys())
 
     if race.track in JRA_TRACKS and 1600 <= race.distance <= 1800:
+        shared = _shared_race_benchmark(race, profiles, race_date)
         return sorted(
             nums,
-            key=lambda n: _normal_key_jra_middle(race, profiles[n], race_date),
+            key=lambda n: _normal_key_jra_middle(
+                race,
+                profiles[n],
+                race_date,
+                shared.get(n),
+            ),
         )
 
     if race.distance >= 2000:
@@ -1404,12 +1559,27 @@ def guard_lists_v1_1(
         exact_ev = _evidence(p["exact"], race_date)
         same_ev = _evidence(p["same_dist"], race_date)
 
-        # 絶対時計：同場同距離TOP3級 ＋ 勝利/0.3以内
-        if (
+        # 絶対時計：
+        # 同場同距離TOP3級＋0.3以内が基本。
+        # JRA1600〜1800mでは、単に新潟持ち時計上位というだけでは不足。
+        # 今回同クラス以上で0.3以内の同距離実績があることも確認する。
+        absolute_ok = (
             n in raw_rank
             and raw_rank[n] <= 3
             and exact_ev["close03"] > 0
-        ):
+        )
+
+        if absolute_ok and race.track in JRA_TRACKS and 1600 <= race.distance <= 1800:
+            same_class_close03 = any(
+                r.time_seconds is not None
+                and r.class_rank >= race.class_rank
+                and r.margin is not None
+                and r.margin <= 0.3
+                for r in p["same_dist"]
+            )
+            absolute_ok = same_class_close03
+
+        if absolute_ok:
             absolute.append(n)
 
         # 境界：通常7〜8位＋同距離勝/0.3以内＋時計分布でも境界圏
@@ -1734,10 +1904,10 @@ st.set_page_config(
 )
 
 st.title("⏱️ 競馬AI 時計TOP6")
-st.caption("完全共通ルール v1.1【凍結版】｜API不要｜4頭絞りなし")
+st.caption(f"完全共通ルール v1.1【凍結版】｜実装 {IMPLEMENTATION_REV}｜API不要｜4頭絞りなし")
 
 st.info(
-    "🔒 ルール固定中："
+    "🔒 ルール固定中（文章ルールは変更なし）："
     f"{RULESET_ID}\n\n"
     "今後の検証で改善案が出ても、このv1.1は上書きしません。"
 )
