@@ -1118,86 +1118,58 @@ def apply_top6_guards(base_order: List[int], guards: Dict[str, List[int]]) -> Li
 
 def pick_four(base_order: List[int], top6: List[int], profiles: Dict[int, Dict],
               guards: Dict[str, List[int]]) -> Tuple[List[int], Dict[int, str]]:
-    selected, roles = [], {}
+    """
+    現行チャット検証の4頭絞りを再現。
 
-    def add(n: Optional[int], role: str):
-        if n is not None and n not in selected and len(selected) < 4:
-            selected.append(n)
-            roles[n] = role
+    基本：
+    - 最終時計順位の上位4頭をそのまま4頭絞りにする。
+    - 境界ガードはTOP6保護専用で、4頭へは自動昇格しない。
+    - 地方転入人気馬ガードだけは4頭へ強制保護する。
 
-    # 1・2枠目は固定
-    add(base_order[0] if base_order else None, "時計TOP1")
-    add(base_order[1] if len(base_order) > 1 else None, "時計TOP2")
+    これにより、古い好走歴だけで「上昇度・再現性」が過大評価され、
+    時計5～6位馬が4頭へ飛び込むのを防ぐ。
+    """
+    selected = list(base_order[:min(4, len(base_order))])
+    roles: Dict[int, str] = {}
 
-    # 3枠目：上昇度＋再現性
-    rem = [n for n in top6 if n not in selected]
-    if rem:
-        def rise_key(n: int):
-            p = profiles[n]
-            repeat = (
-                p["exact_close_count"] * 2
-                + p["exact_win_count"] * 2
-                + p["exact_competitive"]
-            )
-            imp = -999.0 if p["improvement"] is None else p["improvement"]
-            return (repeat, imp, -base_order.index(n))
-        up = max(rem, key=rise_key)
-        add(up, "上昇度・再現性")
-
-    # 4枠目：
-    # まず時計順位上位4頭の未選択馬を優先。
-    # クラスだけで5～6位馬が飛び越えない。
-    rem = [n for n in top6 if n not in selected]
-    if rem:
-        top4_candidates = [n for n in rem if base_order.index(n) <= 3]
-        if top4_candidates:
-            # 上位4頭内なら、同場同距離の現在値・再現性を優先
-            def top4_key(n: int):
-                p = profiles[n]
-                recent = p["exact_recent"] if p["exact_recent"] is not None else 999.0
-                quality = p["exact_quality_time"] if p["exact_quality_time"] is not None else 999.0
-                return (
-                    -p["exact_competitive"],
-                    quality,
-                    recent,
-                    base_order.index(n),
-                )
-            fourth = min(top4_candidates, key=top4_key)
-            add(fourth, "時計上位補完")
+    for i, n in enumerate(selected):
+        if i == 0:
+            roles[n] = "時計TOP1"
+        elif i == 1:
+            roles[n] = "時計TOP2"
         else:
-            # 上位4頭がすでに埋まっている場合だけクラス補完
-            cls = max(
-                rem,
-                key=lambda n: (
-                    profiles[n]["class_best"],
-                    profiles[n]["exact_competitive"],
-                    -base_order.index(n),
-                )
-            )
-            add(cls, "クラス突出")
+            roles[n] = "時計上位"
 
-    # 埋まらない場合
-    for n in top6:
-        if len(selected) >= 4:
-            break
-        add(n, "時計上位補完")
-
-    # 地方転入人気馬ガードは4頭へ強制保護
+    # 地方転入人気馬ガードのみ4頭へ強制保護
     for n in guards["transfer"]:
-        if n not in selected and selected:
-            repl = None
-            for i in range(len(selected) - 1, -1, -1):
-                if roles[selected[i]] not in {"時計TOP1", "時計TOP2"}:
-                    repl = i
-                    break
-            if repl is not None:
-                old = selected[repl]
-                selected[repl] = n
+        if n not in selected:
+            if len(selected) < 4:
+                selected.append(n)
+            else:
+                # TOP1/TOP2は守り、4番手を差し替える
+                replace_idx = len(selected) - 1
+                old = selected[replace_idx]
+                selected[replace_idx] = n
                 roles.pop(old, None)
-                roles[n] = "地方転入人気馬ガード"
+            roles[n] = "地方転入人気馬ガード"
 
-    selected = sorted(selected[:4], key=lambda n: base_order.index(n))
-    return selected, roles
+    # 重複除去・4頭補完
+    clean = []
+    for n in selected:
+        if n not in clean:
+            clean.append(n)
+
+    for n in base_order:
+        if len(clean) >= min(4, len(base_order)):
+            break
+        if n not in clean:
+            clean.append(n)
+            roles.setdefault(n, "時計上位")
+
+    # 表示順は最終時計順位に合わせる
+    clean = sorted(clean[:4], key=lambda n: base_order.index(n))
+    return clean, roles
+
 
 
 
@@ -1338,9 +1310,9 @@ def verify_result(pred: Dict, result_text: str) -> Dict:
 # UI
 # ============================================================
 
-APP_NAME = "競馬AI 時計分析 v3.7"
+APP_NAME = "競馬AI 時計分析 v3.8"
 st.set_page_config(page_title=APP_NAME, page_icon="⏱️", layout="wide")
-st.title("⏱️ 競馬AI 時計分析 v3.7")
+st.title("⏱️ 競馬AI 時計分析 v3.8")
 st.caption("時計分析単独｜4頭絞り【2連系用】＋時計TOP6【三連系用】＋検証ガード")
 
 if "locked_prediction" not in st.session_state:
@@ -1363,7 +1335,8 @@ with st.sidebar:
 - 固定AXIS / 相手C / ハイブリッドは廃止
 - **同場同距離**の実時計＋着差＋再現性＋直近性
 - 別競馬場の同距離生時計は直接比較しない
-- 4頭＝TOP1＋TOP2＋上昇度＋クラス突出
+- 4頭＝最終時計順位の上位4頭を基本
+- 地方転入人気馬ガードのみ4頭へ強制保護
 - 絶対時計 / 境界 / 地方転入ガード
 - 初出走・初距離は警戒表示のみ
 """)
@@ -1492,7 +1465,7 @@ with hist_tab:
         st.info("まだ検証履歴はありません。")
 
 with rule_tab:
-    st.subheader("時計分析 v3.7")
+    st.subheader("時計分析 v3.8")
     st.markdown("""
 ### ベース
 - **同競馬場・同距離の実時計を最優先**
