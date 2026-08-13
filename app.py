@@ -543,7 +543,7 @@ def parse_horse_histories(text: str, entries: Optional[List[Entry]] = None) -> D
 
 RULESET_ID = "CLOCK_RULEBOOK_V2_0_BETA_PYTHON_FROZEN_2026-08-13"
 RULESET_NAME = "時計分析 完全ルールブック v2.0-Beta【完全Python自動判定】"
-IMPLEMENTATION_REV = "python-engine-5"
+IMPLEMENTATION_REV = "python-engine-6-shared-benchmark"
 
 RULEBOOK_TEXT = r"""
 【0｜目的】
@@ -1088,6 +1088,211 @@ def _class_value(rs: List[PastRace], race: RaceInfo) -> Dict:
     return {"rank": best.class_rank, "label": label}
 
 
+
+def _content_profile(rs: List[PastRace], race_date: date) -> Dict:
+    """CONTENTを「最高1走だけ」で潰さず、能力帯の厚みも保持する。
+
+    REPEATとは役割を分けるため、ここは全履歴の内容証拠。
+    直近性・継続性そのものは別途REPEAT/CURRENTで判断する。
+    """
+    if not rs:
+        return {
+            "best": None,
+            "best_band": 0,
+            "second_band": 0,
+            "close03": 0,
+            "close06": 0,
+            "close10": 0,
+            "competitive": 0,
+            "key": (0, 0, 0, 0, 0, -9999),
+        }
+    best = _best_content_run(rs, race_date)
+    levels = sorted(
+        [_margin_level(r.margin) for r in rs if r.margin is not None],
+        reverse=True,
+    )
+    best_band = levels[0] if levels else 0
+    second_band = levels[1] if len(levels) >= 2 else 0
+    close03 = _count_close(rs, 0.3)
+    close06 = _count_close(rs, 0.6)
+    close10 = _count_close(rs, 1.0)
+    competitive = close10
+    best_finish = (
+        3 if best is not None and best.finish == 1
+        else 2 if best is not None and best.finish == 2
+        else 1 if best is not None and best.finish == 3
+        else 0
+    )
+    best_days = -_days(best, race_date) if best is not None else -9999
+    # best帯→2本目の帯→僅差本数。古さは最後にしか使わない。
+    key = (best_band, second_band, close03, close06, close10, best_finish, best_days)
+    return {
+        "best": best,
+        "best_band": best_band,
+        "second_band": second_band,
+        "close03": close03,
+        "close06": close06,
+        "close10": close10,
+        "competitive": competitive,
+        "key": key,
+    }
+
+
+def _competitive_class_profile(rs: List[PastRace], race: RaceInfo, race_date: date) -> Dict:
+    """クラスは必ず競争になった内容とセットで評価する。大敗は入れない。"""
+    good = [r for r in rs if r.margin is not None and r.margin <= 1.0]
+    if not good:
+        return {
+            "best_rank": -9,
+            "best_band": 0,
+            "same_or_up": 0,
+            "one_down_or_up": 0,
+            "close03_high": 0,
+            "key": (-9, 0, 0, 0, 0, -9999),
+        }
+    # 一番高いクラスで「実際に競争になった」走を代表にする。
+    best_rank = max(r.class_rank for r in good)
+    at_best = [r for r in good if r.class_rank == best_rank]
+    best_run = max(at_best, key=lambda r: (_margin_level(r.margin), -_days(r, race_date)))
+    same_or_up = sum(1 for r in good if r.class_rank >= race.class_rank)
+    one_down_or_up = sum(1 for r in good if r.class_rank >= race.class_rank - 1)
+    close03_high = sum(
+        1 for r in good
+        if r.class_rank >= race.class_rank - 1 and r.margin is not None and r.margin <= 0.3
+    )
+    key = (
+        best_rank,
+        _margin_level(best_run.margin),
+        same_or_up,
+        one_down_or_up,
+        close03_high,
+        -_days(best_run, race_date),
+    )
+    return {
+        "best_rank": best_rank,
+        "best_band": _margin_level(best_run.margin),
+        "same_or_up": same_or_up,
+        "one_down_or_up": one_down_or_up,
+        "close03_high": close03_high,
+        "key": key,
+    }
+
+
+def _repeat_profile_for_domain(
+    domain_runs: List[PastRace],
+    race: RaceInfo,
+    clusters: Dict,
+) -> Dict:
+    """選んだ証拠ドメインの直近5走を、好走だけ消さずに丸ごと母数にする。"""
+    recent5 = _recent(domain_runs)[:5]
+    total = len(recent5)
+    close03 = _count_close(recent5, 0.3)
+    close06 = _count_close(recent5, 0.6)
+    close10 = _count_close(recent5, 1.0)
+    last3 = recent5[:3]
+    last3_close10 = _count_close(last3, 1.0)
+
+    known = total >= 2
+    if not known:
+        content_grade, content_label = 1, "材料不足"
+    elif last3_close10 >= 2 or close10 >= 3:
+        content_grade, content_label = 3, "強"
+    elif close10 >= 2:
+        content_grade, content_label = 2, "中"
+    elif close10 >= 1:
+        content_grade, content_label = 1, "単発"
+    else:
+        content_grade, content_label = 0, "弱"
+
+    # CLOCK REPEATは別場の生時計を混ぜない。同場同距離に限定。
+    exact_recent = [
+        r for r in recent5
+        if r.track == race.track and r.distance == race.distance and r.time_seconds is not None
+    ]
+    clock_known = len(exact_recent) >= 2
+    clock_repeat = 0
+    if clock_known:
+        if clusters.get("reliable"):
+            vals = [_cluster_for_time(r.time_seconds, clusters) for r in exact_recent]
+            vals = [v for v in vals if v is not None]
+            if vals:
+                best_cluster = min(vals)
+                clock_repeat = sum(1 for v in vals if v == best_cluster)
+        else:
+            positions = [_continuous_clock_position(r.time_seconds, clusters) for r in exact_recent]
+            positions = [v for v in positions if v is not None]
+            if positions:
+                best_pos = max(positions)
+                # 固定秒差ではなく、そのレース分布内の位置で「自馬ベスト帯」を再現した本数。
+                clock_repeat = sum(1 for v in positions if v >= best_pos - 0.20)
+
+    clock_grade = 0
+    if clock_known:
+        if clock_repeat >= 3:
+            clock_grade = 3
+        elif clock_repeat >= 2:
+            clock_grade = 2
+        elif clock_repeat >= 1:
+            clock_grade = 1
+
+    combined_grade = max(content_grade if known else 1, clock_grade)
+    if not known and not clock_known:
+        combined_label = "材料不足"
+    elif combined_grade >= 3:
+        combined_label = "強"
+    elif combined_grade >= 2:
+        combined_label = "中"
+    elif combined_grade >= 1:
+        combined_label = "単発"
+    else:
+        combined_label = "弱"
+
+    return {
+        "recent5": recent5,
+        "denominator": total,
+        "known": known,
+        "content_grade": content_grade,
+        "content_label": content_label,
+        "close03": close03,
+        "close06": close06,
+        "close10": close10,
+        "last3_close10": last3_close10,
+        "clock_known": clock_known,
+        "clock_repeat": clock_repeat,
+        "clock_grade": clock_grade,
+        "grade": combined_grade,
+        "label": combined_label,
+    }
+
+
+def _current_for_domain(
+    domain_runs: List[PastRace],
+    race: RaceInfo,
+    race_date: date,
+    clusters: Dict,
+) -> Dict:
+    recent = _recent(domain_runs)
+    if not recent:
+        return {"grade": 2, "label": "判定不能", "detail": "比較可能走なし", "near_peak": 0, "confidence": "low"}
+
+    state = _current_state(recent[:3], recent, race, race_date, clusters)
+    latest_days = _days(recent[0], race_date)
+
+    # 長いブランクでは過去PEAKを消さないが、CURRENTを現在値として断定しない。
+    # 150日は固定減点ではなく「CURRENT信頼度を落とす」ための実装上のゲート。
+    if latest_days >= 150:
+        return {
+            "grade": 2,
+            "label": "判定不能",
+            "detail": f"最新比較可能走が{latest_days}日前：長期ブランクでCURRENT信頼度低",
+            "near_peak": state.get("near_peak", 0),
+            "confidence": "low",
+        }
+    state = dict(state)
+    state["confidence"] = "normal"
+    return state
+
+
 def build_horse_eval(race: RaceInfo, e: Entry, h: Optional[HorseHistory], race_date: date, clusters: Dict) -> Dict:
     surface = _surface_runs(h, race)
     same = [r for r in surface if r.distance == race.distance]
@@ -1111,7 +1316,6 @@ def build_horse_eval(race: RaceInfo, e: Entry, h: Optional[HorseHistory], race_d
     best_evidence = min(evidence_candidates, key=lambda r: _condition_tier(race, r)) if evidence_candidates else None
     condition_tier = _condition_tier(race, best_evidence) if best_evidence else 99
 
-    # PEAKタイプ：同場同距離の小差裏付けを最優先。無ければ同距離小差。
     if valid_exact is not None:
         peak_type = "VALID"
         peak_run = valid_exact
@@ -1135,9 +1339,6 @@ def build_horse_eval(race: RaceInfo, e: Entry, h: Optional[HorseHistory], race_d
     direct_known_margins = [r.margin for r in same if r.margin is not None]
     weak_direct = bool(direct_known_margins) and min(direct_known_margins) > 2.5
 
-    # JRA1600〜1800m用の「高クラス＋好内容」証拠。
-    # impl1のように1.1〜2.0秒差まで最上位tierへ入れて、そこで勝負を終わらせない。
-    # クラスは必ず競争になった内容（原則1.0秒以内）とセットで使う。
     same_class_close = [
         r for r in same
         if r.class_rank >= race.class_rank
@@ -1153,19 +1354,14 @@ def build_horse_eval(race: RaceInfo, e: Entry, h: Optional[HorseHistory], race_d
     same_class_close03 = [r for r in same_class_close if r.margin is not None and r.margin <= 0.3]
     same_class_close06 = [r for r in same_class_close if r.margin is not None and r.margin <= 0.6]
 
-    # impl5: JRA1600〜1800mは凍結ルール【15】どおり、
-    # 「同距離CONTENT → 高クラス好内容 → REPEAT → CURRENT → 同場時計」を基本順にする。
-    # 近接距離は同距離と無条件に混ぜず、
-    # 直接材料が無い場合、または直接実績が弱く非常に強い近接がある場合だけ主証拠化する。
-    jra_direct_runs = list(same)
-    jra_direct_good = [
-        r for r in jra_direct_runs
-        if r.margin is not None and r.margin <= 1.0
-    ]
-    jra_direct_best = _best_content_run(jra_direct_runs, race_date)
-    jra_direct_good_best = _best_content_run(jra_direct_good, race_date)
+    # JRA1600〜1800m：まず「同距離」と「近接距離」を別箱に保つ。
+    # 重要：REPEAT用の母数から悪い走を消さない。
+    jra_direct_runs = _recent(list(same))
+    jra_adj_runs = _recent(list(adj_same + adj_other))
+    jra_direct_content = _content_profile(jra_direct_runs, race_date)
+    jra_adj_content = _content_profile(jra_adj_runs, race_date)
 
-    jra_adj_runs = list(adj_same + adj_other)
+    jra_direct_good = [r for r in jra_direct_runs if r.margin is not None and r.margin <= 1.0]
     jra_adj_good = [
         r for r in jra_adj_runs
         if r.distance is not None
@@ -1174,85 +1370,62 @@ def build_horse_eval(race: RaceInfo, e: Entry, h: Optional[HorseHistory], race_d
         and r.margin <= 0.6
         and (r.class_rank >= race.class_rank - 1 or r.margin <= 0.3)
     ]
-    jra_adj_very_strong = [
+    jra_adj_very_strong = [r for r in jra_adj_good if r.margin is not None and r.margin <= 0.3]
+
+    # 「弱い直接」は経験不足ではなく、同距離の最良CONTENTが0.7〜1.0以下に留まる状態も含む。
+    # その場合、同等クラスで0.6以内の強い近接があれば補強・逆転を許す。
+    direct_best_band = jra_direct_content.get("best_band", 0)
+    jra_direct_weak = bool(jra_direct_runs) and direct_best_band <= 3
+    direct_good_best_class = max([r.class_rank for r in jra_direct_good], default=race.class_rank - 1)
+    jra_adj_support = [
         r for r in jra_adj_good
-        if r.margin is not None and r.margin <= 0.3
+        if r.class_rank >= direct_good_best_class
     ]
-    jra_adj_best = _best_content_run(jra_adj_good, race_date)
+    jra_adj_override = jra_direct_weak and bool(jra_adj_support)
 
-    jra_direct_weak = bool(jra_direct_runs) and not bool(jra_direct_good)
-    jra_adj_override = jra_direct_weak and bool(jra_adj_very_strong)
-
-    if jra_direct_good:
-        jra_selected_runs = jra_direct_good
+    if jra_direct_runs and not jra_direct_weak:
+        jra_domain_runs = jra_direct_runs
         jra_selected_source = "同距離"
         jra_evidence_tier = 0
     elif jra_adj_override:
-        jra_selected_runs = jra_adj_good
-        jra_selected_source = "強い近接距離（弱い直接を逆転）"
+        # 近接だけへ置換せず、弱い直接も母数に残して「直接＋強い近接補強」として扱う。
+        jra_domain_runs = _recent(jra_direct_runs + jra_adj_runs)
+        jra_selected_source = "同距離＋強い近接補強"
         jra_evidence_tier = 1
     elif not jra_direct_runs and jra_adj_good:
-        jra_selected_runs = jra_adj_good
+        jra_domain_runs = jra_adj_runs
         jra_selected_source = "強い近接距離"
         jra_evidence_tier = 2
     elif jra_direct_runs:
-        jra_selected_runs = jra_direct_runs
+        jra_domain_runs = jra_direct_runs
         jra_selected_source = "同距離・弱材料"
         jra_evidence_tier = 3
     elif jra_adj_runs:
-        jra_selected_runs = jra_adj_runs
+        jra_domain_runs = jra_adj_runs
         jra_selected_source = "近接距離・補助"
         jra_evidence_tier = 4
     else:
-        jra_selected_runs = []
+        jra_domain_runs = []
         jra_selected_source = "材料薄"
         jra_evidence_tier = 9
 
-    jra_selected_best = _best_content_run(jra_selected_runs, race_date)
-    jra_primary_runs = jra_selected_runs  # 旧UI互換
-    jra_primary_best = jra_selected_best
-    jra_primary_content_key = _content_core_tuple(jra_selected_best, race_date)
-    jra_primary_content_band = (
-        _margin_level(jra_selected_best.margin) if jra_selected_best is not None else 0
-    )
+    jra_content = _content_profile(jra_domain_runs, race_date)
+    jra_class = _competitive_class_profile(jra_domain_runs, race, race_date)
+    jra_repeat = _repeat_profile_for_domain(jra_domain_runs, race, clusters)
+    jra_current = _current_for_domain(jra_domain_runs, race, race_date, clusters)
+
+    jra_primary_best = jra_content["best"]
+    jra_primary_runs = jra_domain_runs
+    jra_primary_content_key = jra_content["key"]
+    jra_primary_content_band = jra_content["best_band"]
     jra_primary_source = jra_selected_source
+    jra_primary_class_key = jra_class["key"]
+    jra_primary_repeat_count = jra_repeat["close10"]
+    jra_primary_close03 = jra_repeat["close03"]
+    jra_repeat_grade = jra_repeat["grade"]
+    jra_repeat_label = jra_repeat["label"]
 
-    # クラス価値はCONTENTの後で比較する。大敗はここへ入れない。
-    jra_selected_good = [
-        r for r in jra_selected_runs
-        if r.margin is not None and r.margin <= 1.0
-    ]
-    jra_primary_class_key = (
-        max([r.class_rank for r in jra_selected_good], default=-9),
-        max([_margin_level(r.margin) for r in jra_selected_good], default=0),
-        sum(1 for r in jra_selected_good if r.margin is not None and r.margin <= 0.3),
-        -min([_days(r, race_date) for r in jra_selected_good], default=9999),
-    )
-
-    # JRA専用REPEAT：同距離主証拠なら同距離だけ、近接主証拠なら近接だけで再現性を見る。
-    # 別条件を無差別に足してREPEATを膨らませない。
-    selected_ids = {id(r) for r in jra_selected_runs}
-    jra_domain_recent = [r for r in last5 if id(r) in selected_ids]
-    jra_repeat_good = sum(1 for r in jra_domain_recent if r.margin is not None and r.margin <= 1.0)
-    jra_repeat_last3 = sum(1 for r in jra_domain_recent[:3] if r.margin is not None and r.margin <= 1.0)
-    if len(jra_domain_recent) < 2:
-        jra_repeat_grade, jra_repeat_label = 1, "材料不足"
-    elif jra_repeat_last3 >= 2 or jra_repeat_good >= 3:
-        jra_repeat_grade, jra_repeat_label = 3, "強"
-    elif jra_repeat_good >= 2:
-        jra_repeat_grade, jra_repeat_label = 2, "中"
-    elif jra_repeat_good >= 1:
-        jra_repeat_grade, jra_repeat_label = 1, "単発"
-    else:
-        jra_repeat_grade, jra_repeat_label = 0, "弱"
-
-    jra_primary_repeat_count = jra_repeat_good
-    jra_primary_close03 = sum(
-        1 for r in jra_domain_recent
-        if r.margin is not None and r.margin <= 0.3
-    )
-
-    # jra_tierは表示・診断互換用。順位の絶対優先には使わない。
+    # 旧診断表示互換用。順位の絶対tierには使わない。
     if same_class_close:
         jra_tier = 0
         jra_run = _best_content_run(same_class_close, race_date)
@@ -1289,6 +1462,9 @@ def build_horse_eval(race: RaceInfo, e: Entry, h: Optional[HorseHistory], race_d
     return {
         "number": e.number,
         "name": e.name,
+        "analysis_date": race_date,
+        "current_class_rank": race.class_rank,
+        "_clusters_ref": clusters,
         "entry": e,
         "history": h,
         "surface": surface,
@@ -1323,6 +1499,11 @@ def build_horse_eval(race: RaceInfo, e: Entry, h: Optional[HorseHistory], race_d
         "jra_direct_weak": jra_direct_weak,
         "jra_adj_override": jra_adj_override,
         "jra_selected_source": jra_selected_source,
+        "jra_domain_runs": jra_domain_runs,
+        "jra_content_profile": jra_content,
+        "jra_class_profile": jra_class,
+        "jra_repeat_profile": jra_repeat,
+        "jra_current": jra_current,
         "jra_repeat_grade": jra_repeat_grade,
         "jra_repeat_label": jra_repeat_label,
         "jra_primary_runs": jra_primary_runs,
@@ -1386,10 +1567,113 @@ def build_direct_matrix(race: RaceInfo, evals: Dict[int, Dict], race_date: date)
                     wa += 1
                 elif winner == b:
                     wb += 1
-                meetings.append({"days": _days(ra, race_date), "winner": winner})
+                meetings.append({
+                    "days": _days(ra, race_date),
+                    "winner": winner,
+                    "distance": ra.distance,
+                    "same_distance": ra.distance == race.distance,
+                    "class_rank": min(ra.class_rank, rb.class_rank),
+                })
             out[(a, b)] = {"a_wins": wa, "b_wins": wb, "meetings": meetings}
             out[(b, a)] = {"a_wins": wb, "b_wins": wa, "meetings": meetings}
     return out
+
+
+def build_shared_race_benchmarks(
+    race: RaceInfo,
+    evals: Dict[int, Dict],
+) -> Dict[int, Dict]:
+    """今回出走馬が複数そろった過去の同距離レースを「共通物差し」にする。
+
+    別競馬場の生時計を横比較するのではなく、同じ日・同じ場・同じレース・
+    同じ距離を走った馬同士だけ、そのレース内の実時計/着順で直接順位を作る。
+    JRA1600〜1800mでは、現在クラス相当以上かつ競争になった共有レースを
+    強い比較材料として扱う。馬番や既知の回帰正解は一切参照しない。
+    """
+    groups: Dict[Tuple, Dict[int, PastRace]] = {}
+    for n, ev in evals.items():
+        for r in ev.get("same", []):
+            if r.race_date is None or r.distance != race.distance:
+                continue
+            key = (r.race_date, r.track, r.race_name, r.surface, r.distance, r.going)
+            groups.setdefault(key, {})[n] = r
+
+    race_date = next((ev.get("analysis_date") for ev in evals.values() if ev.get("analysis_date")), date.today())
+    out: Dict[int, Dict] = {}
+
+    for key, members in groups.items():
+        if len(members) < 2:
+            continue
+        ordered = sorted(
+            members.items(),
+            key=lambda nr: (
+                float("inf") if nr[1].time_seconds is None else nr[1].time_seconds,
+                999 if nr[1].finish is None else nr[1].finish,
+                nr[0],
+            ),
+        )
+        participants = len(ordered)
+        competitive_members = sum(
+            1 for _, r in ordered
+            if r.margin is not None and r.margin <= 1.0
+        )
+        # 同一レースのはずなので通常は全馬同じ。解析揺れがあっても過大評価しないよう最小値を採用。
+        group_class = min((r.class_rank for _, r in ordered), default=-9)
+        class_gap = max(0, race.class_rank - group_class)
+        group_days = min((_days(r, race_date) for _, r in ordered), default=9999)
+
+        for direct_rank, (n, r) in enumerate(ordered, 1):
+            own_competitive = r.margin is not None and r.margin <= 1.0
+            strong = bool(
+                class_gap == 0
+                and competitive_members >= 2
+                and own_competitive
+                and group_days <= 365
+            )
+            strength = 2 if strong and participants >= 3 else 1 if strong else 0
+            margin_bad = (
+                0 if r.margin is not None and r.margin <= 1.0
+                else 1 if r.margin is not None and r.margin <= 1.5
+                else 2 if r.margin is not None and r.margin <= 2.0
+                else 4
+            )
+            candidate_key = (
+                class_gap,
+                0 if strong else 1,
+                -participants,
+                margin_bad,
+                group_days,
+                direct_rank,
+            )
+            candidate = {
+                "key": candidate_key,
+                "strength": strength,
+                "strong": strong,
+                "participants": participants,
+                "direct_rank": direct_rank,
+                "group_class": group_class,
+                "class_gap": class_gap,
+                "days": group_days,
+                "race_key": key,
+                "reason": (
+                    f"共有同距離レース {key[1]} {key[2]}／{participants}頭共通／"
+                    f"直接{direct_rank}位／class{group_class}"
+                ),
+            }
+            if n not in out or candidate_key < out[n]["key"]:
+                out[n] = candidate
+
+    return out
+
+
+def attach_shared_race_benchmarks(race: RaceInfo, evals: Dict[int, Dict]) -> Dict[int, Dict]:
+    shared = build_shared_race_benchmarks(race, evals)
+    for n, ev in evals.items():
+        b = shared.get(n)
+        ev["shared_benchmark"] = b
+        ev["shared_strength"] = b.get("strength", 0) if b else 0
+        ev["shared_reason"] = b.get("reason", "共有同距離レースなし") if b else "共有同距離レースなし"
+    return shared
 
 
 def _direct_cmp(a: int, b: int, matrix: Dict[Tuple[int, int], Dict]) -> int:
@@ -1402,6 +1686,32 @@ def _direct_cmp(a: int, b: int, matrix: Dict[Tuple[int, int], Dict]) -> int:
     if aw > bw and aw >= 1:
         return 1
     if bw > aw and bw >= 1:
+        return -1
+    return 0
+
+def _direct_cmp_recent_same_distance(a: int, b: int, matrix: Dict[Tuple[int, int], Dict]) -> int:
+    """JRA中距離で使う強い直接対戦。
+
+    同距離かつ概ね1年以内の共有レースを優先する。
+    1回でも明確な先着なら小さなCONTENT差のタイブレークに使い、
+    2回以上同じ馬が先着ならDIRECT REPEATとしてさらに強い。
+    """
+    d = matrix.get((a, b), {})
+    meetings = [
+        m for m in d.get("meetings", [])
+        if m.get("same_distance") and m.get("days", 9999) <= 365 and m.get("winner") in {a, b}
+    ]
+    if not meetings:
+        return 0
+    aw = sum(1 for m in meetings if m.get("winner") == a)
+    bw = sum(1 for m in meetings if m.get("winner") == b)
+    if aw >= 2 and bw == 0:
+        return 2
+    if bw >= 2 and aw == 0:
+        return -2
+    if aw > bw:
+        return 1
+    if bw > aw:
         return -1
     return 0
 
@@ -1508,21 +1818,18 @@ def _compare_jra_middle_with_reason(
     b: Dict,
     direct: Dict[Tuple[int, int], Dict],
 ) -> Tuple[int, str]:
-    """JRA1600〜1800mの競合判断（impl5）。
+    """JRA1600〜1800mの競合判断（impl6）。
 
-    凍結ルール【15】をそのまま実装：
-    同距離CONTENT（弱い直接なら非常に強い近接へ差替可）
-    → 高クラスでの好内容 → REPEAT → CURRENT → 直接対戦
-    → 同場同距離時計（最終タイブレーク）。
-    別場の生時計は直接比較しない。
+    v2.0-Betaの「CONTENT→競争になったクラス価値→REPEAT→CURRENT」を
+    固い辞書順にはしない。CONTENT差が1帯だけなら他軸で逆転可能、
+    2帯以上ならCONTENTを尊重する。これで小差を過大解釈しない。
     """
-
     ta, tb = a.get("jra_evidence_tier", 9), b.get("jra_evidence_tier", 9)
     if (ta == 9) != (tb == 9):
         winner = b if ta == 9 else a
         return (1 if winner is a else -1, "比較可能な同距離/近接距離材料の有無")
 
-    # 同場同距離に大きな自然断層がある場合だけ、CONTENTより前にPEAK大差を尊重。
+    # 同場同距離の自然断層が大きい時だけ、グローバルPEAK差ルールを先に適用。
     if (
         a["raw_exact"] is not None and b["raw_exact"] is not None
         and a["peak_cluster_reliable"] and b["peak_cluster_reliable"]
@@ -1532,48 +1839,168 @@ def _compare_jra_middle_with_reason(
         diff = abs(pa - pb)
         upper, lower = (a, b) if pa < pb else (b, a)
         if diff >= 2:
-            if upper["peak_type"] == "RAW" and lower["peak_type"] == "VALID" and lower.get("jra_repeat_grade", 0) >= 2:
-                return (1 if lower is a else -1, "大PEAK差だが上位RAW大差負け／下位VALID再現で逆転")
-            return (1 if upper is a else -1, "同場同距離PEAKの大きな自然断層")
+            lower_rep = lower.get("jra_repeat_profile", {})
+            if (
+                upper["peak_type"] == "RAW"
+                and lower["peak_type"] == "VALID"
+                and lower_rep.get("known")
+                and lower_rep.get("grade", 0) >= 2
+            ):
+                return (1 if lower is a else -1, "大PEAK差だが上位RAW／下位VALID再現で逆転")
+            return (1 if upper is a else -1, "同場同距離VALID PEAKの大きな自然断層")
 
-    # 1) CONTENT。直接同距離を基本に、弱い直接だけ強い近接へ差替済み。
-    ka = a.get("jra_primary_content_key", (-1, -1, -9999))
-    kb = b.get("jra_primary_content_key", (-1, -1, -9999))
-    if ka != kb:
-        winner = a if ka > kb else b
-        return (1 if winner is a else -1, f"CONTENT（{winner.get('jra_primary_source','')}）")
+    ca = a.get("jra_content_profile", {})
+    cb = b.get("jra_content_profile", {})
+    ba, bb = ca.get("best_band", 0), cb.get("best_band", 0)
+    content_leader = a if ba > bb else b if bb > ba else None
+    content_gap = abs(ba - bb)
 
-    # 2) 高クラス＋小差。大敗はキーに入っていない。
-    cla = a.get("jra_primary_class_key", (-9, 0, 0, -9999))
-    clb = b.get("jra_primary_class_key", (-9, 0, 0, -9999))
-    if cla != clb:
-        winner = a if cla > clb else b
-        return (1 if winner is a else -1, "高クラス＋小差CONTENT")
+    # CONTENT差が2帯以上なら大差扱い。小さな他軸差では覆さない。
+    if content_leader is not None and content_gap >= 2:
+        return (1 if content_leader is a else -1, f"CONTENT大差 {max(ba, bb)}帯>{min(ba, bb)}帯")
 
-    # 3) REPEAT。選ばれた証拠ドメイン内だけで評価。
-    ra, rb = a.get("jra_repeat_grade", 0), b.get("jra_repeat_grade", 0)
-    if ra != rb:
-        winner = a if ra > rb else b
-        loser = b if winner is a else a
-        return (1 if winner is a else -1, f"REPEAT {winner.get('jra_repeat_label','')} > {loser.get('jra_repeat_label','')}")
-    pra, prb = a.get("jra_primary_repeat_count", 0), b.get("jra_primary_repeat_count", 0)
-    if pra != prb:
-        winner = a if pra > prb else b
-        return (1 if winner is a else -1, f"REPEAT本数 {max(pra, prb)} > {min(pra, prb)}")
+    # 今回クラス未満の証拠同士で最高CONTENT帯が同じなら、
+    # 同場同距離PEAKの分布内相対差をCONTENT厚みより先に確認する。
+    # これは別場時計比較ではなく、同じ今回競馬場・同距離だけのPEAK差。
+    early_rank_a = a.get("jra_class_profile", {}).get("best_rank", -9)
+    early_rank_b = b.get("jra_class_profile", {}).get("best_rank", -9)
+    if (
+        ba == bb
+        and early_rank_a == early_rank_b
+        and early_rank_a < a.get("current_class_rank", 999)
+        and a.get("raw_exact") is not None
+        and b.get("raw_exact") is not None
+        and not (a.get("peak_cluster_reliable") and b.get("peak_cluster_reliable"))
+    ):
+        clusters_ref = a.get("_clusters_ref") or b.get("_clusters_ref")
+        if clusters_ref and len(clusters_ref.get("rows", [])) >= 3:
+            posa = _continuous_clock_position(a["raw_exact"].time_seconds, clusters_ref)
+            posb = _continuous_clock_position(b["raw_exact"].time_seconds, clusters_ref)
+        else:
+            posa = posb = None
+        if posa is not None and posb is not None and abs(posa - posb) >= 0.35:
+            winner = a if posa > posb else b
+            return (1 if winner is a else -1, "下級条件同CONTENT帯→同場同距離PEAK相対差")
 
-    # 4) CURRENT。
-    ua, ub = a["current"]["grade"], b["current"]["grade"]
-    if ua != ub:
-        winner = a if ua > ub else b
-        loser = b if winner is a else a
-        return (1 if winner is a else -1, f"CURRENT {winner['current']['label']} > {loser['current']['label']}")
+    # 同じCONTENT帯では、最高1走だけでなく2本目・僅差証拠の厚みを見る。
+    if ba == bb:
+        support_a = (
+            ca.get("second_band", 0),
+            ca.get("close03", 0),
+            ca.get("close06", 0),
+            ca.get("close10", 0),
+        )
+        support_b = (
+            cb.get("second_band", 0),
+            cb.get("close03", 0),
+            cb.get("close06", 0),
+            cb.get("close10", 0),
+        )
+        # 2本目の内容帯が2段以上違うなど、明確なCONTENT厚み差だけここで決める。
+        if abs(support_a[0] - support_b[0]) >= 2:
+            winner = a if support_a > support_b else b
+            return (1 if winner is a else -1, "CONTENTの2本目・再現幅に明確差")
 
-    # 5) 完全同条件の直接対戦。
+    # 競争になった高クラス価値。<=1.0秒の走だけなのでクラス単独ボーナスではない。
+    cla = a.get("jra_class_profile", {})
+    clb = b.get("jra_class_profile", {})
+    rank_a, rank_b = cla.get("best_rank", -9), clb.get("best_rank", -9)
+    class_core_a = (
+        rank_a,
+        cla.get("best_band", 0),
+        cla.get("same_or_up", 0),
+        cla.get("one_down_or_up", 0),
+        cla.get("close03_high", 0),
+    )
+    class_core_b = (
+        rank_b,
+        clb.get("best_band", 0),
+        clb.get("same_or_up", 0),
+        clb.get("one_down_or_up", 0),
+        clb.get("close03_high", 0),
+    )
+
+    # CONTENTが1帯差だけなら、より高いクラスで競争になった証拠があれば逆転可。
+    if content_leader is not None and content_gap == 1 and rank_a != rank_b:
+        class_winner = a if class_core_a > class_core_b else b
+        if class_winner is not content_leader and abs(rank_a - rank_b) >= 1:
+            return (1 if class_winner is a else -1, "CONTENT小差を高クラス好内容で逆転")
+
+    # CONTENT同帯では「クラス順位そのもの」が違う時だけここで決める。
+    # 同じクラス内の着差を再びここで比べるとCONTENTの二重評価になるため行わない。
+    if ba == bb and rank_a != rank_b:
+        winner = a if rank_a > rank_b else b
+        return (1 if winner is a else -1, "同CONTENT帯→より高いクラスで好内容")
+
+    # 共有した同距離レースは強いタイブレーク。
+    # CONTENT差が大きい時は使わないが、同帯/1帯差なら実際の直接先着を尊重する。
+    dcs = _direct_cmp_recent_same_distance(a["number"], b["number"], direct)
+    if dcs and content_gap <= 1:
+        winner = a if dcs > 0 else b
+        label = "DIRECT REPEAT" if abs(dcs) >= 2 else "同距離・直接対戦"
+        return (1 if winner is a else -1, label)
+
+    # REPEAT：必ず悪い走も含む「直近5ドメイン走」を母数にする。
+    ra = a.get("jra_repeat_profile", {})
+    rb = b.get("jra_repeat_profile", {})
+    known_a, known_b = bool(ra.get("known")), bool(rb.get("known"))
+    if known_a and known_b:
+        rep_a = (
+            ra.get("grade", 0),
+            ra.get("close03", 0),
+            ra.get("close06", 0),
+            ra.get("close10", 0),
+            ra.get("clock_grade", 0),
+            ra.get("clock_repeat", 0),
+        )
+        rep_b = (
+            rb.get("grade", 0),
+            rb.get("close03", 0),
+            rb.get("close06", 0),
+            rb.get("close10", 0),
+            rb.get("clock_grade", 0),
+            rb.get("clock_repeat", 0),
+        )
+        if rep_a != rep_b:
+            winner = a if rep_a > rep_b else b
+            # 1帯CONTENT差の側がREPEATで明確に勝つなら逆転を許す。
+            if content_leader is None or content_gap <= 1:
+                return (1 if winner is a else -1, "REPEAT（直近5比較可能走・悪走込み）")
+    elif known_a != known_b:
+        known_ev, known_rep = (a, ra) if known_a else (b, rb)
+        # 材料不足そのものを減点しない。ただし既知側に複数回の明確な再現がある時だけ採用。
+        if known_rep.get("grade", 0) >= 2 and known_rep.get("close10", 0) >= 2:
+            return (1 if known_ev is a else -1, "REPEAT既知側に複数再現／相手は材料不足")
+
+    # CURRENT：選択ドメインの直近3走だけ。古いPEAKはここへ混ぜない。
+    ua = a.get("jra_current", a["current"])
+    ub = b.get("jra_current", b["current"])
+    if ua.get("grade", 2) != ub.get("grade", 2):
+        winner = a if ua.get("grade", 2) > ub.get("grade", 2) else b
+        if content_leader is None or content_gap <= 1:
+            return (1 if winner is a else -1, f"CURRENT {winner.get('jra_current', winner['current'])['label']}")
+
+    # ここまでで逆転根拠が無ければ、1帯だけのCONTENTリードを尊重。
+    if content_leader is not None:
+        return (1 if content_leader is a else -1, "CONTENT小差を他軸で覆す根拠なし")
+
+    # CONTENT同帯で未決なら、残りのCONTENT厚みを弱いタイブレークに使う。
+    support_a = (
+        ca.get("second_band", 0), ca.get("close03", 0), ca.get("close06", 0), ca.get("close10", 0)
+    )
+    support_b = (
+        cb.get("second_band", 0), cb.get("close03", 0), cb.get("close06", 0), cb.get("close10", 0)
+    )
+    if support_a != support_b:
+        winner = a if support_a > support_b else b
+        return (1 if winner is a else -1, "CONTENT厚みタイブレーク")
+
+    # 直接対戦。
     dc = _direct_cmp(a["number"], b["number"], direct)
     if dc:
         return dc, "同一レース直接対戦"
 
-    # 他軸同等なら主証拠の直接性。ここで初めて使う。
+    # 他軸同等時だけ証拠の直接性。
     if ta != tb:
         winner = a if ta < tb else b
         return (1 if winner is a else -1, "主証拠の直接性（他軸同等時）")
@@ -1582,9 +2009,9 @@ def _compare_jra_middle_with_reason(
     pta, ptb = pscore.get(a["peak_type"], 0), pscore.get(b["peak_type"], 0)
     if pta != ptb:
         winner = a if pta > ptb else b
-        return (1 if winner is a else -1, f"PEAK種別 {winner['peak_type']}を優先")
+        return (1 if winner is a else -1, f"PEAK種別 {winner['peak_type']}")
 
-    # 6) 同場同距離生時計は最終タイブレークのみ。
+    # 同場同距離生時計は最後だけ。別場生時計は一切ここへ来ない。
     if a["raw_exact"] is not None and b["raw_exact"] is not None:
         if a["raw_exact"].time_seconds != b["raw_exact"].time_seconds:
             winner = a if a["raw_exact"].time_seconds < b["raw_exact"].time_seconds else b
@@ -1598,6 +2025,7 @@ def _compare_jra_middle_with_reason(
         return 0, "完全同等"
     winner = a if a["number"] < b["number"] else b
     return (1 if winner is a else -1, "完全同等のため馬番タイブレーク")
+
 
 def _compare_jra_middle(a: Dict, b: Dict, direct: Dict[Tuple[int, int], Dict]) -> int:
     return _compare_jra_middle_with_reason(a, b, direct)[0]
@@ -1634,7 +2062,7 @@ def _compare_long(a: Dict, b: Dict, direct: Dict[Tuple[int, int], Dict]) -> int:
 def compare_evals_with_reason(a: Dict, b: Dict, race: RaceInfo, direct: Dict[Tuple[int, int], Dict]) -> Tuple[int, str]:
     """比較結果と、実際にreturnした決着理由を返す。
 
-    impl5ではJRA1600〜1800mの理由表示を比較関数そのものと共通化し、
+    impl6ではJRA1600〜1800mの理由表示を比較関数そのものと共通化し、
     表示理由と実際の順位決定が食い違わないようにする。
     """
     if race.track in JRA_TRACKS and 1600 <= race.distance <= 1800:
@@ -1656,24 +2084,93 @@ def compare_evals(a: Dict, b: Dict, race: RaceInfo, direct: Dict[Tuple[int, int]
     return _compare_local(a, b, direct)
 
 
+def _jra_middle_seed_key(race: RaceInfo, ev: Dict) -> Tuple:
+    """JRA1600〜1800mの推移的な初期順位。点数合算ではなく証拠層の辞書順。
+
+    まず今回クラスで競争になった同距離能力帯を分け、その中で
+    3頭以上の強い共有レースを共通物差しとして使う。
+    その後に証拠の直接性、CONTENT厚み、REPEAT、CURRENTを並べる。
+    最終順位はこのseedを隣接競合ルールで再監査する。
+    """
+    cp = ev.get("jra_content_profile", {})
+    cl = ev.get("jra_class_profile", {})
+    rp = ev.get("jra_repeat_profile", {})
+    cu = ev.get("jra_current", ev.get("current", {}))
+    best_rank = cl.get("best_rank", -9)
+    best_band = cl.get("best_band", 0)
+    source_tier = ev.get("jra_evidence_tier", 9)
+
+    if best_rank >= race.class_rank and best_band >= 4:
+        ability_layer = 5
+    elif best_rank >= race.class_rank and best_band >= 3:
+        ability_layer = 4
+    elif best_rank >= race.class_rank - 1 and best_band >= 5:
+        ability_layer = 3
+    elif best_rank >= race.class_rank - 1 and best_band >= 4:
+        ability_layer = 2
+    elif cp.get("best_band", 0) >= 3:
+        ability_layer = 1
+    else:
+        ability_layer = 0
+
+    shared = ev.get("shared_benchmark") or {}
+    shared_strength = shared.get("strength", 0)
+    shared_rank_score = (
+        shared.get("participants", 0) - shared.get("direct_rank", 99) + 1
+        if shared_strength > 0 else 0
+    )
+
+    # 下級証拠同士のseedだけ、同場同距離PEAKの分布内位置を補助にする。
+    lower_peak_support = -1.0
+    clusters_ref = ev.get("_clusters_ref", {})
+    if (
+        best_rank < race.class_rank
+        and ev.get("raw_exact") is not None
+        and len(clusters_ref.get("rows", [])) >= 3
+    ):
+        lower_peak_support = _continuous_clock_position(
+            ev["raw_exact"].time_seconds, clusters_ref
+        ) or 0.0
+
+    return (
+        ability_layer,
+        shared_strength,
+        shared_rank_score,
+        -source_tier,
+        lower_peak_support,
+        cp.get("best_band", 0),
+        cp.get("second_band", 0),
+        cl.get("same_or_up", 0),
+        rp.get("grade", 0) if rp.get("known") else 1,
+        rp.get("close10", 0),
+        cu.get("grade", 2),
+        -ev.get("condition_tier", 99),
+        -ev.get("number", 999),
+    )
+
+
 def _baseline_key(race: RaceInfo, ev: Dict) -> Tuple:
-    """pairwise競合の前に置く、推移的な通常順位の骨格。人気・オッズは使わない。"""
+    """pairwise競合の同点処理に使う推移的な骨格。人気・オッズは不使用。"""
     n = ev["number"]
     peak_type_score = {"VALID": 2, "RAW": 1, "不明": 0}.get(ev["peak_type"], 0)
     exact_time = -ev["raw_exact"].time_seconds if ev["raw_exact"] is not None else -9999.0
     cluster_score = -ev["peak_cluster"] if ev["peak_cluster_reliable"] else -99
 
     if race.track in JRA_TRACKS and 1600 <= race.distance <= 1800:
+        cp = ev.get("jra_content_profile", {})
+        cl = ev.get("jra_class_profile", {})
+        rp = ev.get("jra_repeat_profile", {})
+        cu = ev.get("jra_current", ev["current"])
         has_material = 0 if ev.get("jra_evidence_tier", 9) == 9 else 1
-        # 凍結ルール【15】の順：CONTENT → 高クラス好内容 → REPEAT → CURRENT → 同場時計。
-        # 大きな自然PEAK断層だけはpairwise監査で先に保護する。
+        # これは最終ルールではなく、pairwise勝敗同点時の安定化キー。
         return (
             has_material,
-            ev.get("jra_primary_content_key", (-1, -1, -9999)),
-            ev.get("jra_primary_class_key", (-9, 0, 0, -9999)),
-            ev.get("jra_repeat_grade", 0),
-            ev.get("jra_primary_repeat_count", 0),
-            ev["current"]["grade"],
+            cp.get("best_band", 0),
+            cl.get("best_rank", -9),
+            cp.get("second_band", 0),
+            cp.get("close10", 0),
+            rp.get("grade", 0) if rp.get("known") else 1,
+            cu.get("grade", 2),
             peak_type_score,
             -ev.get("jra_evidence_tier", 9),
             cluster_score,
@@ -1684,41 +2181,63 @@ def _baseline_key(race: RaceInfo, ev: Dict) -> Tuple:
 
     if race.distance >= 2000:
         return (
-            -_long_tier(ev),
-            cluster_score,
-            ev["best_content_tuple"],
-            ev["repeat"]["grade"],
-            ev["current"]["grade"],
-            ev["class_value"]["rank"],
-            peak_type_score,
-            -ev["condition_tier"],
-            exact_time,
-            -n,
+            -_long_tier(ev), cluster_score, ev["best_content_tuple"],
+            ev["repeat"]["grade"], ev["current"]["grade"], ev["class_value"]["rank"],
+            peak_type_score, -ev["condition_tier"], exact_time, -n,
         )
 
     return (
-        1 if ev["exact"] else 0,
-        cluster_score,
-        ev["best_content_tuple"],
-        ev["repeat"]["grade"],
-        ev["current"]["grade"],
-        ev["class_value"]["rank"],
-        peak_type_score,
-        -ev["condition_tier"],
-        exact_time,
-        -n,
+        1 if ev["exact"] else 0, cluster_score, ev["best_content_tuple"],
+        ev["repeat"]["grade"], ev["current"]["grade"], ev["class_value"]["rank"],
+        peak_type_score, -ev["condition_tier"], exact_time, -n,
     )
 
 
 def rank_evals(race: RaceInfo, evals: Dict[int, Dict], direct: Dict[Tuple[int, int], Dict]) -> List[int]:
-    """推移的baselineを作り、TOP8だけを隣接ペア監査する。
+    """証拠層のseedを作り、競合ルールでTOP8を隣接再監査する。
 
-    impl3の「非推移cmp_to_keyで全体sort」は廃止。
-    v2.0-Betaの処理順（通常順位→TOP8隣接比較）をそのまま実装し、
-    比較ルールが循環した場合はループせずbaseline側へ安全に戻す。
+    JRA1600〜1800mはCopeland型の総当たり勝数を初期順位に使わない。
+    非推移な比較で「他馬への勝ち数が多い馬」が共通物差しの直接順位を壊すため、
+    CONTENT/競争になったクラス/共有レース/REPEAT/CURRENTの証拠層でseedを作る。
+    総当たりは診断ログとして残し、最終形成はseed＋隣接競合で行う。
     """
+    attach_shared_race_benchmarks(race, evals)
     items = list(evals.values())
-    ordered = sorted(items, key=lambda ev: _baseline_key(race, ev), reverse=True)
+    wins = {ev["number"]: 0 for ev in items}
+    losses = {ev["number"]: 0 for ev in items}
+    pair_events = []
+
+    for i, a in enumerate(items):
+        for b in items[i + 1:]:
+            cmpv, reason = compare_evals_with_reason(a, b, race, direct)
+            if cmpv > 0:
+                winner, loser = a, b
+            elif cmpv < 0:
+                winner, loser = b, a
+            else:
+                continue
+            wins[winner["number"]] += 1
+            losses[loser["number"]] += 1
+            pair_events.append({
+                "a": a["number"], "b": b["number"],
+                "winner": winner["number"], "reason": reason,
+            })
+
+    jra_middle = race.track in JRA_TRACKS and 1600 <= race.distance <= 1800
+    if jra_middle:
+        ordered = sorted(items, key=lambda ev: _jra_middle_seed_key(race, ev), reverse=True)
+        seed_mode = "JRA証拠層seed＋隣接監査"
+    else:
+        ordered = sorted(
+            items,
+            key=lambda ev: (
+                wins[ev["number"]],
+                -losses[ev["number"]],
+                _baseline_key(race, ev),
+            ),
+            reverse=True,
+        )
+        seed_mode = "総当たり勝敗seed＋隣接監査"
 
     audit_len = min(8, len(ordered))
     head = list(ordered[:audit_len])
@@ -1726,26 +2245,50 @@ def rank_evals(race: RaceInfo, evals: Dict[int, Dict], direct: Dict[Tuple[int, i
     baseline_head = tuple(ev["number"] for ev in head)
     seen = {baseline_head}
     cycle_detected = False
+    audit_events = []
 
-    # 隣接入替が波及するため最大TOP8頭数分だけ再走査。
-    for _ in range(max(1, audit_len)):
+    for pass_no in range(max(1, audit_len)):
         changed = False
         for i in range(len(head) - 1):
-            if compare_evals(head[i + 1], head[i], race, direct) > 0:
-                head[i], head[i + 1] = head[i + 1], head[i]
+            challenger, incumbent = head[i + 1], head[i]
+            cmpv, reason = compare_evals_with_reason(challenger, incumbent, race, direct)
+            if cmpv > 0:
+                audit_events.append({
+                    "pass": pass_no + 1,
+                    "from": (incumbent["number"], challenger["number"]),
+                    "to": (challenger["number"], incumbent["number"]),
+                    "reason": reason,
+                })
+                head[i], head[i + 1] = challenger, incumbent
                 changed = True
         state = tuple(ev["number"] for ev in head)
         if not changed:
             break
         if state in seen:
             cycle_detected = True
-            # 非推移ルールの循環で順番をランダム化しない。baselineへ戻す。
+            # 循環時は総当たり勝敗の安定順位へ戻す。
             head = list(ordered[:audit_len])
+            audit_events.append({"pass": pass_no + 1, "cycle": True, "state": state})
             break
         seen.add(state)
 
+    shared_trace = {
+        "pairwise_events": pair_events,
+        "pairwise_seed": list(baseline_head),
+        "seed_mode": seed_mode,
+        "evidence_seed": list(baseline_head),
+        "shared_benchmarks": {
+            ev["number"]: ev.get("shared_reason", "共有同距離レースなし")
+            for ev in items if ev.get("shared_benchmark")
+        },
+        "audit_events": audit_events,
+        "cycle_detected": cycle_detected,
+    }
     for ev in items:
         ev["ranking_cycle_detected"] = cycle_detected
+        ev["pairwise_wins"] = wins[ev["number"]]
+        ev["pairwise_losses"] = losses[ev["number"]]
+        ev["ranking_trace"] = shared_trace
 
     return [x["number"] for x in (head + tail)]
 
@@ -1808,11 +2351,16 @@ def apply_guards(race: RaceInfo, entries: List[Entry], evals: Dict[int, Dict], n
             if (ev["peak_cluster_reliable"] and ev["peak_cluster"] == 1) or (raw_rank is not None and raw_rank <= 3):
                 fast_big.append(n)
 
-        if (
-            clusters.get("reliable")
-            and ev["peak_cluster"] == 1
-            and ev["exact03"] > 0
-        ):
+        # 絶対時計ガードは「RAW最速がC1」だけでは不可。
+        # 勝利/0.3以内を記録したその走自体がVALID PEAKの最上位クラスタに属する時だけ。
+        valid_peak_cluster1 = any(
+            r.margin is not None
+            and r.margin <= 0.3
+            and _cluster_for_time(r.time_seconds, clusters) == 1
+            for r in ev["exact"]
+            if r.time_seconds is not None
+        )
+        if clusters.get("reliable") and valid_peak_cluster1:
             absolute.append(n)
 
         if _transfer_candidate(race, ev):
@@ -1828,13 +2376,29 @@ def apply_guards(race: RaceInfo, entries: List[Entry], evals: Dict[int, Dict], n
             if ev["same03"] > 0 and _same_ability_band(ev, evals[sixth]):
                 boundary.append(n)
 
+    conflict = False
     forced_outside = []
-    for kind, nums in (("absolute", absolute), ("transfer", transfer), ("boundary", boundary)):
+    for kind, nums in (("absolute", absolute), ("transfer", transfer)):
         for n in nums:
             if n not in base and n not in [x[1] for x in forced_outside]:
                 forced_outside.append((kind, n))
 
-    conflict = len(forced_outside) > max(0, target_len - sum(1 for n in base if n in absolute or n in transfer or n in boundary))
+    # 境界ガードは「6位枠だけ」の保護。7〜8位に複数候補がいる時は、
+    # その候補同士を5軸比較して1頭だけを6位枠へ送る。上位5頭は通常時に触らない。
+    boundary_outside = [n for n in boundary if n not in base]
+    if boundary_outside:
+        chosen_boundary = boundary_outside[0]
+        for n in boundary_outside[1:]:
+            if compare_evals(evals[n], evals[chosen_boundary], race, direct) > 0:
+                chosen_boundary = n
+        forced_outside.append(("boundary", chosen_boundary))
+        if len(boundary_outside) > 1:
+            conflict = True
+
+    conflict = conflict or (
+        len(forced_outside)
+        > max(0, target_len - sum(1 for n in base if n in absolute or n in transfer or n in boundary))
+    )
 
     top6 = list(base)
     protected = set(n for n in top6 if n in absolute or n in transfer or n in boundary)
@@ -1847,12 +2411,17 @@ def apply_guards(race: RaceInfo, entries: List[Entry], evals: Dict[int, Dict], n
             # 全枠がガード競合した場合は5軸比較で最弱を置換。
             candidates = list(top6)
             conflict = True
-        # 現在TOP6内でnより弱い最下位候補を探す。無ければ末尾を置換してガード保護。
-        replace = candidates[-1]
-        for x in reversed(candidates):
-            if compare_evals(evals[n], evals[x], race, direct) >= 0:
-                replace = x
-                break
+
+        if kind == "boundary" and top6[-1] not in protected:
+            # 通常の境界保護は必ず現在6位だけを置換。上位5頭へ昇格させない。
+            replace = top6[-1]
+        else:
+            # 絶対/転入、または既に6位枠が別ガードで保護された競合時だけ5軸再比較。
+            replace = candidates[-1]
+            for x in reversed(candidates):
+                if compare_evals(evals[n], evals[x], race, direct) >= 0:
+                    replace = x
+                    break
         idx = top6.index(replace)
         top6[idx] = n
         protected.add(n)
@@ -1908,6 +2477,9 @@ def _eval_reason(ev: Dict) -> str:
     if ev["peak_cluster_reliable"]:
         parts.append(f"時計クラスタ{ev['peak_cluster']}")
     parts.append(f"PEAK {ev['peak_type']}")
+    if ev.get("shared_strength", 0) > 0:
+        sb = ev.get("shared_benchmark", {})
+        parts.append(f"共有物差し{sb.get('participants', 0)}頭・直接{sb.get('direct_rank', '-')}位")
     parts.append(f"REPEAT {ev['repeat']['label']}")
     parts.append(f"CURRENT {ev['current']['label']}")
     return " / ".join(parts)
@@ -1938,11 +2510,20 @@ def _five_axis_row(ev: Dict) -> Dict:
             f"{ev.get('jra_primary_source','材料薄')}／{_margin_label(ev['jra_primary_best'].margin)}／class{ev['jra_primary_best'].class_rank}"
             if ev.get("jra_primary_best") is not None else "材料薄"
         ),
-        "JRA主証拠本数": ev.get("jra_primary_repeat_count", 0),
+        "JRA主証拠本数": len(ev.get("jra_domain_runs", [])),
+        "JRA_CONTENT帯": ev.get("jra_content_profile", {}).get("best_band", 0),
+        "JRA_CONTENT2本目": ev.get("jra_content_profile", {}).get("second_band", 0),
+        "JRA_REP母数": ev.get("jra_repeat_profile", {}).get("denominator", 0),
+        "JRA_REP0.3内": ev.get("jra_repeat_profile", {}).get("close03", 0),
+        "JRA_REP0.6内": ev.get("jra_repeat_profile", {}).get("close06", 0),
+        "JRA_REP1.0内": ev.get("jra_repeat_profile", {}).get("close10", 0),
+        "JRA_CLOCK_REP": ev.get("jra_repeat_profile", {}).get("clock_repeat", 0) if ev.get("jra_repeat_profile", {}).get("clock_known") else "材料不足",
+        "JRA_CURRENT": ev.get("jra_current", ev["current"])["label"],
         "JRA強近接本数": ev.get("jra_adj_competitive_count", 0),
         "JRA同距離好内容本数": ev.get("jra_direct_competitive_count", 0),
         "JRA同等以上1.0以内": ev.get("jra_same_class_close_count", 0),
         "JRA同等以上0.3以内": ev.get("jra_same_class_close03", 0),
+        "共有レース物差し": ev.get("shared_reason", "共有同距離レースなし"),
     }
 
 
@@ -1986,6 +2567,7 @@ def build_prediction(race: RaceInfo, entries: List[Entry], histories: Dict[int, 
         "status": status,
         "guards": guards,
         "pair_checks": pair_checks,
+        "ranking_trace": (next(iter(evals.values())).get("ranking_trace", {}) if evals else {}),
         "five_axis_rows": [_five_axis_row(evals[n]) for n in normal],
         "normal_rows": [
             {
@@ -1994,6 +2576,8 @@ def build_prediction(race: RaceInfo, entries: List[Entry], histories: Dict[int, 
                 "馬名": evals[n]["name"],
                 "同場同距離": _fmt_time_run(evals[n]["raw_exact"]),
                 "時計クラスタ": evals[n]["peak_cluster"] if evals[n]["peak_cluster_reliable"] else "連続/不足",
+                "総当たり勝": evals[n].get("pairwise_wins", 0),
+                "総当たり敗": evals[n].get("pairwise_losses", 0),
                 "評価理由": _eval_reason(evals[n]),
             }
             for i, n in enumerate(normal[:min(8, len(normal))])
@@ -2055,10 +2639,10 @@ def verify_prediction(pred: Dict, text: str) -> Dict:
 # Streamlit UI
 # ============================================================
 
-APP_NAME = "競馬AI 時計分析 v2.0-Beta 完全Python版 impl3"
+APP_NAME = "競馬AI 時計分析 v2.0-Beta 完全Python版 impl6"
 st.set_page_config(page_title=APP_NAME, page_icon="⏱️", layout="wide")
-st.title("⏱️ 競馬AI 時計分析 v2.0-Beta impl3")
-st.caption("完全Python自動判定｜impl3｜ChatGPT不要｜OpenAI API不要｜外部AI不要")
+st.title("⏱️ 競馬AI 時計分析 v2.0-Beta impl6")
+st.caption("完全Python自動判定｜impl6 shared-benchmark｜ChatGPT不要｜OpenAI API不要｜外部AI不要")
 st.info(
     f"🔒 {RULESET_NAME}\n\n"
     "馬柱解析から5軸評価・競合判断・通常TOP8・ガード・最終TOP6まで、このPythonだけで完結します。"
@@ -2129,7 +2713,7 @@ with tab1:
         st.dataframe(pd.DataFrame(pred["top6_rows"]), use_container_width=True, hide_index=True)
 
         st.markdown("### 通常時計順位 TOP8")
-        st.caption("人気・オッズ・ガードを使わず、5軸＋競合判断だけで作成。impl3ではJRA1600〜1800mをCONTENT→REPEAT→CURRENT→クラスの競合順へ修正。")
+        st.caption("人気・オッズ・ガードを使わず作成。JRA1600〜1800mは5軸＋共有同距離レースの共通物差しでseedを作り、隣接競合で再監査。REPEATは悪走込み直近5走、CURRENTは直近3走。")
         st.dataframe(pd.DataFrame(pred["normal_rows"]), use_container_width=True, hide_index=True)
 
         st.markdown("### 5軸評価")
@@ -2145,6 +2729,24 @@ with tab1:
         st.markdown("### TOP8 隣接ペア比較・決着理由")
         if pred["pair_checks"]:
             st.dataframe(pd.DataFrame(pred["pair_checks"]), use_container_width=True, hide_index=True)
+
+        with st.expander("順位形成ログ（証拠層seed＋隣接監査）", expanded=False):
+            trace = pred.get("ranking_trace", {})
+            st.write("**seed方式：** " + trace.get("seed_mode", "不明"))
+            st.write("**初期TOP8 seed：** " + "・".join(map(str, trace.get("evidence_seed", []))))
+            shared_info = trace.get("shared_benchmarks", {})
+            if shared_info:
+                st.caption("共有同距離レースの共通物差し")
+                st.dataframe(pd.DataFrame([{"馬番": n, "共有物差し": reason} for n, reason in shared_info.items()]), use_container_width=True, hide_index=True)
+            audit = trace.get("audit_events", [])
+            if audit:
+                st.dataframe(pd.DataFrame(audit), use_container_width=True, hide_index=True)
+            else:
+                st.caption("隣接入替なし")
+            pair_events = trace.get("pairwise_events", [])
+            if pair_events:
+                st.caption("全ペアの決着理由（診断用）")
+                st.dataframe(pd.DataFrame(pair_events), use_container_width=True, hide_index=True)
 
         g = pred["guards"]
         st.markdown("### ガード・警戒")
