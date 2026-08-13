@@ -543,7 +543,7 @@ def parse_horse_histories(text: str, entries: Optional[List[Entry]] = None) -> D
 
 RULESET_ID = "CLOCK_RULEBOOK_V2_0_BETA_PYTHON_FROZEN_2026-08-13"
 RULESET_NAME = "時計分析 完全ルールブック v2.0-Beta【完全Python自動判定】"
-IMPLEMENTATION_REV = "python-engine-6-shared-benchmark"
+IMPLEMENTATION_REV = "python-engine-7-direct-floor"
 
 RULEBOOK_TEXT = r"""
 【0｜目的】
@@ -1178,6 +1178,77 @@ def _competitive_class_profile(rs: List[PastRace], race: RaceInfo, race_date: da
     }
 
 
+def _jra_direct_floor_profile(
+    direct_runs: List[PastRace],
+    race: RaceInfo,
+    race_date: date,
+) -> Dict:
+    """JRA1600〜1800mで、同距離実績の「能力床」を診断する。
+
+    最高1走のCONTENTとは別に、同距離で競争になった走が複数あるかを保持する。
+    これは新しい加点軸ではなく、v2.0-Beta既存のCONTENT＋REPEAT＋クラス価値を
+    一発好走と継続証拠に分解して競合判断へ渡すための実装補助。
+
+    別競馬場の生時計は一切比較しない。使うのは着差・クラス・本数・直近性だけ。
+    """
+    runs = _recent(list(direct_runs))
+    cp = _content_profile(runs, race_date)
+    competitive = [r for r in runs if r.margin is not None and r.margin <= 1.0]
+    same_up = [r for r in competitive if r.class_rank >= race.class_rank]
+    one_down_up = [r for r in competitive if r.class_rank >= race.class_rank - 1]
+    recent5 = runs[:5]
+    recent_comp = [r for r in recent5 if r.margin is not None and r.margin <= 1.0]
+    recent_high = [r for r in recent_comp if r.class_rank >= race.class_rank - 1]
+
+    # 4段階の「床」。単発の最高CONTENTではなく、複数回の同距離好内容だけで上がる。
+    if len(same_up) >= 2:
+        strength = 4
+        label = "同級以上で複数再現"
+    elif len(same_up) >= 1 and len(one_down_up) >= 2:
+        strength = 3
+        label = "同級好内容＋近級複数"
+    elif len(one_down_up) >= 2:
+        strength = 2
+        label = "近級で複数再現"
+    elif len(competitive) >= 2:
+        strength = 1
+        label = "下級含む同距離複数"
+    else:
+        strength = 0
+        label = "同距離の継続床なし"
+
+    best_rank = max((r.class_rank for r in competitive), default=-9)
+    recent_high_count = len(recent_high)
+
+    # 最高帯だけ突出し、2本目/僅差本数が乏しい場合は「一発突出」として印を付ける。
+    # 最高走そのものを消すのではなく、後段の競合でREPEAT側が逆転可能かを見るためのフラグ。
+    isolated_spike = bool(
+        cp.get("best_band", 0) >= 4
+        and cp.get("close10", 0) <= 1
+        and cp.get("second_band", 0) <= 2
+    )
+
+    # seed専用のCONTENT帯。単発突出だけを2段階まで圧縮し、最終比較は元のCONTENTを使う。
+    # 例: 5→3, 4→3。継続証拠がある馬は元の帯をそのまま保持する。
+    seed_content_band = cp.get("best_band", 0)
+    if isolated_spike:
+        seed_content_band = min(seed_content_band, 3)
+
+    return {
+        "strength": strength,
+        "label": label,
+        "competitive": len(competitive),
+        "same_or_up": len(same_up),
+        "one_down_or_up": len(one_down_up),
+        "recent_high": recent_high_count,
+        "best_rank": best_rank,
+        "best_band": cp.get("best_band", 0),
+        "second_band": cp.get("second_band", 0),
+        "isolated_spike": isolated_spike,
+        "seed_content_band": seed_content_band,
+    }
+
+
 def _repeat_profile_for_domain(
     domain_runs: List[PastRace],
     race: RaceInfo,
@@ -1413,6 +1484,9 @@ def build_horse_eval(race: RaceInfo, e: Entry, h: Optional[HorseHistory], race_d
     jra_class = _competitive_class_profile(jra_domain_runs, race, race_date)
     jra_repeat = _repeat_profile_for_domain(jra_domain_runs, race, clusters)
     jra_current = _current_for_domain(jra_domain_runs, race, race_date, clusters)
+    # impl7: 最高1走と同距離の継続能力床を分離。
+    # 既存5軸（CONTENT/REPEAT/クラス）を分解した診断値で、新しい採点軸ではない。
+    jra_direct_floor = _jra_direct_floor_profile(jra_direct_runs, race, race_date)
 
     jra_primary_best = jra_content["best"]
     jra_primary_runs = jra_domain_runs
@@ -1504,6 +1578,7 @@ def build_horse_eval(race: RaceInfo, e: Entry, h: Optional[HorseHistory], race_d
         "jra_class_profile": jra_class,
         "jra_repeat_profile": jra_repeat,
         "jra_current": jra_current,
+        "jra_direct_floor": jra_direct_floor,
         "jra_repeat_grade": jra_repeat_grade,
         "jra_repeat_label": jra_repeat_label,
         "jra_primary_runs": jra_primary_runs,
@@ -1855,9 +1930,52 @@ def _compare_jra_middle_with_reason(
     content_leader = a if ba > bb else b if bb > ba else None
     content_gap = abs(ba - bb)
 
-    # CONTENT差が2帯以上なら大差扱い。小さな他軸差では覆さない。
+    # impl7: JRA中距離の「一発突出」と「同距離の継続能力床」を分離する。
+    # 最高1走は消さないが、下級/単発の突出だけで、同距離を近いクラスで
+    # 複数回まとめている馬を自動的に下へ固定しない。これはv2.0-Betaの
+    # 「同PEAK帯ではREPEAT/CURRENTを重視」「高クラスは好内容とセット」の実装。
+    fa = a.get("jra_direct_floor", {})
+    fb = b.get("jra_direct_floor", {})
+
+    if content_leader is not None:
+        follower = b if content_leader is a else a
+        lead_floor = fa if content_leader is a else fb
+        follow_floor = fb if content_leader is a else fa
+        lead_class = lead_floor.get("best_rank", -9)
+        follow_class = follow_floor.get("best_rank", -9)
+        floor_gap = follow_floor.get("strength", 0) - lead_floor.get("strength", 0)
+
+        # 最高CONTENTが一発突出で、相手に近級以上の同距離好内容が複数ある場合、
+        # CONTENT差2帯までならREPEAT＋クラス価値で逆転可能。
+        if (
+            content_gap <= 2
+            and lead_floor.get("isolated_spike", False)
+            and follow_floor.get("strength", 0) >= 2
+            and floor_gap >= 1
+            and follow_class >= lead_class
+        ):
+            return (1 if follower is a else -1, "一発CONTENT突出より同距離・近級の継続能力床")
+
+        # 1帯差なら、一発判定でなくても同距離継続床が大きく上なら逆転を許す。
+        if (
+            content_gap == 1
+            and follow_floor.get("strength", 0) >= 3
+            and floor_gap >= 2
+            and follow_class >= lead_class
+        ):
+            return (1 if follower is a else -1, "CONTENT小差を同距離継続床＋クラスで逆転")
+
+    # CONTENT差が2帯以上なら基本は大差扱い。上の継続能力床例外がない限り尊重する。
     if content_leader is not None and content_gap >= 2:
         return (1 if content_leader is a else -1, f"CONTENT大差 {max(ba, bb)}帯>{min(ba, bb)}帯")
+
+    # CONTENT同帯では、極端な継続床差がある時だけREPEAT/クラスの厚みを先に使う。
+    if ba == bb:
+        floor_a = (fa.get("strength", 0), fa.get("same_or_up", 0), fa.get("one_down_or_up", 0), fa.get("recent_high", 0))
+        floor_b = (fb.get("strength", 0), fb.get("same_or_up", 0), fb.get("one_down_or_up", 0), fb.get("recent_high", 0))
+        if abs(fa.get("strength", 0) - fb.get("strength", 0)) >= 2:
+            winner = a if floor_a > floor_b else b
+            return (1 if winner is a else -1, "同CONTENT帯→同距離継続能力床")
 
     # 今回クラス未満の証拠同士で最高CONTENT帯が同じなら、
     # 同場同距離PEAKの分布内相対差をCONTENT厚みより先に確認する。
@@ -2062,7 +2180,7 @@ def _compare_long(a: Dict, b: Dict, direct: Dict[Tuple[int, int], Dict]) -> int:
 def compare_evals_with_reason(a: Dict, b: Dict, race: RaceInfo, direct: Dict[Tuple[int, int], Dict]) -> Tuple[int, str]:
     """比較結果と、実際にreturnした決着理由を返す。
 
-    impl6ではJRA1600〜1800mの理由表示を比較関数そのものと共通化し、
+    impl7でもJRA1600〜1800mの理由表示を比較関数そのものと共通化し、
     表示理由と実際の順位決定が食い違わないようにする。
     """
     if race.track in JRA_TRACKS and 1600 <= race.distance <= 1800:
@@ -2085,33 +2203,35 @@ def compare_evals(a: Dict, b: Dict, race: RaceInfo, direct: Dict[Tuple[int, int]
 
 
 def _jra_middle_seed_key(race: RaceInfo, ev: Dict) -> Tuple:
-    """JRA1600〜1800mの推移的な初期順位。点数合算ではなく証拠層の辞書順。
+    """JRA1600〜1800mの推移的な初期順位（impl7）。
 
-    まず今回クラスで競争になった同距離能力帯を分け、その中で
-    3頭以上の強い共有レースを共通物差しとして使う。
-    その後に証拠の直接性、CONTENT厚み、REPEAT、CURRENTを並べる。
-    最終順位はこのseedを隣接競合ルールで再監査する。
+    impl6の粗いability_layerを廃止。最高1走だけでレース全体を硬く階層化せず、
+    CONTENTの代表帯→競争になったクラス価値→同距離継続床→CONTENT厚み→
+    REPEAT→CURRENTの順でseedを作る。共有同距離レースは強い補助物差し。
+
+    seedはあくまで初期順で、最終的には同じ証拠を使うペア比較で再監査する。
+    人気・オッズ・別場の生時計は使わない。
     """
     cp = ev.get("jra_content_profile", {})
     cl = ev.get("jra_class_profile", {})
     rp = ev.get("jra_repeat_profile", {})
     cu = ev.get("jra_current", ev.get("current", {}))
-    best_rank = cl.get("best_rank", -9)
-    best_band = cl.get("best_band", 0)
+    floor = ev.get("jra_direct_floor", {})
     source_tier = ev.get("jra_evidence_tier", 9)
+    has_material = 0 if source_tier == 9 else 1
 
-    if best_rank >= race.class_rank and best_band >= 4:
-        ability_layer = 5
-    elif best_rank >= race.class_rank and best_band >= 3:
-        ability_layer = 4
-    elif best_rank >= race.class_rank - 1 and best_band >= 5:
-        ability_layer = 3
-    elif best_rank >= race.class_rank - 1 and best_band >= 4:
-        ability_layer = 2
-    elif cp.get("best_band", 0) >= 3:
-        ability_layer = 1
-    else:
-        ability_layer = 0
+    # 一発突出をseedだけで硬く固定しない。元のbest_bandは比較関数に残る。
+    seed_content_band = floor.get("seed_content_band", cp.get("best_band", 0))
+    if ev.get("jra_selected_source") in {"強い近接距離", "同距離＋強い近接補強"}:
+        # 強い近接で成立している馬は、直接floorが薄くてもprimary CONTENTを失わせない。
+        # ただし一発突出なら1段だけ穏やかにする。
+        seed_content_band = cp.get("best_band", 0)
+        if (
+            cp.get("best_band", 0) >= 4
+            and cp.get("close10", 0) <= 1
+            and cp.get("second_band", 0) <= 2
+        ):
+            seed_content_band = max(3, cp.get("best_band", 0) - 1)
 
     shared = ev.get("shared_benchmark") or {}
     shared_strength = shared.get("strength", 0)
@@ -2120,11 +2240,11 @@ def _jra_middle_seed_key(race: RaceInfo, ev: Dict) -> Tuple:
         if shared_strength > 0 else 0
     )
 
-    # 下級証拠同士のseedだけ、同場同距離PEAKの分布内位置を補助にする。
+    # 下級証拠同士の最後の補助だけ、同場同距離の分布内位置を使う。
     lower_peak_support = -1.0
     clusters_ref = ev.get("_clusters_ref", {})
     if (
-        best_rank < race.class_rank
+        cl.get("best_rank", -9) < race.class_rank
         and ev.get("raw_exact") is not None
         and len(clusters_ref.get("rows", [])) >= 3
     ):
@@ -2133,21 +2253,27 @@ def _jra_middle_seed_key(race: RaceInfo, ev: Dict) -> Tuple:
         ) or 0.0
 
     return (
-        ability_layer,
+        has_material,
+        seed_content_band,
+        cl.get("best_rank", -9),
+        cl.get("best_band", 0),
+        floor.get("strength", 0),
+        floor.get("same_or_up", 0),
+        floor.get("one_down_or_up", 0),
+        cp.get("second_band", 0),
+        cp.get("close03", 0),
+        cp.get("close06", 0),
+        cp.get("close10", 0),
         shared_strength,
         shared_rank_score,
-        -source_tier,
-        lower_peak_support,
-        cp.get("best_band", 0),
-        cp.get("second_band", 0),
-        cl.get("same_or_up", 0),
         rp.get("grade", 0) if rp.get("known") else 1,
         rp.get("close10", 0),
         cu.get("grade", 2),
+        -source_tier,
+        lower_peak_support,
         -ev.get("condition_tier", 99),
         -ev.get("number", 999),
     )
-
 
 def _baseline_key(race: RaceInfo, ev: Dict) -> Tuple:
     """pairwise競合の同点処理に使う推移的な骨格。人気・オッズは不使用。"""
@@ -2523,6 +2649,10 @@ def _five_axis_row(ev: Dict) -> Dict:
         "JRA同距離好内容本数": ev.get("jra_direct_competitive_count", 0),
         "JRA同等以上1.0以内": ev.get("jra_same_class_close_count", 0),
         "JRA同等以上0.3以内": ev.get("jra_same_class_close03", 0),
+        "JRA同距離能力床": ev.get("jra_direct_floor", {}).get("label", "材料不足"),
+        "JRA能力床強度": ev.get("jra_direct_floor", {}).get("strength", 0),
+        "JRA一発突出": "○" if ev.get("jra_direct_floor", {}).get("isolated_spike", False) else "",
+        "JRA_seed_CONTENT": ev.get("jra_direct_floor", {}).get("seed_content_band", ev.get("jra_content_profile", {}).get("best_band", 0)),
         "共有レース物差し": ev.get("shared_reason", "共有同距離レースなし"),
     }
 
@@ -2534,7 +2664,10 @@ def build_prediction(race: RaceInfo, entries: List[Entry], histories: Dict[int, 
     evals = {e.number: build_horse_eval(race, e, histories.get(e.number), race_date, clusters) for e in entries}
     direct = build_direct_matrix(race, evals, race_date)
     normal = rank_evals(race, evals, direct)
+    pre_guard_top6 = list(normal[:min(6, len(normal))])
     top6, guards = apply_guards(race, entries, evals, normal, clusters, direct)
+    guard_added = [n for n in top6 if n not in pre_guard_top6]
+    guard_removed = [n for n in pre_guard_top6 if n not in top6]
 
     pair_checks = []
     top8_for_check = normal[:min(8, len(normal))]
@@ -2563,7 +2696,10 @@ def build_prediction(race: RaceInfo, entries: List[Entry], histories: Dict[int, 
         "race": asdict(race),
         "race_date": race_date.isoformat(),
         "normal_order": normal,
+        "pre_guard_top6": pre_guard_top6,
         "top6": top6,
+        "guard_added": guard_added,
+        "guard_removed": guard_removed,
         "status": status,
         "guards": guards,
         "pair_checks": pair_checks,
@@ -2639,10 +2775,10 @@ def verify_prediction(pred: Dict, text: str) -> Dict:
 # Streamlit UI
 # ============================================================
 
-APP_NAME = "競馬AI 時計分析 v2.0-Beta 完全Python版 impl6"
+APP_NAME = "競馬AI 時計分析 v2.0-Beta 完全Python版 impl7"
 st.set_page_config(page_title=APP_NAME, page_icon="⏱️", layout="wide")
-st.title("⏱️ 競馬AI 時計分析 v2.0-Beta impl6")
-st.caption("完全Python自動判定｜impl6 shared-benchmark｜ChatGPT不要｜OpenAI API不要｜外部AI不要")
+st.title("⏱️ 競馬AI 時計分析 v2.0-Beta impl7")
+st.caption("完全Python自動判定｜impl7 direct-floor｜ChatGPT不要｜OpenAI API不要｜外部AI不要")
 st.info(
     f"🔒 {RULESET_NAME}\n\n"
     "馬柱解析から5軸評価・競合判断・通常TOP8・ガード・最終TOP6まで、このPythonだけで完結します。"
@@ -2712,8 +2848,20 @@ with tab1:
         st.success("時計TOP6：" + "・".join(map(str, pred["top6"])) + f"　｜ {pred['status']}")
         st.dataframe(pd.DataFrame(pred["top6_rows"]), use_container_width=True, hide_index=True)
 
+        st.markdown("### ガード適用前 → 適用後")
+        st.write("**ガード前TOP6：** " + "・".join(map(str, pred.get("pre_guard_top6", []))))
+        added = pred.get("guard_added", [])
+        removed = pred.get("guard_removed", [])
+        if added or removed:
+            st.warning(
+                "ガード変動｜IN：" + ("・".join(map(str, added)) if added else "なし")
+                + " ／ OUT：" + ("・".join(map(str, removed)) if removed else "なし")
+            )
+        else:
+            st.caption("ガードによる入替なし")
+
         st.markdown("### 通常時計順位 TOP8")
-        st.caption("人気・オッズ・ガードを使わず作成。JRA1600〜1800mは5軸＋共有同距離レースの共通物差しでseedを作り、隣接競合で再監査。REPEATは悪走込み直近5走、CURRENTは直近3走。")
+        st.caption("人気・オッズ・ガードを使わず作成。impl7はJRA1600〜1800mで一発CONTENTと同距離の継続能力床を分離し、共有同距離レースと5軸でseedを作って隣接再監査。REPEATは悪走込み直近5走、CURRENTは直近3走。")
         st.dataframe(pd.DataFrame(pred["normal_rows"]), use_container_width=True, hide_index=True)
 
         st.markdown("### 5軸評価")
