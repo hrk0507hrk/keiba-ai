@@ -543,7 +543,7 @@ def parse_horse_histories(text: str, entries: Optional[List[Entry]] = None) -> D
 
 RULESET_ID = "CLOCK_RULEBOOK_V2_0_BETA_PYTHON_FROZEN_2026-08-13"
 RULESET_NAME = "時計分析 完全ルールブック v2.0-Beta【完全Python自動判定】"
-IMPLEMENTATION_REV = "python-engine-14-long-adjacent-cluster-conflict"
+IMPLEMENTATION_REV = "python-engine-16-v11-long-quality-restored"
 
 RULEBOOK_TEXT = r"""
 【0｜目的】
@@ -1361,7 +1361,11 @@ def build_horse_eval(race: RaceInfo, e: Entry, h: Optional[HorseHistory], race_d
         r for r in exact if r.margin is not None and r.margin <= 1.0
     ])
     long_exact_margins = [r.margin for r in exact if r.margin is not None]
-    long_exact_weak = bool(long_exact_margins) and min(long_exact_margins) > 1.5
+    # v1.1凍結ルールを継承。
+    # 「弱い直接実績」は全ての同場同距離実績が2.5秒超の大敗だった場合。
+    # impl13-14では1.5秒超としてしまい、R35の②(1.7差)・⑩(1.9差)・⑥(2.1差)
+    # まで弱い直接扱いになっていたため、v1.1定義へ戻す。
+    long_exact_weak = bool(long_exact_margins) and min(long_exact_margins) > 2.5
 
     direct_known_margins = [r.margin for r in same if r.margin is not None]
     weak_direct = bool(direct_known_margins) and min(direct_known_margins) > 2.5
@@ -2088,6 +2092,56 @@ def _compare_jra_middle(a: Dict, b: Dict, direct: Dict[Tuple[int, int], Dict]) -
     return _compare_jra_middle_with_reason(a, b, direct)[0]
 
 
+def _long_v11_margin_penalty(margin: Optional[float]) -> float:
+    """v1.1凍結版の同場同距離「ベスト時計＋その時計時着差」補正。
+
+    2000m以上で同じ競馬場・同じ距離の実時計を比較するときだけ使う。
+    別競馬場の生時計横比較には絶対に使わない。
+    """
+    if margin is None:
+        return 0.35
+    if margin <= 0.3:
+        return 0.00
+    if margin <= 0.6:
+        return 0.10
+    if margin <= 1.0:
+        return 0.25
+    if margin <= 1.5:
+        return 0.55
+    if margin <= 2.0:
+        return 0.80
+    if margin <= 2.5:
+        return 1.05
+    if margin <= 3.0:
+        return 1.45
+    return 2.00
+
+
+def _long_quality_clock_key(ev: Dict) -> Optional[Tuple[float, float]]:
+    """v1.1のquality clockをv2.0-BetaのPEAK比較へ戻す。
+
+    lower is better.
+    """
+    r = ev.get("raw_exact")
+    if r is None or r.time_seconds is None:
+        return None
+    return (
+        r.time_seconds + _long_v11_margin_penalty(r.margin),
+        r.time_seconds,
+    )
+
+
+def _other_same_distance_nonweak(ev: Dict) -> bool:
+    """別場同距離に「弱い直接ではない」材料があるか。
+
+    v1.1では同距離実績のknown margin最良が2.5秒以内なら、
+    3秒級大敗しかない同場同距離より上回り得る。
+    """
+    runs = ev.get("other_same") or []
+    margins = [r.margin for r in runs if r.margin is not None]
+    return bool(runs) and (not margins or min(margins) <= 2.5)
+
+
 def _long_tier(ev: Dict) -> int:
     """2000m以上の証拠層。
 
@@ -2179,21 +2233,38 @@ def _long_domain_cmp(a: Dict, b: Dict, direct: Dict[Tuple[int, int], Dict], use_
 
 
 def _compare_long_with_reason(a: Dict, b: Dict, direct: Dict[Tuple[int, int], Dict]) -> Tuple[int, str]:
-    """2000m以上の比較（impl13）。
+    """2000m以上の比較（impl16）。
 
     1) 同場同距離が両方ある場合はVALID PEAKをRAW PEAKより信頼。
     2) VALID同士で自然断層がある時だけPEAK帯を先に固定。
     3) 同帯/断層なしは、その同場同距離だけのCONTENT→REPEAT→CURRENT。
-    4) 片方だけ同場同距離でも、その直接実績が1.5秒超しかなく、相手に
+    4) 片方だけ同場同距離でも、その直接実績が2.5秒超しかなく、相手に
        強い同距離/隣接VALID反復がある時は逆転を許す。
     5) 別場同士は生時計秒数を直接比較しない。
     """
     ae, be = bool(a["exact"]), bool(b["exact"])
 
     if ae and be:
+        # v1.1凍結版の土台を先に維持する。
+        # 同場同距離の直接実績が両馬にある場合は、ベスト生時計だけでなく
+        # 「その時計を出した時の着差」を加味したquality clockをPEAK証拠として使う。
+        # R35のように 2:08.5/1.7差 と 2:09.8/1.9差なら、
+        # CONTENT単独で後者を逆転させず、1.3秒の同場生時計差を残す。
+        aweak, bweak = bool(a.get("long_exact_weak")), bool(b.get("long_exact_weak"))
+        if aweak != bweak:
+            stronger = b if aweak else a
+            return (1 if stronger is a else -1,
+                    "2000m+：v1.1弱い直接実績(全て2.5秒超)を非弱直接より下")
+
+        if not aweak and not bweak:
+            qa, qb = _long_quality_clock_key(a), _long_quality_clock_key(b)
+            if qa is not None and qb is not None and qa != qb:
+                return (1 if qa < qb else -1,
+                        "2000m+：v1.1同場同距離quality clock（生時計＋その時計時着差）")
+
         av, bv = a.get("long_valid_exact") is not None, b.get("long_valid_exact") is not None
 
-        # VALID PEAKの有無をRAW最速より先に見る。RAW大敗一発の過大評価を防ぐ。
+        # quality clockで決まらない場合にv2.0-BetaのVALID/CONTENT競合へ進む。
         if av != bv:
             valid_ev, raw_ev = (a, b) if av else (b, a)
             # RAW側にも強い反復CONTENTがある場合だけ即決せずドメイン比較へ。
@@ -2256,10 +2327,16 @@ def _compare_long_with_reason(a: Dict, b: Dict, direct: Dict[Tuple[int, int], Di
 
     if ae != be:
         ex, other = (a, b) if ae else (b, a)
-        # 直接実績が1.5秒超しかない時は「距離経験があるだけ」で保護しない。
-        if ex.get("long_exact_weak") and _long_other_strong(other):
-            return (1 if other is a else -1,
-                    "2000m+：弱い同場直接を強い同距離/隣接反復が逆転")
+        # v1.1凍結版:
+        # 全て2.5秒超の大敗しかない同場同距離は「弱い直接」。
+        # 相手に弱くない別場同距離実績があれば、同場経験だけでは保護しない。
+        if ex.get("long_exact_weak"):
+            if _other_same_distance_nonweak(other):
+                return (1 if other is a else -1,
+                        "2000m+：v1.1弱い同場直接を非弱の別場同距離が逆転")
+            if _long_other_strong(other):
+                return (1 if other is a else -1,
+                        "2000m+：弱い同場直接を強い同距離/隣接反復が逆転")
         return (1 if ex is a else -1,
                 "2000m+：有効な同場同距離の直接証拠を優先")
 
@@ -2285,7 +2362,7 @@ def _compare_long(a: Dict, b: Dict, direct: Dict[Tuple[int, int], Dict]) -> int:
 
 
 def _long_seed_key(race: RaceInfo, ev: Dict) -> Tuple:
-    """2000m+の推移的seed（impl13）。
+    """2000m+の推移的seed（impl16）。
 
     seedでもRAW生時計をCONTENTより前に置かない。
     同場同距離ではVALID PEAK→自然クラスタ→CONTENT→REPEAT→CURRENT→
@@ -3090,10 +3167,10 @@ def verify_prediction(pred: Dict, text: str) -> Dict:
 # Streamlit UI
 # ============================================================
 
-APP_NAME = "競馬AI 時計分析 v2.0-Beta 完全Python版 impl14"
+APP_NAME = "競馬AI 時計分析 v2.0-Beta 完全Python版 impl16"
 st.set_page_config(page_title=APP_NAME, page_icon="⏱️", layout="wide")
-st.title("⏱️ 競馬AI 時計分析 v2.0-Beta impl14")
-st.caption("完全Python自動判定｜impl14 long-adjacent-cluster-conflict｜ChatGPT不要｜OpenAI API不要｜外部AI不要")
+st.title("⏱️ 競馬AI 時計分析 v2.0-Beta impl16")
+st.caption("完全Python自動判定｜impl16 v1.1-long-quality-restored｜ChatGPT不要｜OpenAI API不要｜外部AI不要")
 st.info(
     f"🔒 {RULESET_NAME}\n\n"
     "馬柱解析から5軸評価・競合判断・通常TOP8・ガード・最終TOP6まで、このPythonだけで完結します。"
