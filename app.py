@@ -543,7 +543,7 @@ def parse_horse_histories(text: str, entries: Optional[List[Entry]] = None) -> D
 
 RULESET_ID = "CLOCK_RULEBOOK_V2_0_BETA_PYTHON_FROZEN_2026-08-13"
 RULESET_NAME = "時計分析 完全ルールブック v2.0-Beta【完全Python自動判定】"
-IMPLEMENTATION_REV = "python-engine-11-directness-guard-slot"
+IMPLEMENTATION_REV = "python-engine-12-local-long-evidence-order"
 
 RULEBOOK_TEXT = r"""
 【0｜目的】
@@ -1745,8 +1745,9 @@ def _soft_cmp(a: Dict, b: Dict, direct: Dict[Tuple[int, int], Dict], use_peak_ti
     # 7) 条件近接
     if a["condition_tier"] != b["condition_tier"]:
         return 1 if a["condition_tier"] < b["condition_tier"] else -1
-    # 8) 最後は馬番で完全決定（人気は不使用）
-    return 1 if a["number"] < b["number"] else -1 if a["number"] > b["number"] else 0
+    # 8) 5軸・直接対戦・同場時計まで同等なら順位根拠なし。
+    # 馬番は時計能力と無関係なのでタイブレークに使わない。
+    return 0
 
 
 def _can_reverse_adjacent_cluster(lower: Dict, upper: Dict) -> bool:
@@ -2053,31 +2054,156 @@ def _compare_jra_middle(a: Dict, b: Dict, direct: Dict[Tuple[int, int], Dict]) -
 
 
 def _long_tier(ev: Dict) -> int:
-    if ev["valid_exact"] is not None:
+    """2000m以上の証拠層。
+
+    impl12では「VALIDかどうか」だけで同場同距離馬と別場同距離馬を
+    入れ替えない。同場同距離の実時計は地方長距離の共通物差しとして
+    最も直接的な証拠。弱い直接（全同距離が大敗）だけ例外的に強い別場
+    同距離/隣接へ逆転を許す。
+    """
+    if ev["exact"]:
         return 0
-    if ev["valid_same"] is not None and ev["same"]:
+    if ev["same"]:
         return 1
-    strong_adj = [r for r in ev["adj_same"] + ev["adj_other"] if r.margin is not None and r.margin <= 0.6]
+    strong_adj = [
+        r for r in ev["adj_same"] + ev["adj_other"]
+        if r.margin is not None and r.margin <= 0.6
+    ]
     if strong_adj:
         return 2
-    if ev["same"]:
-        return 3
     if ev["adj_same"]:
-        return 4
+        return 3
     if ev["adj_other"]:
-        return 5
+        return 4
     return 9
 
 
-def _compare_long(a: Dict, b: Dict, direct: Dict[Tuple[int, int], Dict]) -> int:
+def _long_other_strong(ev: Dict) -> bool:
+    """同場同距離の弱材料を逆転できるだけの別条件証拠か。"""
+    same_good = [r for r in ev["same"] if r.margin is not None and r.margin <= 0.6]
+    adj_good = [r for r in ev["adj_same"] + ev["adj_other"] if r.margin is not None and r.margin <= 0.3]
+    return (
+        (len(same_good) >= 2 or len(adj_good) >= 2)
+        and ev["repeat"]["grade"] >= 2
+        and ev["current"]["grade"] >= 3
+    )
+
+
+def _compare_long_with_reason(a: Dict, b: Dict, direct: Dict[Tuple[int, int], Dict]) -> Tuple[int, str]:
+    """2000m以上の比較。
+
+    地方長距離では同場同距離を共通物差しとして強く使う。
+    同場同距離同士は PEAK（自然クラスタ）→CONTENT/REPEAT/CURRENT、
+    別場同距離の生時計は秒数で直接比較しない。
+    """
+    ae, be = bool(a["exact"]), bool(b["exact"])
+
+    # 両馬に同場同距離。まず自然なPEAK差を尊重。
+    if ae and be:
+        if (
+            a["peak_cluster_reliable"] and b["peak_cluster_reliable"]
+            and a["peak_cluster"] != b["peak_cluster"]
+        ):
+            ca, cb = a["peak_cluster"], b["peak_cluster"]
+            upper, lower = (a, b) if ca < cb else (b, a)
+            diff = abs(ca - cb)
+            if diff >= 2:
+                # 大PEAK差。ただし上位がRAW大敗一発で、下位がVALIDを反復する時だけ例外。
+                if (
+                    upper["peak_type"] == "RAW"
+                    and lower["peak_type"] == "VALID"
+                    and lower["repeat"]["grade"] >= 2
+                    and lower["current"]["grade"] >= 3
+                ):
+                    return (1 if lower is a else -1, "2000m+：大PEAK差だがRAW一発をVALID反復が逆転")
+                return (1 if upper is a else -1, "2000m+：同場同距離PEAKの大きな自然断層")
+            # 隣接クラスタは、下位側が再現性・現在値・内容で明確に強い時だけ逆転。
+            lower_content = _margin_level(lower["best_content"].margin) if lower["best_content"] else 0
+            upper_content = _margin_level(upper["best_content"].margin) if upper["best_content"] else 0
+            if (
+                lower["peak_type"] == "VALID"
+                and lower["repeat"]["grade"] >= 2
+                and lower["current"]["grade"] >= 4
+                and lower_content >= upper_content + 2
+            ):
+                return (1 if lower is a else -1, "2000m+：隣接PEAKをCONTENT・REPEAT・CURRENTで逆転")
+            return (1 if upper is a else -1, "2000m+：同場同距離PEAKの自然クラスタ")
+
+        c = _soft_cmp(a, b, direct, use_peak_time=True)
+        if c:
+            return c, "2000m+：同PEAK帯をCONTENT・REPEAT・CURRENTで比較"
+        return 0, "2000m+：同場同距離5軸同等"
+
+    # 片方だけ同場同距離。地方2000m+では基本的に直接証拠を優先。
+    if ae != be:
+        ex, other = (a, b) if ae else (b, a)
+        # 全ての直接同距離が2.5秒超級の大敗なら、強い別場同距離/隣接が逆転可。
+        if ex["weak_direct"] and _long_other_strong(other):
+            return (1 if other is a else -1, "2000m+：弱い同場直接を強い別条件反復が逆転")
+        return (1 if ex is a else -1, "2000m+：同場同距離の直接証拠を優先")
+
+    # 両馬とも同場同距離なし。別場同距離を隣接より基本優先するが、
+    # 別場の生時計秒数は直接比較しない。
     ta, tb = _long_tier(a), _long_tier(b)
     if ta != tb:
-        # 強い隣接（2）は弱い直接（3）を上回るルールをtier化済み。
-        return 1 if ta < tb else -1
-    if ta == 0 and a["raw_exact"] is not None and b["raw_exact"] is not None:
-        if a["peak_cluster_reliable"] and b["peak_cluster_reliable"] and a["peak_cluster"] != b["peak_cluster"]:
-            return 1 if a["peak_cluster"] < b["peak_cluster"] else -1
-    return _soft_cmp(a, b, direct, use_peak_time=(ta == 0))
+        # 強い隣接(2)は、内容の弱い別場同距離(1)を例外的に逆転可。
+        if {ta, tb} == {1, 2}:
+            same_ev, adj_ev = (a, b) if ta == 1 else (b, a)
+            same_best = _margin_level(same_ev["best_content"].margin) if same_ev["best_content"] else 0
+            adj_best = _margin_level(adj_ev["best_content"].margin) if adj_ev["best_content"] else 0
+            if adj_best >= same_best + 2 and adj_ev["repeat"]["grade"] >= 2:
+                return (1 if adj_ev is a else -1, "2000m+：強い隣接が弱い別場同距離を逆転")
+        winner = a if ta < tb else b
+        return (1 if winner is a else -1, "2000m+：同距離証拠の直接性")
+
+    c = _soft_cmp(a, b, direct, use_peak_time=False)
+    if c:
+        return c, "2000m+：別場生時計を比較せずCONTENT・REPEAT・CURRENT"
+    return 0, "2000m+：5軸同等"
+
+
+def _compare_long(a: Dict, b: Dict, direct: Dict[Tuple[int, int], Dict]) -> int:
+    return _compare_long_with_reason(a, b, direct)[0]
+
+
+def _long_seed_key(race: RaceInfo, ev: Dict) -> Tuple:
+    """2000m以上の推移的な初期順位。
+
+    同場同距離ありを先に置き、その中では自然PEAK→同場生時計→VALID性→
+    CONTENT/REPEAT/CURRENT。生時計を使うのは同じ今回競馬場・同距離だけ。
+    同場同距離が無い馬では別場生時計をキーに入れない。
+    """
+    peak_type_score = {"VALID": 2, "RAW": 1, "不明": 0}.get(ev["peak_type"], 0)
+    exact = bool(ev["exact"])
+    if exact:
+        cluster_score = -ev["peak_cluster"] if ev["peak_cluster_reliable"] else -99
+        raw_time = -ev["raw_exact"].time_seconds if ev["raw_exact"] is not None else -9999.0
+        # weak_directは「全同距離が2.5秒超」の時だけ。単発大敗時計そのものは
+        # PEAKとして残し、CONTENT/REPEATで信頼度を調整する。
+        return (
+            3 if not ev["weak_direct"] else 2,
+            cluster_score,
+            raw_time,
+            peak_type_score,
+            ev["best_content_tuple"],
+            ev["repeat"]["grade"],
+            ev["current"]["grade"],
+            ev["class_value"]["rank"],
+            -ev["condition_tier"],
+        )
+
+    tier = _long_tier(ev)
+    return (
+        1,
+        -tier,
+        0.0,  # 別場生時計秒数はランキングキーにしない
+        peak_type_score,
+        ev["best_content_tuple"],
+        ev["repeat"]["grade"],
+        ev["current"]["grade"],
+        ev["class_value"]["rank"],
+        -ev["condition_tier"],
+    )
 
 
 def compare_evals_with_reason(a: Dict, b: Dict, race: RaceInfo, direct: Dict[Tuple[int, int], Dict]) -> Tuple[int, str]:
@@ -2089,12 +2215,10 @@ def compare_evals_with_reason(a: Dict, b: Dict, race: RaceInfo, direct: Dict[Tup
     if race.track in JRA_TRACKS and 1600 <= race.distance <= 1800:
         return _compare_jra_middle_with_reason(a, b, direct)
 
-    c = compare_evals(a, b, race, direct)
     if race.distance >= 2000:
-        reason = "2000m以上ルール（直接距離/強い隣接＋5軸）"
-    else:
-        reason = "地方・その他ルール（同場同距離＋5軸）"
-    return c, reason
+        return _compare_long_with_reason(a, b, direct)
+    c = compare_evals(a, b, race, direct)
+    return c, "地方・その他ルール（同場同距離＋5軸）"
 
 
 def compare_evals(a: Dict, b: Dict, race: RaceInfo, direct: Dict[Tuple[int, int], Dict]) -> int:
@@ -2200,11 +2324,7 @@ def _baseline_key(race: RaceInfo, ev: Dict) -> Tuple:
         )
 
     if race.distance >= 2000:
-        return (
-            -_long_tier(ev), cluster_score, ev["best_content_tuple"],
-            ev["repeat"]["grade"], ev["current"]["grade"], ev["class_value"]["rank"],
-            peak_type_score, -ev["condition_tier"], exact_time, -n,
-        )
+        return _long_seed_key(race, ev)
 
     return (
         1 if ev["exact"] else 0, cluster_score, ev["best_content_tuple"],
@@ -2373,6 +2493,70 @@ def rank_evals(race: RaceInfo, evals: Dict[int, Dict], direct: Dict[Tuple[int, i
         head_nums = {ev["number"] for ev in head}
         tail_final = [ev for ev in ordered if ev["number"] not in head_nums]
         cycle_detected = False
+    elif race.distance >= 2000:
+        # impl12: 2000m以上は総当たり勝数を初期順位にしない。
+        # 非推移の勝数で、同場同距離PEAKの序列が崩れるのを防ぐ。
+        ordered = sorted(items, key=lambda ev: _long_seed_key(race, ev), reverse=True)
+        seed_mode = "2000m+同場同距離PEAK seed＋安定挿入監査"
+        audit_len = min(8, len(ordered))
+        baseline_head = tuple(ev["number"] for ev in ordered[:audit_len])
+        baseline_all = tuple(ev["number"] for ev in ordered)
+        audit_events = []
+        admission_events = []
+        dominance_events = []
+        cycle_detected = False
+
+        # seed上位8頭を安定挿入。各馬は上方向へだけ動かし循環させない。
+        head = []
+        for ev in ordered[:audit_len]:
+            head.append(ev)
+            idx = len(head) - 1
+            while idx > 0:
+                cmpv, reason = compare_evals_with_reason(head[idx], head[idx - 1], race, direct)
+                if cmpv <= 0:
+                    break
+                before = (head[idx - 1]["number"], head[idx]["number"])
+                head[idx - 1], head[idx] = head[idx], head[idx - 1]
+                audit_events.append({
+                    "pass": "long-seed-insert",
+                    "from": before,
+                    "to": (head[idx - 1]["number"], head[idx]["number"]),
+                    "reason": reason,
+                })
+                idx -= 1
+
+        # TOP8外も8位と正式比較して入替可。勝数だけでの救済はしない。
+        tail = list(ordered[audit_len:])
+        for challenger in tail:
+            if not head:
+                head.append(challenger)
+                continue
+            cmpv, reason = compare_evals_with_reason(challenger, head[-1], race, direct)
+            if cmpv > 0:
+                displaced = head[-1]
+                head[-1] = challenger
+                admission_events.append({
+                    "IN": challenger["number"],
+                    "OUT": displaced["number"],
+                    "reason": reason,
+                })
+                idx = len(head) - 1
+                while idx > 0:
+                    cmp2, reason2 = compare_evals_with_reason(head[idx], head[idx - 1], race, direct)
+                    if cmp2 <= 0:
+                        break
+                    before = (head[idx - 1]["number"], head[idx]["number"])
+                    head[idx - 1], head[idx] = head[idx], head[idx - 1]
+                    audit_events.append({
+                        "pass": "long-outside-admit",
+                        "from": before,
+                        "to": (head[idx - 1]["number"], head[idx]["number"]),
+                        "reason": reason2,
+                    })
+                    idx -= 1
+
+        head_nums = {ev["number"] for ev in head}
+        tail_final = [ev for ev in ordered if ev["number"] not in head_nums]
     else:
         ordered = sorted(
             items,
@@ -2777,10 +2961,10 @@ def verify_prediction(pred: Dict, text: str) -> Dict:
 # Streamlit UI
 # ============================================================
 
-APP_NAME = "競馬AI 時計分析 v2.0-Beta 完全Python版 impl10"
+APP_NAME = "競馬AI 時計分析 v2.0-Beta 完全Python版 impl12"
 st.set_page_config(page_title=APP_NAME, page_icon="⏱️", layout="wide")
 st.title("⏱️ 競馬AI 時計分析 v2.0-Beta impl10")
-st.caption("完全Python自動判定｜impl11 directness-guard-slot｜ChatGPT不要｜OpenAI API不要｜外部AI不要")
+st.caption("完全Python自動判定｜impl12 local-long-evidence-order｜ChatGPT不要｜OpenAI API不要｜外部AI不要")
 st.info(
     f"🔒 {RULESET_NAME}\n\n"
     "馬柱解析から5軸評価・競合判断・通常TOP8・ガード・最終TOP6まで、このPythonだけで完結します。"
