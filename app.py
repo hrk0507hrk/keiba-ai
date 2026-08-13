@@ -543,7 +543,7 @@ def parse_horse_histories(text: str, entries: Optional[List[Entry]] = None) -> D
 
 RULESET_ID = "CLOCK_RULEBOOK_V2_0_BETA_PYTHON_FROZEN_2026-08-13"
 RULESET_NAME = "時計分析 完全ルールブック v2.0-Beta【完全Python自動判定】"
-IMPLEMENTATION_REV = "python-engine-18-guard-peak-boundary-fix"
+IMPLEMENTATION_REV = "python-engine-19-local-smooth-conflict-fix"
 
 RULEBOOK_TEXT = r"""
 【0｜目的】
@@ -1829,7 +1829,7 @@ def _local_raw_rank(ev: Dict) -> Optional[int]:
 
 
 def _compare_local_with_reason(a: Dict, b: Dict, direct: Dict[Tuple[int, int], Dict]) -> Tuple[int, str]:
-    """地方・短中距離の競合判断（impl17）。
+    """地方・短中距離の競合判断（impl19）。
 
     v2.0-Betaの「同場同距離PEAK＋CONTENT＋REPEAT＋CURRENT」を、
     CONTENTの辞書順1発で決めないようにする。
@@ -1877,6 +1877,42 @@ def _compare_local_with_reason(a: Dict, b: Dict, direct: Dict[Tuple[int, int], D
             upper_band, lower_band = max(ac, bc), min(ac, bc)
             ur = _local_raw_rank(upper_c)
             lr = _local_raw_rank(lower_c)
+            urg = upper_c.get("repeat", {}).get("grade", 0)
+            lrg = lower_c.get("repeat", {}).get("grade", 0)
+            ucu = upper_c.get("current", {}).get("grade", 2)
+            lcu = lower_c.get("current", {}).get("grade", 2)
+
+            # impl19:
+            # 自然断層なし/同PEAK帯では、CONTENTを固定的な絶対順位にしない。
+            # v2.0-Betaの
+            # 「似たPEAKなら反復して高水準の馬が一発型を逆転できる」
+            # 「明確なCURRENT divergence はPEAKの信頼度を変える」
+            # をそのまま比較へ反映する。
+            # ただしCONTENT差3帯以上までは崩さない。
+            if content_diff <= 2 and ur is not None and lr is not None:
+                lower_peak_better = lr < ur
+
+                # A) 一発CONTENTより、同等以上PEAKを反復している馬を優先。
+                # REPEAT差が2段階以上ある時だけ。CURRENTは悪化していないこと。
+                repeat_peak_override = (
+                    lower_peak_better
+                    and lrg >= urg + 2
+                    and lcu >= ucu
+                )
+                if repeat_peak_override:
+                    return (1 if lower_c is a else -1,
+                            "地方：同PEAK帯で反復高水準が一発CONTENTを逆転")
+
+                # B) PEAKが分布内で明確に上かつCURRENTも明確に上、
+                # REPEATでも負けない場合はCONTENT差2帯まで逆転可。
+                current_peak_override = (
+                    lr + 2 <= ur
+                    and lrg >= urg
+                    and lcu >= ucu + 2
+                )
+                if current_peak_override:
+                    return (1 if lower_c is a else -1,
+                            "地方：同PEAK帯でPEAK＋REPEAT/CURRENTの明確優勢がCONTENT差を逆転")
 
             # CONTENT1帯差なら、PEAKがレース内分布で2順位以上上かつ
             # REPEAT/CURRENTで負けていない馬は逆転可能。
@@ -1887,8 +1923,8 @@ def _compare_local_with_reason(a: Dict, b: Dict, direct: Dict[Tuple[int, int], D
                 and lr + 2 <= ur
             )
             time_axes_not_worse = (
-                lower_c.get("repeat", {}).get("grade", 0) >= upper_c.get("repeat", {}).get("grade", 0)
-                and lower_c.get("current", {}).get("grade", 2) >= upper_c.get("current", {}).get("grade", 2)
+                lrg >= urg
+                and lcu >= ucu
             )
             if peak_clearer and time_axes_not_worse:
                 return (1 if lower_c is a else -1,
@@ -1897,14 +1933,26 @@ def _compare_local_with_reason(a: Dict, b: Dict, direct: Dict[Tuple[int, int], D
             return (1 if upper_c is a else -1,
                     f"地方：同場同距離CONTENT帯を優先（{upper_band}>{lower_band}）")
 
-        # CONTENT同帯なら、一発の着順/日付で決めず時間軸へ。
+        # CONTENT同帯。REPEATだけを先に固定せず、
+        # PEAKが大きく上＋CURRENTが明確に良い場合はそちらを先に評価する。
+        # R38型の「遅いPEAK＋下降なのにREPEATだけで上位」を防ぐ。
+        arank, brank = _local_raw_rank(a), _local_raw_rank(b)
+        acu = a.get("current", {}).get("grade", 2)
+        bcu = b.get("current", {}).get("grade", 2)
+        if arank is not None and brank is not None and abs(arank - brank) >= 2:
+            faster, slower = (a, b) if arank < brank else (b, a)
+            fcu = faster.get("current", {}).get("grade", 2)
+            scu = slower.get("current", {}).get("grade", 2)
+            if fcu >= scu + 2:
+                return (1 if faster is a else -1,
+                        "地方：同CONTENT帯で明確なPEAK順位差＋CURRENT差を優先")
+
+        # それでも同水準なら時間軸。
         agr = a.get("repeat", {}).get("grade", 0)
         bgr = b.get("repeat", {}).get("grade", 0)
         if agr != bgr:
             return (1 if agr > bgr else -1, "地方：同CONTENT帯でREPEATを優先")
 
-        acu = a.get("current", {}).get("grade", 2)
-        bcu = b.get("current", {}).get("grade", 2)
         if acu != bcu:
             return (1 if acu > bcu else -1, "地方：同CONTENT/REPEATでCURRENTを優先")
 
