@@ -543,7 +543,7 @@ def parse_horse_histories(text: str, entries: Optional[List[Entry]] = None) -> D
 
 RULESET_ID = "CLOCK_RULEBOOK_V2_0_BETA_PYTHON_FROZEN_2026-08-13"
 RULESET_NAME = "時計分析 完全ルールブック v2.0-Beta【完全Python自動判定】"
-IMPLEMENTATION_REV = "python-engine-17-local-conflict-v11"
+IMPLEMENTATION_REV = "python-engine-18-guard-peak-boundary-fix"
 
 RULEBOOK_TEXT = r"""
 【0｜目的】
@@ -2953,9 +2953,89 @@ def _transfer_candidate(race: RaceInfo, ev: Dict) -> bool:
     return _is_upper_environment(prev.track) and not any(r.track == race.track for r in recent)
 
 
+def _top_valid_peak_cluster_members(evals: Dict[int, Dict], clusters: Dict) -> set:
+    """
+    絶対時計ガード専用の「最上位VALID PEAK群」を作る。
+
+    v2.0-Betaの意図は formal TOP3 ではなく自然な最上位PEAK群。
+    旧実装は全同場同距離RAW分布の大きな下位断層だけでC1が広がると、
+    C1のほぼ全馬を絶対時計候補にしてしまった。
+
+    ここでは各馬の「同場同距離・VALID(<=1.0差)の最速時計」だけを並べ、
+    上端から見た局所的な自然断層を使う。固定秒差は使わない。
+    """
+    rows = []
+    for n, ev in evals.items():
+        vr = _best_time_run([
+            r for r in ev.get("exact", [])
+            if r.time_seconds is not None
+            and r.margin is not None
+            and r.margin <= 1.0
+        ])
+        if vr is not None:
+            rows.append((n, float(vr.time_seconds), vr))
+
+    rows.sort(key=lambda x: x[1])
+    if not rows:
+        return set()
+    if len(rows) == 1:
+        return {rows[0][0]}
+
+    gaps = [rows[i+1][1] - rows[i][1] for i in range(len(rows)-1)]
+    positive = [g for g in gaps if g > 1e-9]
+    if not positive:
+        return {n for n, _, _ in rows}
+
+    # 最速1頭が明確に抜けるケース。後続の典型gapとの比で判定。
+    if len(gaps) >= 2 and gaps[0] > 0:
+        tail_pos = [g for g in gaps[1:] if g > 1e-9]
+        if tail_pos:
+            tail_med = statistics.median(tail_pos)
+            if tail_med > 0 and gaps[0] > tail_med * 2.5:
+                return {rows[0][0]}
+
+    # 2頭以上の上位塊。直前までの内部gapに対して急に広がる最初の箇所を採用。
+    for i in range(1, len(gaps)):
+        g = gaps[i]
+        if g <= 1e-9:
+            continue
+        prior = [x for x in gaps[:i] if x > 1e-9]
+        if not prior:
+            continue
+        prior_med = statistics.median(prior)
+        if prior_med > 0 and g > prior_med * 2.5:
+            return {n for n, _, _ in rows[:i+1]}
+
+    # 明確な上端断層が無い場合は、絶対時計ガードを無理に作らない。
+    # PEAK差が滑らかな時はCONTENT/REPEAT/CURRENTで通常順位を作る、という凍結方針に従う。
+    return set()
+
+
 def _same_ability_band(a: Dict, b: Dict) -> bool:
+    """境界ガード用。粗いクラスタ一致だけで「同等能力」としない。
+
+    同じC1でも、そのC1が広すぎる場合は6位ラインから大きく離れた馬まで
+    境界保護されてしまう。固定秒差ではなく、そのレース内の典型的な
+    同場同距離gapに対してどれだけ離れているかで「近い帯」を確認する。
+    """
     if a["peak_cluster_reliable"] and b["peak_cluster_reliable"]:
-        return a["peak_cluster"] == b["peak_cluster"]
+        if a["peak_cluster"] != b["peak_cluster"]:
+            return False
+
+        ar = a.get("raw_exact")
+        br = b.get("raw_exact")
+        clusters = a.get("_clusters_ref") or b.get("_clusters_ref") or {}
+        if ar is not None and br is not None and ar.time_seconds is not None and br.time_seconds is not None:
+            rows = clusters.get("rows", [])
+            times = sorted(float(x["time"]) for x in rows if x.get("time") is not None)
+            gaps = [times[i+1] - times[i] for i in range(len(times)-1)]
+            positive = [g for g in gaps if g > 1e-9]
+            if positive:
+                typical = statistics.median(positive)
+                if typical > 0 and abs(float(ar.time_seconds) - float(br.time_seconds)) > typical * 2.5:
+                    return False
+        return True
+
     # クラスタが作れない時は、条件層とCONTENT帯が近い場合のみ同等扱い。
     ca = _margin_level(a["best_content"].margin) if a["best_content"] else 0
     cb = _margin_level(b["best_content"].margin) if b["best_content"] else 0
@@ -2976,6 +3056,10 @@ def apply_guards(race: RaceInfo, entries: List[Entry], evals: Dict[int, Dict], n
     fast_big = []
 
     # 警戒・絶対
+    # 絶対時計は「同場同距離VALID PEAKの上端自然クラスタ」でのみ判定。
+    # 全RAW分布の下位外れ値が原因でC1が広がるケースを絶対ガードへ持ち込まない。
+    top_valid_peak_members = _top_valid_peak_cluster_members(evals, clusters)
+
     for n, ev in evals.items():
         e = by_num[n]
         if not ev["history"] or not ev["history"].races:
@@ -2992,16 +3076,18 @@ def apply_guards(race: RaceInfo, entries: List[Entry], evals: Dict[int, Dict], n
             if (ev["peak_cluster_reliable"] and ev["peak_cluster"] == 1) or (raw_rank is not None and raw_rank <= 3):
                 fast_big.append(n)
 
-        # 絶対時計ガード：最上位VALID PEAKクラスタ＋勝利/0.3以内。
-        valid_peak_cluster1 = any(
-            r.margin is not None
-            and r.margin <= 0.3
-            and _cluster_for_time(r.time_seconds, clusters) == 1
-            for r in ev["exact"]
-            if r.time_seconds is not None
-        )
-        if clusters.get("reliable") and valid_peak_cluster1:
-            absolute.append(n)
+        # 絶対時計ガード：最上位VALID PEAK群に属し、
+        # その馬のVALID最速時計そのものが勝利/0.3以内であること。
+        # 「別の遅い0.3以内走」があるだけでは絶対ガードにしない。
+        if n in top_valid_peak_members:
+            valid_best = _best_time_run([
+                r for r in ev["exact"]
+                if r.time_seconds is not None
+                and r.margin is not None
+                and r.margin <= 1.0
+            ])
+            if valid_best is not None and valid_best.margin is not None and valid_best.margin <= 0.3:
+                absolute.append(n)
 
         if _transfer_candidate(race, ev):
             transfer.append(n)
