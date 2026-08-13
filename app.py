@@ -543,7 +543,7 @@ def parse_horse_histories(text: str, entries: Optional[List[Entry]] = None) -> D
 
 RULESET_ID = "CLOCK_RULEBOOK_V2_0_BETA_PYTHON_FROZEN_2026-08-13"
 RULESET_NAME = "時計分析 完全ルールブック v2.0-Beta【完全Python自動判定】"
-IMPLEMENTATION_REV = "python-engine-9-stable-insertion"
+IMPLEMENTATION_REV = "python-engine-10-pairwise-consistency"
 
 RULEBOOK_TEXT = r"""
 【0｜目的】
@@ -2021,10 +2021,9 @@ def _compare_jra_middle_with_reason(
         winner = a if a["condition_tier"] < b["condition_tier"] else b
         return (1 if winner is a else -1, "CONDITION最終タイブレーク")
 
-    if a["number"] == b["number"]:
-        return 0, "完全同等"
-    winner = a if a["number"] < b["number"] else b
-    return (1 if winner is a else -1, "完全同等のため馬番タイブレーク")
+    # 5軸・直接対戦・同場時計まで完全同等なら順位根拠なし。
+    # 馬番は時計能力と無関係なのでタイブレークに使わない。
+    return 0, "5軸同等・順位保留（馬番は使わない）"
 
 
 def _compare_jra_middle(a: Dict, b: Dict, direct: Dict[Tuple[int, int], Dict]) -> int:
@@ -2145,7 +2144,6 @@ def _jra_middle_seed_key(race: RaceInfo, ev: Dict) -> Tuple:
         rp.get("close10", 0),
         cu.get("grade", 2),
         -ev.get("condition_tier", 99),
-        -ev.get("number", 999),
     )
 
 
@@ -2196,13 +2194,14 @@ def _baseline_key(race: RaceInfo, ev: Dict) -> Tuple:
 def rank_evals(race: RaceInfo, evals: Dict[int, Dict], direct: Dict[Tuple[int, int], Dict]) -> List[int]:
     """通常順位を作る。
 
-    impl9:
-    - impl6のJRA1600〜1800m証拠層・比較関数へ戻す。
-    - 非推移なpairwise比較を何周も回して循環した時にseedへ全リセットする処理を廃止。
-    - JRA1600〜1800mはseedを初期順にだけ使い、各馬を1回ずつ安定挿入する。
-    - TOP8外も8位境界へ挑戦可能。境界勝利または総当たりで明確優勢なら候補へ入れ、
-      その後は同じ比較関数で勝てる位置まで上へ挿入する。
-    - 最後に5位vs6位、6位vs7位を明示的に再確認する。
+    impl10:
+    - impl9の安定挿入を維持。
+    - 「途中の1頭に負けたため、本来上に置くべき馬との直接比較まで届かない」経路依存を補正。
+    - TOP8形成後、直接比較でも勝ち、かつ総当たりで勝数+2以上・敗数も少ない
+      「強いpairwise優勢」だけを使って全体整合を1段階再監査する。
+    - この補正は人気・オッズ・馬番を使わず、既存5軸比較の結果を安定化するだけ。
+    - 完全同等時の馬番タイブレークを廃止。
+    - 境界ガードは従来どおり6位枠だけ。
 
     人気・オッズ・ガードはここでは使わない。
     """
@@ -2310,6 +2309,45 @@ def rank_evals(race: RaceInfo, evals: Dict[int, Dict], direct: Dict[Tuple[int, i
                     })
                     bubble_up_once(head, pair_idx, "boundary-bubble")
 
+        # impl10: 非推移比較の「経路依存」を強いpairwise優勢だけで再監査。
+        # 例: AはBに勝つが途中のCに負けたためBまで到達できず、BがAより上に残るケース。
+        # 直接比較で下位馬が上位馬に勝ち、かつ全頭総当たりでも
+        # 勝数+2以上・敗数が少ない場合だけ、その上位馬の直前へ移す。
+        # 勝数だけで順位を作るのではなく、既存5軸比較の明確な矛盾を解消する安定化処理。
+        dominance_events = []
+        max_rounds = max(1, len(head))
+        for _round in range(max_rounds):
+            moved = False
+            for j in range(1, len(head)):
+                lower = head[j]
+                for i in range(j):
+                    upper = head[i]
+                    cmpv, reason = compare_evals_with_reason(lower, upper, race, direct)
+                    strong_dom = (
+                        cmpv > 0
+                        and wins[lower["number"]] >= wins[upper["number"]] + 2
+                        and losses[lower["number"]] < losses[upper["number"]]
+                    )
+                    if not strong_dom:
+                        continue
+                    before = [ev["number"] for ev in head]
+                    item = head.pop(j)
+                    head.insert(i, item)
+                    dominance_events.append({
+                        "IN馬": lower["number"],
+                        "上回った馬": upper["number"],
+                        "直接比較理由": reason,
+                        "総当たり": f"{wins[lower['number']]}勝{losses[lower['number']]}敗 vs {wins[upper['number']]}勝{losses[upper['number']]}敗",
+                        "before": "・".join(map(str, before)),
+                        "after": "・".join(str(ev["number"]) for ev in head),
+                    })
+                    moved = True
+                    break
+                if moved:
+                    break
+            if not moved:
+                break
+
         head_nums = {ev["number"] for ev in head}
         tail_final = [ev for ev in ordered if ev["number"] not in head_nums]
         cycle_detected = False
@@ -2331,6 +2369,7 @@ def rank_evals(race: RaceInfo, evals: Dict[int, Dict], direct: Dict[Tuple[int, i
         baseline_all = tuple(ev["number"] for ev in ordered)
         audit_events = []
         admission_events = []
+        dominance_events = []
         seen = {baseline_head}
         cycle_detected = False
         for pass_no in range(max(1, audit_len)):
@@ -2369,6 +2408,7 @@ def rank_evals(race: RaceInfo, evals: Dict[int, Dict], direct: Dict[Tuple[int, i
         },
         "audit_events": audit_events,
         "admission_events": admission_events,
+        "dominance_events": dominance_events,
         "cycle_detected": cycle_detected,
     }
     final_order = head + tail_final
@@ -2623,6 +2663,7 @@ def build_prediction(race: RaceInfo, entries: List[Entry], histories: Dict[int, 
     evals = {e.number: build_horse_eval(race, e, histories.get(e.number), race_date, clusters) for e in entries}
     direct = build_direct_matrix(race, evals, race_date)
     normal = rank_evals(race, evals, direct)
+    pre_guard_top6 = normal[:min(6, len(normal))]
     top6, guards = apply_guards(race, entries, evals, normal, clusters, direct)
 
     pair_checks = []
@@ -2652,6 +2693,7 @@ def build_prediction(race: RaceInfo, entries: List[Entry], histories: Dict[int, 
         "race": asdict(race),
         "race_date": race_date.isoformat(),
         "normal_order": normal,
+        "pre_guard_top6": pre_guard_top6,
         "top6": top6,
         "status": status,
         "guards": guards,
@@ -2728,10 +2770,10 @@ def verify_prediction(pred: Dict, text: str) -> Dict:
 # Streamlit UI
 # ============================================================
 
-APP_NAME = "競馬AI 時計分析 v2.0-Beta 完全Python版 impl9"
+APP_NAME = "競馬AI 時計分析 v2.0-Beta 完全Python版 impl10"
 st.set_page_config(page_title=APP_NAME, page_icon="⏱️", layout="wide")
-st.title("⏱️ 競馬AI 時計分析 v2.0-Beta impl9")
-st.caption("完全Python自動判定｜impl9 stable-insertion｜ChatGPT不要｜OpenAI API不要｜外部AI不要")
+st.title("⏱️ 競馬AI 時計分析 v2.0-Beta impl10")
+st.caption("完全Python自動判定｜impl10 pairwise-consistency｜ChatGPT不要｜OpenAI API不要｜外部AI不要")
 st.info(
     f"🔒 {RULESET_NAME}\n\n"
     "馬柱解析から5軸評価・競合判断・通常TOP8・ガード・最終TOP6まで、このPythonだけで完結します。"
@@ -2800,9 +2842,12 @@ with tab1:
         st.subheader("② 最終 時計TOP6")
         st.success("時計TOP6：" + "・".join(map(str, pred["top6"])) + f"　｜ {pred['status']}")
         st.dataframe(pd.DataFrame(pred["top6_rows"]), use_container_width=True, hide_index=True)
+        st.markdown("### ガード適用前 → 適用後")
+        st.write("**ガード前TOP6：** " + "・".join(map(str, pred.get("pre_guard_top6", []))))
+        st.write("**ガード後TOP6：** " + "・".join(map(str, pred["top6"])))
 
         st.markdown("### 通常時計順位 TOP8")
-        st.caption("人気・オッズ・ガードを使わず作成。JRA1600〜1800mは5軸＋共有同距離レースの共通物差しでseedを作り、隣接競合で再監査。REPEATは悪走込み直近5走、CURRENTは直近3走。")
+        st.caption("人気・オッズ・ガードを使わず作成。JRA1600〜1800mは5軸＋共有同距離レースでseedを作り、安定挿入＋強いpairwise優勢で経路依存を再監査。REPEATは悪走込み直近5走、CURRENTは直近3走。")
         st.dataframe(pd.DataFrame(pred["normal_rows"]), use_container_width=True, hide_index=True)
 
         st.markdown("### 5軸評価")
@@ -2832,6 +2877,10 @@ with tab1:
                 st.dataframe(pd.DataFrame(audit), use_container_width=True, hide_index=True)
             else:
                 st.caption("隣接入替なし")
+            dominance = trace.get("dominance_events", [])
+            if dominance:
+                st.caption("強いpairwise優勢による経路依存補正")
+                st.dataframe(pd.DataFrame(dominance), use_container_width=True, hide_index=True)
             pair_events = trace.get("pairwise_events", [])
             if pair_events:
                 st.caption("全ペアの決着理由（診断用）")
