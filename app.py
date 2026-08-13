@@ -543,7 +543,7 @@ def parse_horse_histories(text: str, entries: Optional[List[Entry]] = None) -> D
 
 RULESET_ID = "CLOCK_RULEBOOK_V2_0_BETA_PYTHON_FROZEN_2026-08-13"
 RULESET_NAME = "時計分析 完全ルールブック v2.0-Beta【完全Python自動判定】"
-IMPLEMENTATION_REV = "python-engine-13-long-domain-valid-peak"
+IMPLEMENTATION_REV = "python-engine-14-long-adjacent-cluster-conflict"
 
 RULEBOOK_TEXT = r"""
 【0｜目的】
@@ -2212,18 +2212,44 @@ def _compare_long_with_reason(a: Dict, b: Dict, direct: Dict[Tuple[int, int], Di
                 if diff >= 2:
                     return (1 if upper is a else -1,
                             "2000m+：VALID同場PEAKの大きな自然断層")
-                # 隣接クラスタはCONTENT/REPEAT/CURRENTが明確なら逆転可。
+                # 隣接クラスタ（差1）は「中程度のPEAK差」。
+                # impl13は lower のCONTENTが+2帯かつCURRENT高という固定ゲートで
+                # 逆転条件が硬すぎ、CONTENT/REPEAT/CURRENTの総合競合を潰していた。
+                # v2.0-Betaどおり、同場同距離ドメインの3軸で lower が明確に優勢なら逆転可。
                 lc_u, lc_l = upper.get("long_content", {}), lower.get("long_content", {})
-                lr_l, cu_l = lower.get("long_repeat", {}), lower.get("long_current", {})
-                if (
-                    lc_l.get("best_band", 0) >= lc_u.get("best_band", 0) + 2
-                    and lr_l.get("grade", 0) >= 2
-                    and cu_l.get("grade", 2) >= 3
-                ):
+                lr_u, lr_l = upper.get("long_repeat", {}), lower.get("long_repeat", {})
+                cu_u, cu_l = upper.get("long_current", {}), lower.get("long_current", {})
+
+                axis = []
+                # CONTENTは古さを含む全keyではなく、能力内容の厚みまでで比較。
+                content_u = (
+                    lc_u.get("best_band", 0), lc_u.get("second_band", 0),
+                    lc_u.get("close03", 0), lc_u.get("close06", 0), lc_u.get("close10", 0)
+                )
+                content_l = (
+                    lc_l.get("best_band", 0), lc_l.get("second_band", 0),
+                    lc_l.get("close03", 0), lc_l.get("close06", 0), lc_l.get("close10", 0)
+                )
+                axis.append(1 if content_l > content_u else -1 if content_l < content_u else 0)
+                axis.append(1 if lr_l.get("grade", 0) > lr_u.get("grade", 0) else -1 if lr_l.get("grade", 0) < lr_u.get("grade", 0) else 0)
+                axis.append(1 if cu_l.get("grade", 2) > cu_u.get("grade", 2) else -1 if cu_l.get("grade", 2) < cu_u.get("grade", 2) else 0)
+
+                lower_wins = sum(x > 0 for x in axis)
+                upper_wins = sum(x < 0 for x in axis)
+                # 2軸以上優勢・残りで明確に劣らない時だけPEAK隣接差を覆す。
+                # PEAK大差（diff>=2）は従来どおりここへ来ない。
+                if lower_wins >= 2 and upper_wins == 0:
                     return (1 if lower is a else -1,
-                            "2000m+：隣接VALID PEAKをCONTENT・REPEAT・CURRENTで逆転")
+                            "2000m+：隣接VALID PEAKをCONTENT・REPEAT・CURRENTの2軸以上で逆転")
+
+                # CONTENTが明確優勢で、REPEAT/CURRENTのどちらかも劣らず、
+                # もう片方が優勢なら同じく逆転。上の条件を説明的に補完。
+                if axis[0] > 0 and axis[1] >= 0 and axis[2] >= 0 and (axis[1] > 0 or axis[2] > 0):
+                    return (1 if lower is a else -1,
+                            "2000m+：隣接VALID PEAKをCONTENT＋時間軸で逆転")
+
                 return (1 if upper is a else -1,
-                        "2000m+：VALID同場PEAKの自然クラスタ")
+                        "2000m+：VALID同場PEAKの隣接クラスタを維持")
 
         # 自然断層なし/片方RAWは同場同距離ドメインの中身で決める。
         return _long_domain_cmp(a, b, direct, use_exact_time=True)
@@ -3064,10 +3090,10 @@ def verify_prediction(pred: Dict, text: str) -> Dict:
 # Streamlit UI
 # ============================================================
 
-APP_NAME = "競馬AI 時計分析 v2.0-Beta 完全Python版 impl12"
+APP_NAME = "競馬AI 時計分析 v2.0-Beta 完全Python版 impl14"
 st.set_page_config(page_title=APP_NAME, page_icon="⏱️", layout="wide")
-st.title("⏱️ 競馬AI 時計分析 v2.0-Beta impl10")
-st.caption("完全Python自動判定｜impl12 local-long-evidence-order｜ChatGPT不要｜OpenAI API不要｜外部AI不要")
+st.title("⏱️ 競馬AI 時計分析 v2.0-Beta impl14")
+st.caption("完全Python自動判定｜impl14 long-adjacent-cluster-conflict｜ChatGPT不要｜OpenAI API不要｜外部AI不要")
 st.info(
     f"🔒 {RULESET_NAME}\n\n"
     "馬柱解析から5軸評価・競合判断・通常TOP8・ガード・最終TOP6まで、このPythonだけで完結します。"
