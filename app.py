@@ -543,7 +543,7 @@ def parse_horse_histories(text: str, entries: Optional[List[Entry]] = None) -> D
 
 RULESET_ID = "CLOCK_RULEBOOK_V2_0_BETA_PYTHON_FROZEN_2026-08-13"
 RULESET_NAME = "時計分析 完全ルールブック v2.0-Beta【完全Python自動判定】"
-IMPLEMENTATION_REV = "python-engine-7-direct-floor"
+IMPLEMENTATION_REV = "python-engine-8-fullfield-audit"
 
 RULEBOOK_TEXT = r"""
 【0｜目的】
@@ -2366,43 +2366,142 @@ def rank_evals(race: RaceInfo, evals: Dict[int, Dict], direct: Dict[Tuple[int, i
         seed_mode = "総当たり勝敗seed＋隣接監査"
 
     audit_len = min(8, len(ordered))
-    head = list(ordered[:audit_len])
-    tail = list(ordered[audit_len:])
-    baseline_head = tuple(ev["number"] for ev in head)
-    seen = {baseline_head}
+    baseline_all = tuple(ev["number"] for ev in ordered)
+    baseline_head = tuple(ev["number"] for ev in ordered[:audit_len])
     cycle_detected = False
     audit_events = []
+    admission_events = []
 
-    for pass_no in range(max(1, audit_len)):
-        changed = False
-        for i in range(len(head) - 1):
-            challenger, incumbent = head[i + 1], head[i]
-            cmpv, reason = compare_evals_with_reason(challenger, incumbent, race, direct)
-            if cmpv > 0:
-                audit_events.append({
-                    "pass": pass_no + 1,
-                    "from": (incumbent["number"], challenger["number"]),
-                    "to": (challenger["number"], incumbent["number"]),
-                    "reason": reason,
-                })
-                head[i], head[i + 1] = challenger, incumbent
+    if jra_middle and len(ordered) > audit_len:
+        # impl8: TOP8へ切る前に全頭を監査する。
+        # impl7はseed 9位以下の馬を比較関数へ戻せず、強い近接距離馬などが
+        # 永久にTOP8外へ固定される構造だった。
+        # ここではseedは「初期候補順」に限定し、TOP8外の全馬に8位境界への挑戦権を与える。
+        head = list(ordered[:audit_len])
+        tail = list(ordered[audit_len:])
+
+        # 強い競合を先に確認するため、tailは総当たり勝数→seed順で診断順だけ整える。
+        seed_pos = {ev["number"]: i for i, ev in enumerate(ordered)}
+        tail.sort(
+            key=lambda ev: (wins[ev["number"]], -losses[ev["number"]], -seed_pos[ev["number"]]),
+            reverse=True,
+        )
+
+        # 状態循環を防ぎながら、TOP8外→8位境界→上位へバブルアップ。
+        seen_heads = {tuple(ev["number"] for ev in head)}
+        max_rounds = max(1, len(items) * 2)
+        for round_no in range(max_rounds):
+            changed = False
+            next_tail = []
+            for challenger in tail:
+                if not head:
+                    head.append(challenger)
+                    changed = True
+                    continue
+                cmpv, reason = compare_evals_with_reason(challenger, head[-1], race, direct)
+                if cmpv <= 0:
+                    next_tail.append(challenger)
+                    continue
+
+                displaced = head[-1]
+                head[-1] = challenger
+                next_tail.append(displaced)
                 changed = True
-        state = tuple(ev["number"] for ev in head)
-        if not changed:
-            break
-        if state in seen:
-            cycle_detected = True
-            # 循環時は総当たり勝敗の安定順位へ戻す。
-            head = list(ordered[:audit_len])
-            audit_events.append({"pass": pass_no + 1, "cycle": True, "state": state})
-            break
-        seen.add(state)
+                admission_events.append({
+                    "round": round_no + 1,
+                    "IN": challenger["number"],
+                    "OUT": displaced["number"],
+                    "boundary_reason": reason,
+                })
+
+                # 入った馬は、実際の比較関数で勝てるところまで上へ。
+                idx = len(head) - 1
+                while idx > 0:
+                    cmp_up, reason_up = compare_evals_with_reason(head[idx], head[idx - 1], race, direct)
+                    if cmp_up <= 0:
+                        break
+                    audit_events.append({
+                        "pass": f"admit-{round_no + 1}",
+                        "from": (head[idx - 1]["number"], head[idx]["number"]),
+                        "to": (head[idx]["number"], head[idx - 1]["number"]),
+                        "reason": reason_up,
+                    })
+                    head[idx - 1], head[idx] = head[idx], head[idx - 1]
+                    idx -= 1
+
+            state = tuple(ev["number"] for ev in head)
+            if state in seen_heads and changed:
+                cycle_detected = True
+                admission_events.append({"round": round_no + 1, "cycle": True, "state": state})
+                break
+            seen_heads.add(state)
+            tail = next_tail
+            if not changed:
+                break
+
+        # TOP8内部の隣接再監査。seed順ではなく、全頭境界監査後のheadを対象にする。
+        seen = {tuple(ev["number"] for ev in head)}
+        for pass_no in range(max(1, audit_len)):
+            changed = False
+            for i in range(len(head) - 1):
+                challenger, incumbent = head[i + 1], head[i]
+                cmpv, reason = compare_evals_with_reason(challenger, incumbent, race, direct)
+                if cmpv > 0:
+                    audit_events.append({
+                        "pass": pass_no + 1,
+                        "from": (incumbent["number"], challenger["number"]),
+                        "to": (challenger["number"], incumbent["number"]),
+                        "reason": reason,
+                    })
+                    head[i], head[i + 1] = challenger, incumbent
+                    changed = True
+            state = tuple(ev["number"] for ev in head)
+            if not changed:
+                break
+            if state in seen:
+                cycle_detected = True
+                audit_events.append({"pass": pass_no + 1, "cycle": True, "state": state})
+                break
+            seen.add(state)
+
+        # tailは最終TOP8の外。seed順へ戻して表示を安定化。
+        head_nums = {ev["number"] for ev in head}
+        tail = [ev for ev in ordered if ev["number"] not in head_nums]
+        seed_mode = "JRA証拠層seed＋全頭TOP8境界監査＋隣接監査"
+    else:
+        head = list(ordered[:audit_len])
+        tail = list(ordered[audit_len:])
+        seen = {tuple(ev["number"] for ev in head)}
+        for pass_no in range(max(1, audit_len)):
+            changed = False
+            for i in range(len(head) - 1):
+                challenger, incumbent = head[i + 1], head[i]
+                cmpv, reason = compare_evals_with_reason(challenger, incumbent, race, direct)
+                if cmpv > 0:
+                    audit_events.append({
+                        "pass": pass_no + 1,
+                        "from": (incumbent["number"], challenger["number"]),
+                        "to": (challenger["number"], incumbent["number"]),
+                        "reason": reason,
+                    })
+                    head[i], head[i + 1] = challenger, incumbent
+                    changed = True
+            state = tuple(ev["number"] for ev in head)
+            if not changed:
+                break
+            if state in seen:
+                cycle_detected = True
+                audit_events.append({"pass": pass_no + 1, "cycle": True, "state": state})
+                break
+            seen.add(state)
 
     shared_trace = {
         "pairwise_events": pair_events,
         "pairwise_seed": list(baseline_head),
         "seed_mode": seed_mode,
         "evidence_seed": list(baseline_head),
+        "evidence_seed_all": list(baseline_all),
+        "admission_events": admission_events,
         "shared_benchmarks": {
             ev["number"]: ev.get("shared_reason", "共有同距離レースなし")
             for ev in items if ev.get("shared_benchmark")
@@ -2414,6 +2513,7 @@ def rank_evals(race: RaceInfo, evals: Dict[int, Dict], direct: Dict[Tuple[int, i
         ev["ranking_cycle_detected"] = cycle_detected
         ev["pairwise_wins"] = wins[ev["number"]]
         ev["pairwise_losses"] = losses[ev["number"]]
+        ev["seed_rank"] = baseline_all.index(ev["number"]) + 1
         ev["ranking_trace"] = shared_trace
 
     return [x["number"] for x in (head + tail)]
@@ -2775,7 +2875,7 @@ def verify_prediction(pred: Dict, text: str) -> Dict:
 # Streamlit UI
 # ============================================================
 
-APP_NAME = "競馬AI 時計分析 v2.0-Beta 完全Python版 impl7"
+APP_NAME = "競馬AI 時計分析 v2.0-Beta 完全Python版 impl8"
 st.set_page_config(page_title=APP_NAME, page_icon="⏱️", layout="wide")
 st.title("⏱️ 競馬AI 時計分析 v2.0-Beta impl7")
 st.caption("完全Python自動判定｜impl7 direct-floor｜ChatGPT不要｜OpenAI API不要｜外部AI不要")
@@ -2861,7 +2961,7 @@ with tab1:
             st.caption("ガードによる入替なし")
 
         st.markdown("### 通常時計順位 TOP8")
-        st.caption("人気・オッズ・ガードを使わず作成。impl7はJRA1600〜1800mで一発CONTENTと同距離の継続能力床を分離し、共有同距離レースと5軸でseedを作って隣接再監査。REPEATは悪走込み直近5走、CURRENTは直近3走。")
+        st.caption("人気・オッズ・ガードを使わず作成。impl8はJRA1600〜1800mでseed上位8頭だけを先に固定せず、全頭にTOP8境界への挑戦権を与えてから隣接再監査。seedは初期順にのみ使用し、強い近接距離馬などが9位以下で永久除外される問題を修正。REPEATは悪走込み直近5走、CURRENTは直近3走。")
         st.dataframe(pd.DataFrame(pred["normal_rows"]), use_container_width=True, hide_index=True)
 
         st.markdown("### 5軸評価")
@@ -2878,10 +2978,16 @@ with tab1:
         if pred["pair_checks"]:
             st.dataframe(pd.DataFrame(pred["pair_checks"]), use_container_width=True, hide_index=True)
 
-        with st.expander("順位形成ログ（証拠層seed＋隣接監査）", expanded=False):
+        with st.expander("順位形成ログ（seed＋全頭境界監査＋隣接監査）", expanded=False):
             trace = pred.get("ranking_trace", {})
             st.write("**seed方式：** " + trace.get("seed_mode", "不明"))
             st.write("**初期TOP8 seed：** " + "・".join(map(str, trace.get("evidence_seed", []))))
+            if trace.get("evidence_seed_all"):
+                st.write("**全頭seed順：** " + "・".join(map(str, trace.get("evidence_seed_all", []))))
+            admission = trace.get("admission_events", [])
+            if admission:
+                st.caption("TOP8外からの境界侵入ログ")
+                st.dataframe(pd.DataFrame(admission), use_container_width=True, hide_index=True)
             shared_info = trace.get("shared_benchmarks", {})
             if shared_info:
                 st.caption("共有同距離レースの共通物差し")
