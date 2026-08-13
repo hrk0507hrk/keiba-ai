@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 import calendar
+import hashlib
+import json
 import re
+import textwrap
+import statistics
+from functools import cmp_to_key
 from dataclasses import dataclass, asdict
 from datetime import date, datetime
 from typing import Dict, List, Optional, Tuple
@@ -134,7 +139,7 @@ def class_rank_from_text(text: str) -> int:
         return 8
     if "重賞" in t:
         return 7
-    if re.search(r"L", t) or "OP" in t or "オープン" in t:
+    if re.search(r"\bL\b", t) or "OP" in t or "オープン" in t:
         return 6
     if "3勝" in t:
         return 5
@@ -530,400 +535,199 @@ def parse_horse_histories(text: str, entries: Optional[List[Entry]] = None) -> D
 
 
 
-# ============================================================
-# 時計分析単独エンジン v3.0
-# ============================================================
-
-def distance_group(distance: int) -> str:
-    if distance <= 900:
-        return "800"
-    if 1000 <= distance <= 1400:
-        return "short"
-    if distance == 1500:
-        return "1500"
-    if 1600 <= distance <= 1800:
-        return "1600-1800"
-    if 2000 <= distance <= 2200:
-        return "2000-2200"
-    if distance >= 2400:
-        return "2400+"
-    return "other"
-
-
-def group_distance_match(current: int, candidate: Optional[int]) -> bool:
-    if candidate is None:
-        return False
-    g = distance_group(current)
-    if g == "800":
-        return candidate in {800, 850, 900, 1000}
-    if g == "short":
-        return 1000 <= candidate <= 1400
-    if g == "1500":
-        return candidate in {1400, 1500}
-    if g == "1600-1800":
-        return 1600 <= candidate <= 1800
-    if g == "2000-2200":
-        return 2000 <= candidate <= 2200
-    if g == "2400+":
-        return candidate >= 2400
-    return candidate == current
-
-
-def timed_races(history: Optional[HorseHistory], race: RaceInfo) -> List[PastRace]:
-    if not history:
-        return []
-    return [r for r in history.races
-            if r.surface == race.surface and r.distance is not None and r.time_seconds is not None]
-
-
-def best_time(rs: List[PastRace]) -> Optional[float]:
-    vals = [r.time_seconds for r in rs if r.time_seconds is not None]
-    return min(vals) if vals else None
-
-
-def second_best_time(rs: List[PastRace]) -> Optional[float]:
-    vals = sorted(r.time_seconds for r in rs if r.time_seconds is not None)
-    return vals[1] if len(vals) >= 2 else None
-
-
-def recent_time(rs: List[PastRace]) -> Optional[float]:
-    valid = [r for r in rs if r.time_seconds is not None]
-    if not valid:
-        return None
-    valid.sort(key=lambda r: r.race_date or date.min, reverse=True)
-    return valid[0].time_seconds
-
-
-def best_close_margin(rs: List[PastRace]) -> Optional[float]:
-    vals = [r.margin for r in rs if r.margin is not None]
-    return min(vals) if vals else None
-
-
-def close_run_count(rs: List[PastRace], limit: float = 0.3) -> int:
-    return sum(1 for r in rs if r.margin is not None and r.margin <= limit)
-
-
-def win_count(rs: List[PastRace]) -> int:
-    return sum(1 for r in rs if r.finish == 1)
-
-
-def rank_values(values: Dict[int, Optional[float]]) -> Dict[int, float]:
-    valid = sorted((v, n) for n, v in values.items() if v is not None)
-    ranks: Dict[int, float] = {}
-    last_v = None
-    last_rank = 0
-    for idx, (v, n) in enumerate(valid, 1):
-        if last_v is None or abs(v - last_v) > 1e-9:
-            last_rank = idx
-            last_v = v
-        ranks[n] = float(last_rank)
-    miss_rank = float(len(valid) + 2)
-    for n in values:
-        ranks.setdefault(n, miss_rank)
-    return ranks
-
-
-def is_upper_environment(track: str) -> bool:
-    return track in JRA_TRACKS or track in {"浦和", "船橋", "大井", "川崎"}
-
-
-def local_transfer_guard_target(race: RaceInfo, e: Entry, h: Optional[HorseHistory]) -> bool:
-    if race.track not in NAR_TRACKS or not h or not h.races or e.popularity > 3:
-        return False
-    prev = h.races[0]
-    if not is_upper_environment(prev.track):
-        return False
-    # 現競馬場への過去出走が無い＝今回を転入初戦相当として扱う
-    return not any(r.track == race.track for r in h.races)
-
-
-def debut_warning_target(e: Entry, h: Optional[HorseHistory]) -> bool:
-    return (not h or not h.races) and e.popularity <= 5
-
-
-
-def margin_penalty(margin: Optional[float]) -> float:
-    """
-    ベスト時計を出した時の着差ペナルティ。
-    生時計を主役に残しつつ、時計差が僅差なら接戦馬を上へ。
-
-    これにより:
-    - 1:41.5 / 1.4差 より 1:41.6 / 0.6差を上げられる
-    - 2:08.5 / 1.7差 と 2:09.8 / 1.9差なら、生時計差1.3秒を維持しやすい
-    """
-    if margin is None:
-        return 0.35
-    if margin <= 0.3:
-        return 0.00
-    if margin <= 0.6:
-        return 0.10
-    if margin <= 1.0:
-        return 0.25
-    if margin <= 1.5:
-        return 0.55
-    if margin <= 2.0:
-        return 0.80
-    if margin <= 2.5:
-        return 1.05
-    if margin <= 3.0:
-        return 1.45
-    return 2.00
-
-
-
-def best_clock_race(rs: List[PastRace]) -> Optional[PastRace]:
-    valid = [r for r in rs if r.time_seconds is not None]
-    if not valid:
-        return None
-    return min(valid, key=lambda r: r.time_seconds)
-
-
-def best_quality_race(rs: List[PastRace]) -> Optional[PastRace]:
-    """
-    生時計 + 着差ペナルティで「実戦的に価値の高い時計」を選ぶ。
-    例:
-      1:41.5 / 1.4差  -> 1:43.0相当
-      1:41.6 / 0.6差  -> 1:41.8相当
-    """
-    valid = [r for r in rs if r.time_seconds is not None]
-    if not valid:
-        return None
-    return min(
-        valid,
-        key=lambda r: (
-            r.time_seconds + margin_penalty(r.margin),
-            r.time_seconds,
-        )
-    )
-
-
-def quality_time(rs: List[PastRace]) -> Optional[float]:
-    """
-    ベスト時計そのものに、そのレースの着差だけを加味。
-    別の遅い勝ち時計へ置き換えない。
-    """
-    r = best_clock_race(rs)
-    if r is None or r.time_seconds is None:
-        return None
-    return r.time_seconds + margin_penalty(r.margin)
-
-
-
-def clock_margin(rs: List[PastRace]) -> Optional[float]:
-    """純粋なベスト時計を出したレースの着差。"""
-    r = best_clock_race(rs)
-    return r.margin if r else None
-
-
-def quality_margin(rs: List[PastRace]) -> Optional[float]:
-    """着差込みで最も価値が高い時計の着差。"""
-    r = best_quality_race(rs)
-    return r.margin if r else None
-
-
-def build_profiles(race: RaceInfo, entries: List[Entry], histories: Dict[int, HorseHistory]) -> Dict[int, Dict]:
-    profiles = {}
-
-    for e in entries:
-        h = histories.get(e.number)
-        all_timed = timed_races(h, race)
-
-        same_dist_all = [r for r in all_timed if r.distance == race.distance]
-        exact = [r for r in same_dist_all if r.track == race.track]
-        exact_going = [r for r in exact if r.going == race.going]
-
-        other_track_same_dist = [r for r in same_dist_all if r.track != race.track]
-
-        adjacent_same_track = [
-            r for r in all_timed
-            if r.track == race.track
-            and r.distance != race.distance
-            and group_distance_match(race.distance, r.distance)
-        ]
-        adjacent_other = [
-            r for r in all_timed
-            if r.track != race.track
-            and r.distance != race.distance
-            and group_distance_match(race.distance, r.distance)
-        ]
-
-        # 上昇度：同場同距離を優先
-        trend_src = exact if len(exact) >= 2 else same_dist_all
-        recent_for_trend = sorted(
-            trend_src, key=lambda r: r.race_date or date.min, reverse=True
-        )[:3]
-        rec_times = [r.time_seconds for r in recent_for_trend if r.time_seconds is not None]
-        improvement = None
-        if len(rec_times) >= 2:
-            improvement = rec_times[-1] - rec_times[0]
-
-        exact_close = close_run_count(exact, 0.3)
-        exact_win = win_count(exact)
-        other_close = close_run_count(other_track_same_dist, 0.3)
-        other_win = win_count(other_track_same_dist)
-
-        class_src = exact if exact else (
-            same_dist_all if same_dist_all else adjacent_same_track + adjacent_other
-        )
-        class_best = max([r.class_rank for r in class_src], default=-2)
-
-        exact_competitive = sum(
-            1 for r in sorted(exact, key=lambda r: r.race_date or date.min, reverse=True)[:3]
-            if r.margin is not None and r.margin <= 1.0
-        )
-
-        # 同馬場で1秒以内の実戦的好走数
-        going_competitive = sum(
-            1 for r in exact_going
-            if r.margin is not None and r.margin <= 1.0
-        )
-
-        best_r = best_clock_race(exact)
-        quality_r = best_quality_race(exact)
-
-        profiles[e.number] = {
-            "entry": e,
-            "history": h,
-            "same_dist": same_dist_all,
-            "exact": exact,
-            "exact_going": exact_going,
-            "other_track_same_dist": other_track_same_dist,
-            "adjacent_same_track": adjacent_same_track,
-            "adjacent_other": adjacent_other,
-
-            "exact_best": best_time(exact),
-            "exact_best_margin": best_r.margin if best_r else None,
-            "exact_quality_time": quality_time(exact),
-            "exact_quality_margin": quality_r.margin if quality_r else None,
-            "exact_recent": recent_time(exact),
-            "exact_recent_date": max([r.race_date for r in exact if r.race_date is not None], default=None),
-            "exact_second": second_best_time(exact),
-            "exact_going_best": best_time(exact_going),
-
-            "other_same_dist_best": best_time(other_track_same_dist),
-            "adjacent_same_track_best": best_time(adjacent_same_track),
-            "adjacent_other_best": best_time(adjacent_other),
-
-            "best_margin": best_close_margin(exact) if exact else best_close_margin(same_dist_all),
-            "exact_close_count": exact_close,
-            "exact_win_count": exact_win,
-            "other_close_count": other_close,
-            "other_win_count": other_win,
-
-            "same_dist_count": len(same_dist_all),
-            "exact_count": len(exact),
-            "exact_competitive": exact_competitive,
-            "going_competitive": going_competitive,
-            "improvement": improvement,
-            "class_best": class_best,
-        }
-
-    return profiles
-
-
-
-
 
 
 # ============================================================
-# 時計TOP6 完全共通ルール v1.1【凍結版】
+# 時計分析 完全ルールブック v2.0-Beta【完全Python自動判定版】
+# ChatGPT / OpenAI API / 外部LLM 不使用
 # ============================================================
 
-RULESET_ID = "CLOCK_TOP6_COMMON_V1_1_FROZEN_2026-08-13"
-RULESET_NAME = "時計TOP6 完全共通ルール v1.1【固定・変更禁止】"
-IMPLEMENTATION_REV = "impl2"
+RULESET_ID = "CLOCK_RULEBOOK_V2_0_BETA_PYTHON_FROZEN_2026-08-13"
+RULESET_NAME = "時計分析 完全ルールブック v2.0-Beta【完全Python自動判定】"
+IMPLEMENTATION_REV = "python-engine-1"
 
-RULESET_TEXT = """
-【目的】
-レース前のレース情報・出馬表・馬柱だけを使い、時計面から馬券内候補TOP6を選ぶ。
-人気・オッズは通常時計順位には使用しない。
-固定AXIS・相手C・総合指数・騎手・調教師・血統・枠順・展開補正は不使用。
+RULEBOOK_TEXT = r"""
+【0｜目的】
+レース結果を知らない事前状態で、出馬表・馬柱から時計面だけでTOP6を選定する。
+目的は単純な時計順ではなく、このチャットで行ってきた時計分析の考え方を、新しい未見レースでも同じ手順で再現すること。
+通常時計順位では人気・オッズ・騎手・調教師・血統・枠順・展開・固定AXIS・相手Cを使用しない。
+人気は地方転入人気馬ガード、初出走警戒など明文化されたガード用途に限る。
 
-【2段階処理】
-第1エンジン：ガードを使わず通常時計順位1〜8位を作る。
-第2エンジン：絶対時計・境界・地方転入人気馬ガードを最後に適用し最終TOP6を固定する。
+【1｜処理順】
+第1段階＝事実抽出。
+第2段階＝5軸と競合ルールで通常時計TOP8を作る。
+第3段階＝通常順位確定後に絶対時計・地方転入・境界ガードを確認し最終TOP6を作る。
+ガードを通常順位へ混ぜない。
 
-【通常時計分析】
-1. 同場同距離を最優先。
-2. ベスト時計と、その時計を出した時の着差を必ずセットで評価。
-3. 勝利・0.3秒差以内を最重要の好走証拠とする。
-4. 0.4〜0.6、0.7〜1.0、1.1〜1.5、それ以上の順で評価を下げる。
-5. 単発の高速時計より、同水準を複数回出した再現性を重視。
-6. 同程度なら直近性を優先。ただし古い強い時計は完全には消さない。
-7. 高速時計でも大差負けを繰り返す場合は過大評価しない。
-8. 別競馬場の生時計は秒数だけで直接比較しない。
-9. クラスは単独加点ではなく「高クラス＋小差」の時計価値として評価。
-10. 同距離材料が弱い時のみ隣接距離を補助に使う。
-11. 弱い直接距離実績より、強い隣接距離実績を上にできる。
+【2｜必須事実】
+各馬について、同場同距離ベスト、その時計時着差、2本目、3本目、直近時計、同馬場時計、別場同距離、勝利・0.3・0.6・1.0秒以内、クラス、直近時計推移、隣接距離、直接対戦を確認する。
+ベスト時計とその時計時着差は必ず1セットで扱う。
 
-【JRA 1600〜1800m】
+【3｜CONDITION】
+CONDITIONは点数ではなく、どの証拠を直接比較してよいかを決めるフィルター。
+基本信頼順は、同場同距離＋近い馬場 → 同場同距離 → 別場同距離 → 同場隣接距離 → 別場隣接距離。
+ただし弱い直接実績より非常に強い隣接距離実績を上にできる。
+別競馬場の生時計秒数を直接比較してはならない。
+
+【4｜PEAK】
+PEAKは過去全体の最高時計能力。
+RAW PEAK＝単純な最速時計。
+VALID PEAK＝高い時計水準に加え、その走りで勝利・小差など競争になっている裏付けがあるピーク。
+通常順位ではVALID PEAKをRAW PEAKより信頼する。
+高速時計でも大差負けならRAW PEAKは高くてもVALID PEAKの信頼度は低い。
+
+【5｜CONTENT】
+時計を出した時にどれだけ競争になっていたかを見る。
+勝利・0.3秒以内が最重要。次に0.4〜0.6、0.7〜1.0、1.1〜1.5、それ以上の順に弱くする。
+CONTENTだけで何秒ものPEAK差を無条件に逆転させない。
+クラスは単独加点せず「高クラス＋小差CONTENT」として評価する。
+高クラス大敗は強い証拠にしない。
+
+【6｜REPEAT】
+REPEATは比較可能な直近5走を基本範囲とする。
+CLOCK REPEAT＝ベスト付近・同一能力帯の時計を何度再現したか。
+CONTENT REPEAT＝勝利・0.3・0.6・1.0秒以内等の好内容を何度再現したか。
+直近3走中2回以上、または直近5走中3回以上の高水準再現は強い。直近5走中2回は中程度、1回のみは単発。
+ただし比較可能走が少ない馬は「再現性低」ではなく「材料不足」とする。
+古い好時計はPEAKには残すが、最近5比較可能走の外ならREPEATへ足し続けない。
+
+【7｜CURRENT】
+CURRENTは比較可能な直近3走で判断する。
+高水準維持・上昇・横ばい・下降・判定不能の5分類。
+時計水準とCONTENTの双方が改善していれば上昇。過去PEAK後に複数走続けて能力帯が低下しCONTENTも悪化していれば下降。
+比較可能な最近材料が1走以下ならCURRENT不明とし、材料不足だけで減点しない。
+長期休養ではPEAKを消さず、CURRENTの信頼度を下げるか不明とする。
+
+【8｜時計クラスタ】
+PEAK差の大中小を固定秒数で決めない。同競馬場・同距離のメンバー内時計分布から自然な時計の塊と断層を見る。
+明確な断層がなければ無理にTOP3等でクラスタを切らない。
+クラスタ形成に使う生時計は原則として同競馬場・同距離のみ。
+別場から持ち込むのは生時計秒数ではなく、その条件での相対水準、CONTENT、クラス、REPEAT、CURRENT。
+比較材料が少なすぎる場合は形式順位だけでクラスタや絶対時計を作らない。
+
+【9｜PEAK差の競合】
+同じ時計クラスタ＝PEAK差小。CONTENT・REPEAT・CURRENTで普通に逆転可能。
+隣接クラスタ＝PEAK差中。PEAK上位が基本優勢だが、下位側がCURRENT上昇・CLOCK REPEAT強・CONTENT REPEAT強なら逆転可能。
+明確な断層を跨ぐ＝PEAK差大。CURRENTや小差だけで簡単に逆転させない。
+ただし上位側がRAW PEAKのみ＋大差負け＋再現なしなら、そのPEAK自体の信頼性を下げる。
+
+【10｜時計差 vs 着差】
+時計差が小さいほどCONTENTを強く使い、小差好走馬が逆転できる。
+時計差が大きいほど絶対時計差を尊重し、着差が少し良いだけでは逆転させない。
+固定の「着差を何秒加算」だけで全条件を処理しない。
+
+【11｜PEAK vs REPEAT/CURRENT】
+同じPEAKクラスタなら単発最速より高水準を繰り返す馬を通常順位で上にできる。
+単発でも最上位VALID PEAKなら絶対時計候補として価値を保持する。
+古いPEAKで近走再現がなければ通常順位ではREPEAT・CURRENTを優先するが、PEAKそのものは消さない。
+CURRENT差が小さければPEAKを尊重する。明確な上昇・下降がある時にCURRENTを強く使う。
+
+【12｜直接対戦】
+今回出走馬同士が同じ過去レースを走っていれば完全に同一条件の共通物差しとして強いタイブレークにする。
+直近5比較可能走程度で2回以上直接対戦し、同じ馬が継続して優勢ならDIRECT REPEATとしてさらに強くする。
+ただし古い直接対戦だけでCURRENTの明確な逆転を無視しない。
+
+【13｜距離】
+直接同距離を基本優先するが、弱い直接実績より強い隣接距離実績を上にできる。
+隣接距離は今回距離との差が小さいほど信頼度が高い。延長・短縮そのものには固定加減点を与えない。
+方向ではなく距離差＋時計内容＋CONTENTを見る。
+
+【14｜地方競馬】
+地方は中央より同場同距離を強く信頼する。
+同場同距離PEAK＋CONTENT＋REPEAT＋CURRENTを中心に通常順位を作る。
+別場生時計は直接比較しない。
+
+【15｜JRA1600〜1800m】
 別場生時計を直接比較しない。
-同距離での小差好走 → 高クラスでの好内容 → 再現性 → 直近性を先に比較。
-同場同距離の実時計は重要なタイブレーク材料として使う。
+同距離CONTENT → 高クラスでの好内容 → REPEAT → CURRENT → 同場同距離時計の順を基本に比較する。
+同じ過去レースの直接対戦は強い比較材料。
 高クラスでも大差負けだけなら上げない。
 
-【地方競馬】
-同競馬場・同距離の実時計比較を中央より強く重視。
-同場同距離のベスト時計＋着差＋再現性＋直近性で順位を作る。
-別場の生時計は直接比較しない。
+【16｜2000m以上】
+直接距離実績を強く重視するが、距離経験があるだけでは保護しない。
+同距離で大差負けしかない弱い直接実績より、隣接距離の強いVALID内容を上にできる。
 
-【2000m以上】
-直接距離実績を強く重視。
-ただし同距離で大差負けしかない「弱い直接実績」は保護しない。
-強い隣接距離実績が弱い直接実績を上回ることを認める。
+【17｜通常TOP8】
+人気・オッズ・ガードを使わず通常1〜8位を作る。
+一度TOP8を作った後、隣接順位をペア比較して再確認する。
+特に5位vs6位、6位vs7位、7位vs8位を重点確認する。
+同じPEAK能力帯ならCONTENT・REPEAT・CURRENTの重要度を上げる。
 
-【絶対時計ガード】
-同場同距離の絶対時計がメンバーTOP3級、
-かつ勝利または0.3秒差以内ならTOP6から落とさない。
+【18｜絶対時計ガード】
+最上位VALID PEAK時計クラスタに所属し、かつ勝利または0.3秒以内の裏付けがある馬をTOP6から落とさない。
+形式上の生時計TOP3だけでは発動しない。
+比較材料が少なすぎる場合も順位だけで絶対時計扱いしない。
 
-【境界ガード】
-通常7〜8位付近で、
-同距離勝利または0.3秒差以内、
-かつ時計がTOP6境界から大きく劣らない馬を6番手へ保護。
-境界ガードだけを理由に上位順位へ上げない。
+【19｜境界ガード】
+通常7〜8位付近で、同距離勝利または0.3秒以内があり、6位馬と同じまたはほぼ同じ時計能力帯でCONTENTの裏付けがある馬を6番手へ保護できる。
+境界ガードだけを理由に上位順位へ昇格させない。
 
-【地方転入人気馬ガード】
-地方転入初戦＋直近がJRA/南関など上位環境＋当日3番人気以内。
+【20｜地方転入人気馬ガード】
+地方転入初戦、直前までJRAまたは南関等の上位環境、当日3番人気以内。
 通常TOP6外なら6番手へ保護。
-人気を通常時計順位には使わない。
+一度別地方を走った後の「今回競馬場初出走」だけでは転入初戦扱いしない。
+人気はこのガード以外の通常順位に使わない。
 
-【警戒表示のみ】
-初出走＋5番人気以内。
-初距離＋隣接距離に強い内容。
-高速時計＋大差負け。
-これらは単独でTOP6へ強制加入させない。
+【21｜警戒表示】
+初出走＋5番人気以内＝初出走警戒。
+同距離実績なし＋隣接距離に強い内容＝初距離警戒。
+最速級RAW PEAK＋大差負け＝高速時計＋大差負け警戒。
+警戒表示だけではTOP6へ強制加入させない。
 
-【少頭数】
+【22｜複数ガード競合 Beta暫定】
+ガード候補が多すぎて6枠を超える実例は不足しているため、固定優先順位を新しく発明しない。
+競合した場合は「ガード競合」と明示し、5軸とガード根拠を再比較して6枠を決める。
+この項目はv2.1候補。
+
+【23｜禁止判断】
+通常順位を人気・オッズ・騎手・調教師・血統・枠順・展開で変更しない。
+別場生時計を秒数だけで直接比較しない。
+固定の競馬場秒補正を作らない。
+単発高速時計だけ、クラスだけ、人気だけで自動上位にしない。
+境界ガード馬を上位へ昇格させない。
+結果を知った後の後付けで事前順位を変えない。
+入力に無い事実を推測で補わない。材料不足は「不明」と書く。
+
+【24｜エンジン強制手順】
+1. 事実抽出結果を読む
+2. CONDITION整理
+3. PEAK判定
+4. VALID/RAW判定
+5. 時計クラスタ確認
+6. CONTENT評価
+7. REPEAT評価（直近5比較可能走）
+8. CURRENT評価（直近3比較可能走）
+9. クラス価値
+10. 直接対戦
+11. 通常TOP8作成
+12. 隣接順位ペア比較
+13. 通常順位固定
+14. 絶対時計ガード
+15. 地方転入ガード
+16. 境界ガード
+17. 最終TOP6固定
+
+【25｜少頭数】
 6頭以下：TOP6＝全頭、参考・ノーカウント。
-7頭：参考。
+7頭：TOP6は参考。
 8頭以上：本集計。
 
-【変更禁止】
-検証で新しい改善案が出ても、このv1.1自体は上書きしない。
-改善はv1.2候補として別管理し、採用時は別バージョンを新規作成する。
-"""
-
+【26｜バージョン管理】
+このv2.0-Betaは仮凍結する。検証で改善案が出ても直接上書きしない。
+新しい改善はv2.1候補として別管理する。
+""".strip()
 
 # ============================================================
-# v1.1 evidence helpers
+# 基本評価ヘルパー
 # ============================================================
 
-def _days_since(r: PastRace, race_date: date) -> int:
+def _days(r: PastRace, race_date: date) -> int:
     if r.race_date is None:
         return 9999
     return max(0, (race_date - r.race_date).days)
 
 
 def _margin_level(m: Optional[float]) -> int:
-    """
-    大きいほど強い。
-    5: 勝利/0.3以内
-    4: 0.6以内
-    3: 1.0以内
-    2: 1.5以内
-    1: 2.5以内
-    0: それ以上/不明
-    """
     if m is None:
         return 0
     if m <= 0.3:
@@ -939,889 +743,834 @@ def _margin_level(m: Optional[float]) -> int:
     return 0
 
 
-def _recency_level(days: int) -> int:
-    if days <= 30:
-        return 5
-    if days <= 60:
-        return 4
-    if days <= 100:
-        return 3
-    if days <= 180:
-        return 2
-    if days <= 365:
-        return 1
-    return 0
+def _margin_label(m: Optional[float]) -> str:
+    if m is None:
+        return "不明"
+    if m <= 0.3:
+        return "勝利・0.3以内"
+    if m <= 0.6:
+        return "0.4-0.6"
+    if m <= 1.0:
+        return "0.7-1.0"
+    if m <= 1.5:
+        return "1.1-1.5"
+    return "1.6以上"
 
 
-def _run_content_key(r: PastRace, race_date: date) -> Tuple:
-    """
-    生時計を競馬場横断で比較せず、
-    着差→(小差時のみ)クラス→直近性→着順の順で走りの価値を表す。
-    """
-    ml = _margin_level(r.margin)
-    class_when_competitive = r.class_rank if ml >= 3 else -2
-    finish_score = 0
-    if r.finish == 1:
-        finish_score = 3
-    elif r.finish == 2:
-        finish_score = 2
-    elif r.finish == 3:
-        finish_score = 1
-    return (
-        ml,
-        class_when_competitive,
-        _recency_level(_days_since(r, race_date)),
-        finish_score,
-    )
+def _recent(rs: List[PastRace]) -> List[PastRace]:
+    return sorted(rs, key=lambda r: r.race_date or date.min, reverse=True)
 
 
-def _evidence(rs: List[PastRace], race_date: date) -> Dict:
-    valid = [r for r in rs if r.time_seconds is not None]
-    if not valid:
-        return {
-            "count": 0,
-            "best_time": None,
-            "second_time": None,
-            "best_clock_margin": None,
-            "best_clock_date": None,
-            "best_content": (-1, -9, -1, -1),
-            "second_content": (-1, -9, -1, -1),
-            "win_count": 0,
-            "close03": 0,
-            "close06": 0,
-            "close10": 0,
-            "close15": 0,
-            "class_close03": -2,
-            "class_close10": -2,
-            "latest_comp_days": 9999,
-            "latest_strong_days": 9999,
-            "weak_direct": True,
-            "repeat_score": 0,
-        }
-
-    by_time = sorted(valid, key=lambda r: r.time_seconds)
-    best_clock = by_time[0]
-
-    by_content = sorted(
-        valid,
-        key=lambda r: _run_content_key(r, race_date),
-        reverse=True,
-    )
-    best_content = _run_content_key(by_content[0], race_date)
-    second_content = (
-        _run_content_key(by_content[1], race_date)
-        if len(by_content) >= 2
-        else (-1, -9, -1, -1)
-    )
-
-    close03_runs = [r for r in valid if r.margin is not None and r.margin <= 0.3]
-    close06_runs = [r for r in valid if r.margin is not None and r.margin <= 0.6]
-    close10_runs = [r for r in valid if r.margin is not None and r.margin <= 1.0]
-    close15_runs = [r for r in valid if r.margin is not None and r.margin <= 1.5]
-
-    latest_comp_days = min(
-        [_days_since(r, race_date) for r in close10_runs],
-        default=9999,
-    )
-    latest_strong_days = min(
-        [_days_since(r, race_date) for r in close03_runs],
-        default=9999,
-    )
-
-    # 同水準を繰り返していることを再現性として扱う。
-    repeat_score = (
-        len(close03_runs) * 4
-        + max(0, len(close06_runs) - len(close03_runs)) * 2
-        + max(0, len(close10_runs) - len(close06_runs))
-        + sum(1 for r in valid if r.finish == 1) * 2
-    )
-
-    # 直接距離経験があっても、全て大差負けなら「弱い直接実績」。
-    known_margins = [r.margin for r in valid if r.margin is not None]
-    weak_direct = bool(known_margins) and min(known_margins) > 2.5
-
-    return {
-        "count": len(valid),
-        "best_time": by_time[0].time_seconds,
-        "second_time": by_time[1].time_seconds if len(by_time) >= 2 else None,
-        "best_clock_margin": best_clock.margin,
-        "best_clock_date": best_clock.race_date,
-        "best_content": best_content,
-        "second_content": second_content,
-        "win_count": sum(1 for r in valid if r.finish == 1),
-        "close03": len(close03_runs),
-        "close06": len(close06_runs),
-        "close10": len(close10_runs),
-        "close15": len(close15_runs),
-        "class_close03": max([r.class_rank for r in close03_runs], default=-2),
-        "class_close10": max([r.class_rank for r in close10_runs], default=-2),
-        "latest_comp_days": latest_comp_days,
-        "latest_strong_days": latest_strong_days,
-        "weak_direct": weak_direct,
-        "repeat_score": repeat_score,
-    }
+def _surface_runs(h: Optional[HorseHistory], race: RaceInfo) -> List[PastRace]:
+    if not h:
+        return []
+    return [
+        r for r in h.races
+        if r.surface == race.surface and r.distance is not None and r.time_seconds is not None
+    ]
 
 
-def _quality_clock_key(ev: Dict) -> Tuple:
-    """
-    同場同距離でのみ使う実時計比較。
-    ベスト時計を主役に残しつつ、その時計時着差・再現性をセット評価。
-    lower is better.
-    """
-    bt = ev["best_time"]
-    if bt is None:
-        return (9999.0, 9999.0, 9999, 9999)
-
-    m = ev["best_clock_margin"]
-    adjusted = bt + margin_penalty(m)
-
-    return (
-        adjusted,
-        bt,
-        -ev["repeat_score"],
-        ev["latest_comp_days"],
-    )
+def _same_dist_runs(h: Optional[HorseHistory], race: RaceInfo) -> List[PastRace]:
+    return [r for r in _surface_runs(h, race) if r.distance == race.distance]
 
 
-def _adjacent_strength(rs: List[PastRace], race_date: date) -> Tuple:
-    ev = _evidence(rs, race_date)
-    return (
-        ev["best_content"],
-        ev["repeat_score"],
-        -ev["latest_comp_days"],
-    )
+def _exact_runs(h: Optional[HorseHistory], race: RaceInfo) -> List[PastRace]:
+    return [r for r in _same_dist_runs(h, race) if r.track == race.track]
 
 
-
-def _shared_race_benchmark(
-    race: RaceInfo,
-    profiles: Dict[int, Dict],
-    race_date: date,
-) -> Dict[int, Tuple]:
-    """
-    同じ過去レースに今回の出走馬が複数いた場合、そのレースは完全に同一条件なので
-    直接比較できる「共通物差し」として使う。
-
-    特にJRA1600〜1800mでは、別場生時計の横比較より信頼度が高い。
-    戻り値は horse_number -> benchmark tuple。
-    tupleは小さいほど強い。
-    """
-    groups = {}
-
-    for n, p in profiles.items():
-        for r in p["same_dist"]:
-            if r.time_seconds is None or r.race_date is None:
-                continue
-            key = (
-                r.race_date,
-                r.track,
-                r.race_name,
-                r.surface,
-                r.distance,
-            )
-            groups.setdefault(key, []).append((n, r))
-
-    out = {}
-
-    for key, members in groups.items():
-        unique_nums = {n for n, _ in members}
-        if len(unique_nums) < 2:
+def _adjacent_runs(h: Optional[HorseHistory], race: RaceInfo, same_track: Optional[bool] = None) -> List[PastRace]:
+    out = []
+    for r in _surface_runs(h, race):
+        if r.distance == race.distance or r.distance is None:
             continue
-
-        # 同じレースなので実時計を直接比較してよい。
-        ordered = sorted(
-            members,
-            key=lambda x: (
-                x[1].time_seconds,
-                999 if x[1].finish is None else x[1].finish,
-            ),
-        )
-
-        participants = len(unique_nums)
-        for direct_rank, (n, r) in enumerate(ordered, 1):
-            # 今回と同クラス以上の共通レースを最優先。
-            class_gap = max(0, race.class_rank - r.class_rank)
-            margin_bad = 0
-            if r.margin is not None:
-                if r.margin <= 1.0:
-                    margin_bad = 0
-                elif r.margin <= 1.5:
-                    margin_bad = 1
-                elif r.margin <= 2.0:
-                    margin_bad = 2
-                else:
-                    margin_bad = 4
-            else:
-                margin_bad = 2
-
-            candidate = (
-                class_gap,
-                margin_bad,
-                -participants,              # 3頭共通 > 2頭共通
-                direct_rank,                # 同じレース内の直接順位
-                _days_since(r, race_date),
-            )
-
-            if n not in out or candidate < out[n]:
-                out[n] = candidate
-
+        if abs(r.distance - race.distance) > 400:
+            continue
+        if same_track is True and r.track != race.track:
+            continue
+        if same_track is False and r.track == race.track:
+            continue
+        out.append(r)
     return out
 
 
-def _jra_same_distance_strength(
-    race: RaceInfo,
-    p: Dict,
-    race_date: date,
-) -> Tuple:
-    """
-    JRA1600〜1800mの「時計価値」。
-
-    v1.1の意図どおり、
-    ・今回と同クラス以上で競争になっている同距離実績
-    ・再現性
-    ・直近性
-    を、下級条件の勝利より先に見る。
-    """
-    runs = [
-        r for r in p["same_dist"]
-        if r.time_seconds is not None
-    ]
-
-    if not runs:
-        return (9, 9, 999, 999, 999)
-
-    # 今回と同クラス以上で、大敗ではない走り
-    relevant = [
-        r for r in runs
-        if r.class_rank >= race.class_rank
-        and (r.margin is None or r.margin <= 2.0)
-    ]
-
-    if relevant:
-        ev = _evidence(relevant, race_date)
-        return (
-            0,
-            -ev["repeat_score"],
-            ev["latest_comp_days"],
-            -ev["class_close10"],
-            tuple(-x for x in ev["best_content"]),
-        )
-
-    # 1クラス下でも小差・再現性が高ければ次点
-    lower_close = [
-        r for r in runs
-        if r.class_rank >= race.class_rank - 1
-        and r.margin is not None
-        and r.margin <= 1.0
-    ]
-    if lower_close:
-        ev = _evidence(lower_close, race_date)
-        return (
-            1,
-            -ev["repeat_score"],
-            ev["latest_comp_days"],
-            -ev["class_close10"],
-            tuple(-x for x in ev["best_content"]),
-        )
-
-    # その他の同距離
-    ev = _evidence(runs, race_date)
-    return (
-        2,
-        -ev["repeat_score"],
-        ev["latest_comp_days"],
-        -ev["class_close10"],
-        tuple(-x for x in ev["best_content"]),
-    )
+def _comparable_runs(h: Optional[HorseHistory], race: RaceInfo) -> List[PastRace]:
+    return _recent([
+        r for r in _surface_runs(h, race)
+        if r.distance == race.distance or (r.distance is not None and abs(r.distance - race.distance) <= 400)
+    ])
 
 
-# ============================================================
-# 第1エンジン：通常時計順位
-# ============================================================
-
-def _normal_key_jra_middle(
-    race: RaceInfo,
-    p: Dict,
-    race_date: date,
-    shared_benchmark: Optional[Tuple] = None,
-) -> Tuple:
-    """
-    JRA 1600〜1800m。
-
-    1) 今回と同クラス以上で競争になった同距離実績
-    2) 同じ過去レースでの直接比較（共通物差し）
-    3) 再現性・直近性
-    4) 同場同距離時計は補助
-
-    別競馬場の生時計だけを横並びにはしない。
-    """
-    same_ev = _evidence(p["same_dist"], race_date)
-    exact_ev = _evidence(p["exact"], race_date)
-    adjacent = p["adjacent_same_track"] + p["adjacent_other"]
-    adj_ev = _evidence(adjacent, race_date)
-
-    if same_ev["count"] > 0 and not same_ev["weak_direct"]:
-        strength = _jra_same_distance_strength(race, p, race_date)
-
-        # 共通レースがある場合は、同一条件の直接比較を強いタイブレークにする。
-        # 無い馬を機械的に落とさないよう、strengthの後に置く。
-        shared_key = shared_benchmark if shared_benchmark is not None else (9, 9, 9, 99, 9999)
-
-        return (
-            0,
-            strength,
-            shared_key,
-            -same_ev["repeat_score"],
-            same_ev["latest_comp_days"],
-            0 if exact_ev["count"] > 0 else 1,
-            _quality_clock_key(exact_ev),
-            p["entry"].number,
-        )
-
-    # 強い隣接距離は弱い直接実績を上回れる
-    if adj_ev["count"] > 0 and adj_ev["best_content"][0] >= 3:
-        return (
-            1,
-            tuple(-x for x in adj_ev["best_content"]),
-            -adj_ev["repeat_score"],
-            adj_ev["latest_comp_days"],
-            p["entry"].number,
-        )
-
-    if same_ev["count"] > 0:
-        return (
-            2,
-            _jra_same_distance_strength(race, p, race_date),
-            -same_ev["repeat_score"],
-            same_ev["latest_comp_days"],
-            _quality_clock_key(exact_ev),
-            p["entry"].number,
-        )
-
-    if adj_ev["count"] > 0:
-        return (
-            3,
-            tuple(-x for x in adj_ev["best_content"]),
-            -adj_ev["repeat_score"],
-            adj_ev["latest_comp_days"],
-            p["entry"].number,
-        )
-
-    return (9, p["entry"].number)
+def _best_time_run(rs: List[PastRace]) -> Optional[PastRace]:
+    valid = [r for r in rs if r.time_seconds is not None]
+    return min(valid, key=lambda r: r.time_seconds) if valid else None
 
 
-
-def _normal_key_2000plus(
-    race: RaceInfo,
-    p: Dict,
-    race_date: date,
-) -> Tuple:
-    """
-    2000m以上:
-    直接距離実績を強く重視。
-    ただし大差負けしかない弱い直接実績は、強い隣接距離に負ける。
-    """
-    exact_ev = _evidence(p["exact"], race_date)
-    other_ev = _evidence(p["other_track_same_dist"], race_date)
-    same_ev = _evidence(p["same_dist"], race_date)
-    adj_same_ev = _evidence(p["adjacent_same_track"], race_date)
-    adj_other_ev = _evidence(p["adjacent_other"], race_date)
-
-    # 強い同場同距離
-    if exact_ev["count"] > 0 and not exact_ev["weak_direct"]:
-        return (
-            0,
-            _quality_clock_key(exact_ev),
-            -exact_ev["repeat_score"],
-            exact_ev["latest_comp_days"],
-            -exact_ev["class_close10"],
-            p["entry"].number,
-        )
-
-    # 同場は無いが、別場同距離で競走内容が強い
-    if other_ev["count"] > 0 and not other_ev["weak_direct"]:
-        return (
-            1,
-            tuple(-x for x in other_ev["best_content"]),
-            -other_ev["repeat_score"],
-            other_ev["latest_comp_days"],
-            -other_ev["class_close10"],
-            p["entry"].number,
-        )
-
-    # 強い隣接距離は、弱い直接距離実績を上回れる
-    best_adj = adj_same_ev
-    adj_group = 2
-    if adj_other_ev["best_content"] > adj_same_ev["best_content"]:
-        best_adj = adj_other_ev
-        adj_group = 3
-
-    if best_adj["count"] > 0 and best_adj["best_content"][0] >= 4:
-        return (
-            adj_group,
-            tuple(-x for x in best_adj["best_content"]),
-            -best_adj["repeat_score"],
-            best_adj["latest_comp_days"],
-            p["entry"].number,
-        )
-
-    # 弱い直接実績
-    if same_ev["count"] > 0:
-        return (
-            4,
-            tuple(-x for x in same_ev["best_content"]),
-            -same_ev["repeat_score"],
-            same_ev["latest_comp_days"],
-            p["entry"].number,
-        )
-
-    if best_adj["count"] > 0:
-        return (
-            5,
-            tuple(-x for x in best_adj["best_content"]),
-            -best_adj["repeat_score"],
-            best_adj["latest_comp_days"],
-            p["entry"].number,
-        )
-
-    return (9, p["entry"].number)
+def _best_content_run(rs: List[PastRace], race_date: date) -> Optional[PastRace]:
+    if not rs:
+        return None
+    def key(r: PastRace):
+        ml = _margin_level(r.margin)
+        class_part = r.class_rank if ml >= 3 else -9
+        finish_part = 3 if r.finish == 1 else 2 if r.finish == 2 else 1 if r.finish == 3 else 0
+        return (ml, class_part, -_days(r, race_date), finish_part)
+    return max(rs, key=key)
 
 
-def _normal_key_local_or_other(
-    race: RaceInfo,
-    p: Dict,
-    race_date: date,
-) -> Tuple:
-    """
-    地方・その他:
-    同場同距離のベスト時計＋その着差＋再現性＋直近性を主役にする。
-    別場同距離は生時計を直接比較しない。
-    """
-    exact_ev = _evidence(p["exact"], race_date)
-    other_ev = _evidence(p["other_track_same_dist"], race_date)
-    adj_same_ev = _evidence(p["adjacent_same_track"], race_date)
-    adj_other_ev = _evidence(p["adjacent_other"], race_date)
-
-    if exact_ev["count"] > 0 and not exact_ev["weak_direct"]:
-        return (
-            0,
-            _quality_clock_key(exact_ev),
-            -exact_ev["repeat_score"],
-            exact_ev["latest_comp_days"],
-            -exact_ev["class_close10"],
-            # 今回と同馬場の直接実績を補助
-            0 if p["exact_going"] else 1,
-            p["entry"].number,
-        )
-
-    # 同場同距離が大差負けしかない場合、
-    # 強い別場同距離/隣接距離が上回ることを認める。
-    if other_ev["count"] > 0 and other_ev["best_content"][0] >= 4:
-        return (
-            1,
-            tuple(-x for x in other_ev["best_content"]),
-            -other_ev["repeat_score"],
-            other_ev["latest_comp_days"],
-            -other_ev["class_close10"],
-            p["entry"].number,
-        )
-
-    if adj_same_ev["count"] > 0 and adj_same_ev["best_content"][0] >= 4:
-        return (
-            2,
-            tuple(-x for x in adj_same_ev["best_content"]),
-            -adj_same_ev["repeat_score"],
-            adj_same_ev["latest_comp_days"],
-            p["entry"].number,
-        )
-
-    if exact_ev["count"] > 0:
-        return (
-            3,
-            _quality_clock_key(exact_ev),
-            -exact_ev["repeat_score"],
-            exact_ev["latest_comp_days"],
-            p["entry"].number,
-        )
-
-    if other_ev["count"] > 0:
-        return (
-            4,
-            tuple(-x for x in other_ev["best_content"]),
-            -other_ev["repeat_score"],
-            other_ev["latest_comp_days"],
-            p["entry"].number,
-        )
-
-    if adj_same_ev["count"] > 0:
-        return (
-            5,
-            tuple(-x for x in adj_same_ev["best_content"]),
-            -adj_same_ev["repeat_score"],
-            adj_same_ev["latest_comp_days"],
-            p["entry"].number,
-        )
-
-    if adj_other_ev["count"] > 0:
-        return (
-            6,
-            tuple(-x for x in adj_other_ev["best_content"]),
-            -adj_other_ev["repeat_score"],
-            adj_other_ev["latest_comp_days"],
-            p["entry"].number,
-        )
-
-    return (9, p["entry"].number)
+def _content_tuple(r: Optional[PastRace], race_date: date) -> Tuple:
+    if r is None:
+        return (-1, -9, -9999, -1)
+    ml = _margin_level(r.margin)
+    class_part = r.class_rank if ml >= 3 else -9
+    finish_part = 3 if r.finish == 1 else 2 if r.finish == 2 else 1 if r.finish == 3 else 0
+    return (ml, class_part, -_days(r, race_date), finish_part)
 
 
-def normal_clock_order(
-    race: RaceInfo,
-    profiles: Dict[int, Dict],
-    race_date: date,
-) -> List[int]:
-    """
-    v1.1の第1エンジン。
-    人気・オッズ・ガードを一切使わず、通常時計順位を作る。
-    """
-    nums = list(profiles.keys())
-
-    if race.track in JRA_TRACKS and 1600 <= race.distance <= 1800:
-        shared = _shared_race_benchmark(race, profiles, race_date)
-        return sorted(
-            nums,
-            key=lambda n: _normal_key_jra_middle(
-                race,
-                profiles[n],
-                race_date,
-                shared.get(n),
-            ),
-        )
-
-    if race.distance >= 2000:
-        return sorted(
-            nums,
-            key=lambda n: _normal_key_2000plus(race, profiles[n], race_date),
-        )
-
-    return sorted(
-        nums,
-        key=lambda n: _normal_key_local_or_other(race, profiles[n], race_date),
-    )
+def _count_close(rs: List[PastRace], lim: float) -> int:
+    return sum(1 for r in rs if r.margin is not None and r.margin <= lim)
 
 
-# ============================================================
-# 第2エンジン：ガード
-# ============================================================
+def _condition_tier(race: RaceInfo, r: PastRace) -> int:
+    if r.distance is None:
+        return 99
+    delta = abs(r.distance - race.distance)
+    if r.track == race.track and r.distance == race.distance and r.going == race.going:
+        return 0
+    if r.track == race.track and r.distance == race.distance:
+        return 1
+    if r.distance == race.distance:
+        return 2
+    if r.track == race.track and delta <= 100:
+        return 3
+    if r.track == race.track and delta <= 200:
+        return 4
+    if r.track == race.track and delta <= 400:
+        return 5
+    if delta <= 100:
+        return 6
+    if delta <= 200:
+        return 7
+    if delta <= 400:
+        return 8
+    return 99
 
-def _raw_exact_rank(profiles: Dict[int, Dict]) -> Dict[int, int]:
-    pairs = sorted(
-        [
-            (n, p["exact_best"])
-            for n, p in profiles.items()
-            if p["exact_best"] is not None
-        ],
-        key=lambda x: x[1],
-    )
-    return {n: i + 1 for i, (n, _) in enumerate(pairs)}
 
-
-def guard_lists_v1_1(
-    race: RaceInfo,
-    entries: List[Entry],
-    histories: Dict[int, HorseHistory],
-    profiles: Dict[int, Dict],
-    normal_order: List[int],
-    race_date: date,
-) -> Dict[str, List[int]]:
-    by_num = {e.number: e for e in entries}
-    pos = {n: i + 1 for i, n in enumerate(normal_order)}
-    raw_rank = _raw_exact_rank(profiles)
-
-    absolute = []
-    boundary = []
-    transfer = []
-    debut = []
-    first_distance = []
-    fast_big_margin = []
-
-    # 「境界から大きく劣らない」は固定秒差ではなく、
-    # 同場同距離の時計順位分布で判定する。
-    exact_count = len(raw_rank)
-    boundary_raw_rank_limit = min(
-        8,
-        max(6, (exact_count + 1) // 2),
-    ) if exact_count else 0
-
-    for n in normal_order:
-        p = profiles[n]
-        e = by_num[n]
-        h = histories.get(n)
-        exact_ev = _evidence(p["exact"], race_date)
-        same_ev = _evidence(p["same_dist"], race_date)
-
-        # 絶対時計：
-        # 同場同距離TOP3級＋0.3以内が基本。
-        # JRA1600〜1800mでは、単に新潟持ち時計上位というだけでは不足。
-        # 今回同クラス以上で0.3以内の同距離実績があることも確認する。
-        absolute_ok = (
-            n in raw_rank
-            and raw_rank[n] <= 3
-            and exact_ev["close03"] > 0
-        )
-
-        if absolute_ok and race.track in JRA_TRACKS and 1600 <= race.distance <= 1800:
-            same_class_close03 = any(
-                r.time_seconds is not None
-                and r.class_rank >= race.class_rank
-                and r.margin is not None
-                and r.margin <= 0.3
-                for r in p["same_dist"]
-            )
-            absolute_ok = same_class_close03
-
-        if absolute_ok:
-            absolute.append(n)
-
-        # 境界：通常7〜8位＋同距離勝/0.3以内＋時計分布でも境界圏
-        # 同場同距離がある場合はその生時計順位で確認。
-        if pos[n] in {7, 8} and same_ev["close03"] > 0:
-            close_enough = False
-
-            if n in raw_rank:
-                close_enough = raw_rank[n] <= boundary_raw_rank_limit
-            else:
-                # 別場同距離しか無い時は生時計横比較をせず、
-                # 小差実績の再現性が2本以上なら境界候補として認める。
-                close_enough = (
-                    same_ev["close03"] >= 2
-                    or (
-                        same_ev["close03"] >= 1
-                        and same_ev["class_close03"] >= race.class_rank
-                    )
-                )
-
-            if close_enough:
-                boundary.append(n)
-
-        if local_transfer_guard_target(race, e, h):
-            transfer.append(n)
-
-        if debut_warning_target(e, h):
-            debut.append(n)
-
-        # 同距離実績そのものが無い馬だけを初距離警戒
-        if (
-            p["same_dist_count"] == 0
-            and (
-                p["adjacent_same_track"]
-                or p["adjacent_other"]
-            )
-        ):
-            adj_ev = _evidence(
-                p["adjacent_same_track"] + p["adjacent_other"],
-                race_date,
-            )
-            if adj_ev["best_content"][0] >= 3:
-                first_distance.append(n)
-
-        # 高速時計＋大差負けは警戒表示だけ。
-        # 同場同距離TOP3級だがベスト時計時に1.0秒超負け。
-        m = p["exact_best_margin"]
-        if (
-            n in raw_rank
-            and raw_rank[n] <= 3
-            and m is not None
-            and m > 1.0
-        ):
-            fast_big_margin.append(n)
-
+def _condition_text(tier: int) -> str:
     return {
-        "absolute": absolute,
-        "boundary": boundary,
-        "transfer": transfer,
-        "debut": debut,
-        "first_distance": first_distance,
-        "fast_big_margin": fast_big_margin,
+        0: "同場同距離・同馬場",
+        1: "同場同距離",
+        2: "別場同距離",
+        3: "同場隣接100m以内",
+        4: "同場隣接200m以内",
+        5: "同場隣接400m以内",
+        6: "別場隣接100m以内",
+        7: "別場隣接200m以内",
+        8: "別場隣接400m以内",
+    }.get(tier, "材料薄")
+
+
+# ============================================================
+# 時計クラスタ：固定秒差ではなく分布の自然断層を検出
+# ============================================================
+
+def build_clock_clusters(race: RaceInfo, entries: List[Entry], histories: Dict[int, HorseHistory]) -> Dict:
+    rows = []
+    for e in entries:
+        br = _best_time_run(_exact_runs(histories.get(e.number), race))
+        if br is not None:
+            rows.append({
+                "number": e.number,
+                "name": e.name,
+                "time": br.time_seconds,
+                "margin": br.margin,
+                "date": br.race_date,
+            })
+    rows.sort(key=lambda x: x["time"])
+    n = len(rows)
+    if n == 0:
+        return {"rows": [], "cluster_by_num": {}, "reliable": False, "break_after": [], "boundaries": []}
+
+    gaps = [rows[i+1]["time"] - rows[i]["time"] for i in range(n-1)]
+    breaks = []
+    reliable = False
+    if n >= 4 and len(gaps) >= 3:
+        positive = [g for g in gaps if g > 1e-9]
+        if positive:
+            med = statistics.median(positive)
+            s = pd.Series(positive, dtype=float)
+            q1 = float(s.quantile(0.25))
+            q3 = float(s.quantile(0.75))
+            iqr = max(0.0, q3 - q1)
+            threshold = max(q3 + 1.5 * iqr, med * 2.5)
+            for i, g in enumerate(gaps):
+                if g > threshold and g > med * 1.5:
+                    breaks.append(i)
+            reliable = bool(breaks)
+
+    cluster = 1
+    cluster_by_num = {}
+    boundaries = []
+    for i, row in enumerate(rows):
+        cluster_by_num[row["number"]] = cluster
+        row["raw_rank"] = i + 1
+        row["cluster"] = cluster if reliable else 1
+        if i in breaks:
+            boundaries.append((rows[i]["time"] + rows[i+1]["time"]) / 2.0)
+            cluster += 1
+    if not reliable:
+        for row in rows:
+            row["cluster"] = 1
+            cluster_by_num[row["number"]] = 1
+    return {
+        "rows": rows,
+        "cluster_by_num": cluster_by_num,
+        "reliable": reliable,
+        "break_after": breaks,
+        "boundaries": boundaries,
     }
 
 
-def apply_guards_v1_1(
-    normal_order: List[int],
-    guards: Dict[str, List[int]],
-) -> List[int]:
-    """
-    通常TOP6を作った後にだけガードを適用。
-    ガード馬は「6番手保護」が基本。
-    既に保護した馬を後続ガードで押し出さない。
-    """
-    target_len = min(6, len(normal_order))
-    top6 = list(normal_order[:target_len])
-    protected = set()
+def _cluster_for_time(seconds: Optional[float], clusters: Dict) -> Optional[int]:
+    if seconds is None or not clusters.get("rows"):
+        return None
+    if not clusters.get("reliable"):
+        return 1
+    c = 1
+    for b in clusters.get("boundaries", []):
+        if seconds > b:
+            c += 1
+        else:
+            break
+    return c
 
-    # v1.1の確認順
-    forced_groups = [
-        ("absolute", guards["absolute"]),
-        ("boundary", guards["boundary"]),
-        ("transfer", guards["transfer"]),
+
+# ============================================================
+# 5軸評価
+# ============================================================
+
+def _repeat_grade(last5: List[PastRace], race: RaceInfo, clusters: Dict) -> Dict:
+    if len(last5) < 2:
+        return {"grade": 1, "label": "材料不足", "content_high": 0, "clock_high": 0}
+
+    content_high = sum(1 for r in last5 if r.margin is not None and r.margin <= 1.0)
+    last3_high = sum(1 for r in last5[:3] if r.margin is not None and r.margin <= 1.0)
+
+    exact_recent = [r for r in last5 if r.track == race.track and r.distance == race.distance]
+    clock_high = 0
+    if clusters.get("reliable") and exact_recent:
+        peak_cluster = min((_cluster_for_time(r.time_seconds, clusters) or 99) for r in exact_recent)
+        clock_high = sum(1 for r in exact_recent if (_cluster_for_time(r.time_seconds, clusters) or 99) <= peak_cluster)
+
+    if last3_high >= 2 or content_high >= 3 or clock_high >= 3:
+        grade, label = 3, "強"
+    elif content_high >= 2 or clock_high >= 2:
+        grade, label = 2, "中"
+    elif content_high >= 1 or clock_high >= 1:
+        grade, label = 1, "単発"
+    else:
+        grade, label = 0, "弱"
+    return {"grade": grade, "label": label, "content_high": content_high, "clock_high": clock_high}
+
+
+def _run_current_key(r: PastRace, race: RaceInfo, race_date: date, clusters: Dict) -> Tuple:
+    ml = _margin_level(r.margin)
+    tier = _condition_tier(race, r)
+    cl = None
+    if r.track == race.track and r.distance == race.distance:
+        cl = _cluster_for_time(r.time_seconds, clusters)
+    cluster_part = -(cl or 9)
+    class_part = r.class_rank if ml >= 3 else -9
+    return (ml, cluster_part, class_part, -tier, -_days(r, race_date))
+
+
+def _current_state(last3: List[PastRace], race: RaceInfo, race_date: date, clusters: Dict) -> Dict:
+    if len(last3) < 2:
+        return {"grade": 2, "label": "判定不能", "detail": "比較可能走1本以下"}
+    chronological = list(reversed(last3))
+    keys = [_run_current_key(r, race, race_date, clusters) for r in chronological]
+    ups = sum(1 for a, b in zip(keys, keys[1:]) if b > a)
+    downs = sum(1 for a, b in zip(keys, keys[1:]) if b < a)
+    recent_high = sum(1 for r in last3 if r.margin is not None and r.margin <= 1.0)
+    if len(last3) >= 3 and ups == len(keys) - 1:
+        return {"grade": 4, "label": "上昇", "detail": "直近比較可能走で内容水準が連続改善"}
+    if len(last3) >= 3 and downs == len(keys) - 1:
+        return {"grade": 0, "label": "下降", "detail": "直近比較可能走で内容水準が連続低下"}
+    if recent_high >= 2:
+        return {"grade": 4, "label": "高水準維持", "detail": "直近3比較可能走で1.0秒以内を複数回"}
+    return {"grade": 2, "label": "横ばい", "detail": "明確な連続上昇・下降なし"}
+
+
+def _class_value(rs: List[PastRace], race: RaceInfo) -> Dict:
+    strong = [r for r in rs if r.margin is not None and r.margin <= 1.0]
+    if not strong:
+        return {"rank": -9, "label": "強いクラス裏付けなし"}
+    best = max(strong, key=lambda r: (r.class_rank, _margin_level(r.margin)))
+    if best.class_rank >= race.class_rank:
+        label = "今回同等以上クラスで好内容"
+    elif best.class_rank >= race.class_rank - 1:
+        label = "1クラス下までで好内容"
+    else:
+        label = "下級条件で好内容"
+    return {"rank": best.class_rank, "label": label}
+
+
+def build_horse_eval(race: RaceInfo, e: Entry, h: Optional[HorseHistory], race_date: date, clusters: Dict) -> Dict:
+    surface = _surface_runs(h, race)
+    same = [r for r in surface if r.distance == race.distance]
+    exact = [r for r in same if r.track == race.track]
+    other_same = [r for r in same if r.track != race.track]
+    adj_same = _adjacent_runs(h, race, True)
+    adj_other = _adjacent_runs(h, race, False)
+    comp = _comparable_runs(h, race)
+    last3, last5 = comp[:3], comp[:5]
+
+    raw_exact = _best_time_run(exact)
+    raw_same = _best_time_run(same)
+    valid_exact = _best_time_run([r for r in exact if r.margin is not None and r.margin <= 1.0])
+    valid_same = _best_content_run([r for r in same if r.margin is not None and r.margin <= 1.0], race_date)
+    valid_adj_same = _best_content_run([r for r in adj_same if r.margin is not None and r.margin <= 1.0], race_date)
+    valid_adj_other = _best_content_run([r for r in adj_other if r.margin is not None and r.margin <= 1.0], race_date)
+
+    evidence_candidates = []
+    for rs in (exact, other_same, adj_same, adj_other):
+        evidence_candidates.extend(rs)
+    best_evidence = min(evidence_candidates, key=lambda r: _condition_tier(race, r)) if evidence_candidates else None
+    condition_tier = _condition_tier(race, best_evidence) if best_evidence else 99
+
+    # PEAKタイプ：同場同距離の小差裏付けを最優先。無ければ同距離小差。
+    if valid_exact is not None:
+        peak_type = "VALID"
+        peak_run = valid_exact
+    elif valid_same is not None:
+        peak_type = "VALID"
+        peak_run = valid_same
+    elif raw_exact is not None or raw_same is not None:
+        peak_type = "RAW"
+        peak_run = raw_exact or raw_same
+    else:
+        peak_type = "不明"
+        peak_run = valid_adj_same or valid_adj_other
+
+    peak_cluster = clusters.get("cluster_by_num", {}).get(e.number)
+    peak_cluster_reliable = bool(clusters.get("reliable") and peak_cluster is not None)
+    best_content = _best_content_run(same if same else (adj_same + adj_other), race_date)
+    repeat = _repeat_grade(last5, race, clusters)
+    current = _current_state(last3, race, race_date, clusters)
+    classv = _class_value(same if same else (adj_same + adj_other), race)
+
+    direct_known_margins = [r.margin for r in same if r.margin is not None]
+    weak_direct = bool(direct_known_margins) and min(direct_known_margins) > 2.5
+
+    # JRA中距離専用の同距離強度階層
+    current_class_comp = [
+        r for r in same if r.class_rank >= race.class_rank and r.margin is not None and r.margin <= 2.0
     ]
+    one_down_close = [
+        r for r in same if r.class_rank >= race.class_rank - 1 and r.margin is not None and r.margin <= 1.0
+    ]
+    if current_class_comp:
+        jra_tier = 0
+        jra_run = _best_content_run(current_class_comp, race_date)
+    elif one_down_close:
+        jra_tier = 1
+        jra_run = _best_content_run(one_down_close, race_date)
+    elif valid_same is not None:
+        jra_tier = 2
+        jra_run = valid_same
+    elif same:
+        jra_tier = 3
+        jra_run = _best_content_run(same, race_date)
+    elif valid_adj_same or valid_adj_other:
+        jra_tier = 4
+        jra_run = valid_adj_same or valid_adj_other
+    else:
+        jra_tier = 9
+        jra_run = None
 
-    for _, horses in forced_groups:
-        for n in horses:
-            if n in top6:
-                protected.add(n)
+    same03 = _count_close(same, 0.3)
+    same06 = _count_close(same, 0.6)
+    same10 = _count_close(same, 1.0)
+    exact03 = _count_close(exact, 0.3)
+
+    return {
+        "number": e.number,
+        "name": e.name,
+        "entry": e,
+        "history": h,
+        "surface": surface,
+        "same": same,
+        "exact": exact,
+        "other_same": other_same,
+        "adj_same": adj_same,
+        "adj_other": adj_other,
+        "last3": last3,
+        "last5": last5,
+        "condition_tier": condition_tier,
+        "condition_label": _condition_text(condition_tier),
+        "raw_exact": raw_exact,
+        "raw_same": raw_same,
+        "valid_exact": valid_exact,
+        "valid_same": valid_same,
+        "peak_type": peak_type,
+        "peak_run": peak_run,
+        "peak_cluster": peak_cluster,
+        "peak_cluster_reliable": peak_cluster_reliable,
+        "best_content": best_content,
+        "best_content_tuple": _content_tuple(best_content, race_date),
+        "repeat": repeat,
+        "current": current,
+        "class_value": classv,
+        "weak_direct": weak_direct,
+        "jra_tier": jra_tier,
+        "jra_run": jra_run,
+        "jra_content_tuple": _content_tuple(jra_run, race_date),
+        "same03": same03,
+        "same06": same06,
+        "same10": same10,
+        "exact03": exact03,
+    }
+
+
+# ============================================================
+# 直接対戦
+# ============================================================
+
+def build_direct_matrix(race: RaceInfo, evals: Dict[int, Dict], race_date: date) -> Dict[Tuple[int, int], Dict]:
+    groups: Dict[Tuple, Dict[int, PastRace]] = {}
+    for n, ev in evals.items():
+        for r in ev["surface"]:
+            if r.race_date is None or r.distance is None:
                 continue
+            if abs(r.distance - race.distance) > 400:
+                continue
+            key = (r.race_date, r.track, r.race_name, r.surface, r.distance, r.going)
+            groups.setdefault(key, {})[n] = r
 
-            # 最下位側から「未保護」の通常馬を探す
-            replace_idx = None
-            for i in range(len(top6) - 1, -1, -1):
-                if top6[i] not in protected:
-                    replace_idx = i
-                    break
+    out = {}
+    nums = list(evals)
+    for i, a in enumerate(nums):
+        for b in nums[i+1:]:
+            wa = wb = 0
+            meetings = []
+            for key, members in groups.items():
+                if a not in members or b not in members:
+                    continue
+                ra, rb = members[a], members[b]
+                # 近い比較材料を優先し、極端に古いものも記録はする。
+                winner = 0
+                if ra.time_seconds is not None and rb.time_seconds is not None:
+                    if ra.time_seconds < rb.time_seconds - 1e-9:
+                        winner = a
+                    elif rb.time_seconds < ra.time_seconds - 1e-9:
+                        winner = b
+                elif ra.finish is not None and rb.finish is not None:
+                    if ra.finish < rb.finish:
+                        winner = a
+                    elif rb.finish < ra.finish:
+                        winner = b
+                if winner == a:
+                    wa += 1
+                elif winner == b:
+                    wb += 1
+                meetings.append({"days": _days(ra, race_date), "winner": winner})
+            out[(a, b)] = {"a_wins": wa, "b_wins": wb, "meetings": meetings}
+            out[(b, a)] = {"a_wins": wb, "b_wins": wa, "meetings": meetings}
+    return out
 
-            if replace_idx is not None:
-                top6[replace_idx] = n
-                protected.add(n)
 
-    # 重複除去し、足りなければ通常順位から補完
+def _direct_cmp(a: int, b: int, matrix: Dict[Tuple[int, int], Dict]) -> int:
+    d = matrix.get((a, b), {})
+    aw, bw = d.get("a_wins", 0), d.get("b_wins", 0)
+    if aw >= 2 and bw == 0:
+        return 1
+    if bw >= 2 and aw == 0:
+        return -1
+    if aw > bw and aw >= 1:
+        return 1
+    if bw > aw and bw >= 1:
+        return -1
+    return 0
+
+
+# ============================================================
+# 競合判断
+# ============================================================
+
+def _soft_cmp(a: Dict, b: Dict, direct: Dict[Tuple[int, int], Dict], use_peak_time: bool = False) -> int:
+    # 1) CONTENT
+    if a["best_content_tuple"] != b["best_content_tuple"]:
+        return 1 if a["best_content_tuple"] > b["best_content_tuple"] else -1
+    # 2) REPEAT
+    if a["repeat"]["grade"] != b["repeat"]["grade"]:
+        return 1 if a["repeat"]["grade"] > b["repeat"]["grade"] else -1
+    # 3) CURRENT（不明=中立2）
+    if a["current"]["grade"] != b["current"]["grade"]:
+        return 1 if a["current"]["grade"] > b["current"]["grade"] else -1
+    # 4) 高クラス＋小差
+    if a["class_value"]["rank"] != b["class_value"]["rank"]:
+        return 1 if a["class_value"]["rank"] > b["class_value"]["rank"] else -1
+    # 5) 直接対戦
+    dc = _direct_cmp(a["number"], b["number"], direct)
+    if dc:
+        return dc
+    # 6) 同場同距離なら生時計を最終タイブレーク
+    if use_peak_time and a["raw_exact"] is not None and b["raw_exact"] is not None:
+        ta, tb = a["raw_exact"].time_seconds, b["raw_exact"].time_seconds
+        if ta != tb:
+            return 1 if ta < tb else -1
+    # 7) 条件近接
+    if a["condition_tier"] != b["condition_tier"]:
+        return 1 if a["condition_tier"] < b["condition_tier"] else -1
+    # 8) 最後は馬番で完全決定（人気は不使用）
+    return 1 if a["number"] < b["number"] else -1 if a["number"] > b["number"] else 0
+
+
+def _can_reverse_adjacent_cluster(lower: Dict, upper: Dict) -> bool:
+    # 下位クラスタ側が「VALID＋再現強＋現在高水準/上昇」なら隣接クラスタだけ逆転可能。
+    lower_strong = (
+        lower["peak_type"] == "VALID"
+        and lower["repeat"]["grade"] >= 2
+        and lower["current"]["grade"] >= 4
+        and lower["best_content"] is not None
+        and _margin_level(lower["best_content"].margin) >= 4
+    )
+    upper_weak = (
+        upper["peak_type"] == "RAW"
+        or upper["repeat"]["grade"] <= 1
+        or upper["current"]["label"] == "下降"
+    )
+    return lower_strong and upper_weak
+
+
+def _compare_local(a: Dict, b: Dict, direct: Dict[Tuple[int, int], Dict]) -> int:
+    ae, be = bool(a["exact"]), bool(b["exact"])
+
+    if ae and be:
+        # 明確な時計クラスタがある場合は能力帯を先に見る。
+        if a["peak_cluster_reliable"] and b["peak_cluster_reliable"]:
+            ca, cb = a["peak_cluster"], b["peak_cluster"]
+            if ca != cb:
+                diff = abs(ca - cb)
+                upper, lower = (a, b) if ca < cb else (b, a)
+                if diff >= 2:
+                    # 大差PEAK。ただし上位がRAW大差負け、下位がVALIDなら例外。
+                    if upper["peak_type"] == "RAW" and lower["peak_type"] == "VALID" and lower["repeat"]["grade"] >= 2:
+                        return 1 if lower is a else -1
+                    return 1 if upper is a else -1
+                # 隣接クラスタは強いCURRENT/REPEATで逆転可能。
+                if _can_reverse_adjacent_cluster(lower, upper):
+                    return 1 if lower is a else -1
+                return 1 if upper is a else -1
+        # 同クラスタ/断層なしならCONTENT・REPEAT・CURRENTを強く使う。
+        return _soft_cmp(a, b, direct, use_peak_time=True)
+
+    # 片方だけ同場同距離。強い直接実績なら地方では優先。
+    if ae != be:
+        ex, other = (a, b) if ae else (b, a)
+        ex_valid = ex["valid_exact"] is not None or not ex["weak_direct"]
+        other_strong = (
+            other["valid_same"] is not None
+            and other["repeat"]["grade"] >= 2
+            and other["current"]["grade"] >= 4
+        )
+        if ex_valid and not other_strong:
+            return 1 if ex is a else -1
+        if ex["weak_direct"] and other_strong:
+            return 1 if other is a else -1
+
+    # 同場直接が弱い/無い場合は条件近接＋内容を比較。
+    if a["condition_tier"] != b["condition_tier"]:
+        # 直接実績が弱い場合は非常に強い隣接が逆転可。
+        if a["weak_direct"] and b["peak_type"] == "VALID" and b["best_content"] and _margin_level(b["best_content"].margin) >= 4:
+            return -1
+        if b["weak_direct"] and a["peak_type"] == "VALID" and a["best_content"] and _margin_level(a["best_content"].margin) >= 4:
+            return 1
+        return 1 if a["condition_tier"] < b["condition_tier"] else -1
+    return _soft_cmp(a, b, direct, use_peak_time=False)
+
+
+def _compare_jra_middle(a: Dict, b: Dict, direct: Dict[Tuple[int, int], Dict]) -> int:
+    # 同距離CONTENT → 高クラス好内容 → REPEAT → CURRENT → 同場時計
+    if a["jra_tier"] != b["jra_tier"]:
+        return 1 if a["jra_tier"] < b["jra_tier"] else -1
+    if a["jra_content_tuple"] != b["jra_content_tuple"]:
+        return 1 if a["jra_content_tuple"] > b["jra_content_tuple"] else -1
+    if a["repeat"]["grade"] != b["repeat"]["grade"]:
+        return 1 if a["repeat"]["grade"] > b["repeat"]["grade"] else -1
+    if a["current"]["grade"] != b["current"]["grade"]:
+        return 1 if a["current"]["grade"] > b["current"]["grade"] else -1
+    dc = _direct_cmp(a["number"], b["number"], direct)
+    if dc:
+        return dc
+    # 同場同距離は最後のタイブレーク。
+    if a["raw_exact"] is not None and b["raw_exact"] is not None:
+        if a["peak_cluster_reliable"] and b["peak_cluster_reliable"] and a["peak_cluster"] != b["peak_cluster"]:
+            return 1 if a["peak_cluster"] < b["peak_cluster"] else -1
+        if a["raw_exact"].time_seconds != b["raw_exact"].time_seconds:
+            return 1 if a["raw_exact"].time_seconds < b["raw_exact"].time_seconds else -1
+    return _soft_cmp(a, b, direct, use_peak_time=False)
+
+
+def _long_tier(ev: Dict) -> int:
+    if ev["valid_exact"] is not None:
+        return 0
+    if ev["valid_same"] is not None and ev["same"]:
+        return 1
+    strong_adj = [r for r in ev["adj_same"] + ev["adj_other"] if r.margin is not None and r.margin <= 0.6]
+    if strong_adj:
+        return 2
+    if ev["same"]:
+        return 3
+    if ev["adj_same"]:
+        return 4
+    if ev["adj_other"]:
+        return 5
+    return 9
+
+
+def _compare_long(a: Dict, b: Dict, direct: Dict[Tuple[int, int], Dict]) -> int:
+    ta, tb = _long_tier(a), _long_tier(b)
+    if ta != tb:
+        # 強い隣接（2）は弱い直接（3）を上回るルールをtier化済み。
+        return 1 if ta < tb else -1
+    if ta == 0 and a["raw_exact"] is not None and b["raw_exact"] is not None:
+        if a["peak_cluster_reliable"] and b["peak_cluster_reliable"] and a["peak_cluster"] != b["peak_cluster"]:
+            return 1 if a["peak_cluster"] < b["peak_cluster"] else -1
+    return _soft_cmp(a, b, direct, use_peak_time=(ta == 0))
+
+
+def compare_evals(a: Dict, b: Dict, race: RaceInfo, direct: Dict[Tuple[int, int], Dict]) -> int:
+    if race.track in JRA_TRACKS and 1600 <= race.distance <= 1800:
+        return _compare_jra_middle(a, b, direct)
+    if race.distance >= 2000:
+        return _compare_long(a, b, direct)
+    return _compare_local(a, b, direct)
+
+
+def rank_evals(race: RaceInfo, evals: Dict[int, Dict], direct: Dict[Tuple[int, int], Dict]) -> List[int]:
+    items = list(evals.values())
+    def cmp(a, b):
+        c = compare_evals(a, b, race, direct)
+        # cmp_to_keyは負ならaが前。compare_evalsは+1=a優勢。
+        return -1 if c > 0 else 1 if c < 0 else 0
+    ordered = sorted(items, key=cmp_to_key(cmp))
+
+    # TOP8候補を隣接ペアで再確認。非推移の微妙な競合を2パスだけ整える。
+    for _ in range(2):
+        changed = False
+        for i in range(len(ordered) - 1):
+            if compare_evals(ordered[i+1], ordered[i], race, direct) > 0:
+                ordered[i], ordered[i+1] = ordered[i+1], ordered[i]
+                changed = True
+        if not changed:
+            break
+    return [x["number"] for x in ordered]
+
+
+# ============================================================
+# ガード
+# ============================================================
+
+def _is_upper_environment(track: str) -> bool:
+    return track in JRA_TRACKS or track in {"浦和", "船橋", "大井", "川崎"}
+
+
+def _transfer_candidate(race: RaceInfo, ev: Dict) -> bool:
+    e: Entry = ev["entry"]
+    h: Optional[HorseHistory] = ev["history"]
+    if race.track not in NAR_TRACKS or e.popularity > 3 or not h or not h.races:
+        return False
+    recent = _recent(h.races)
+    prev = recent[0]
+    # 直前が上位環境で、今回場の過去歴がない時のみ。
+    return _is_upper_environment(prev.track) and not any(r.track == race.track for r in recent)
+
+
+def _same_ability_band(a: Dict, b: Dict) -> bool:
+    if a["peak_cluster_reliable"] and b["peak_cluster_reliable"]:
+        return a["peak_cluster"] == b["peak_cluster"]
+    # クラスタが作れない時は、条件層とCONTENT帯が近い場合のみ同等扱い。
+    ca = _margin_level(a["best_content"].margin) if a["best_content"] else 0
+    cb = _margin_level(b["best_content"].margin) if b["best_content"] else 0
+    return abs(a["condition_tier"] - b["condition_tier"]) <= 1 and abs(ca - cb) <= 1
+
+
+def apply_guards(race: RaceInfo, entries: List[Entry], evals: Dict[int, Dict], normal: List[int], clusters: Dict, direct: Dict[Tuple[int, int], Dict]) -> Tuple[List[int], Dict]:
+    by_num = {e.number: e for e in entries}
+    pos = {n: i+1 for i, n in enumerate(normal)}
+    target_len = min(6, len(normal))
+    base = list(normal[:target_len])
+
+    absolute = []
+    transfer = []
+    boundary = []
+    debut = []
+    first_dist = []
+    fast_big = []
+
+    # 警戒・絶対
+    for n, ev in evals.items():
+        e = by_num[n]
+        if not ev["history"] or not ev["history"].races:
+            if e.popularity <= 5:
+                debut.append(n)
+
+        if not ev["same"] and (ev["adj_same"] or ev["adj_other"]):
+            adj = ev["adj_same"] + ev["adj_other"]
+            if any(r.margin is not None and r.margin <= 1.0 for r in adj):
+                first_dist.append(n)
+
+        if ev["raw_exact"] is not None and ev["raw_exact"].margin is not None and ev["raw_exact"].margin > 1.0:
+            if ev["peak_cluster_reliable"] and ev["peak_cluster"] == 1:
+                fast_big.append(n)
+
+        if (
+            clusters.get("reliable")
+            and ev["peak_cluster"] == 1
+            and ev["exact03"] > 0
+        ):
+            absolute.append(n)
+
+        if _transfer_candidate(race, ev):
+            transfer.append(n)
+
+    # 境界は通常7〜8位だけ。6位と同等能力帯＋同距離0.3以内。
+    sixth = normal[5] if len(normal) >= 6 else None
+    if sixth is not None:
+        for n in normal:
+            if pos[n] not in {7, 8}:
+                continue
+            ev = evals[n]
+            if ev["same03"] > 0 and _same_ability_band(ev, evals[sixth]):
+                boundary.append(n)
+
+    forced_outside = []
+    for kind, nums in (("absolute", absolute), ("transfer", transfer), ("boundary", boundary)):
+        for n in nums:
+            if n not in base and n not in [x[1] for x in forced_outside]:
+                forced_outside.append((kind, n))
+
+    conflict = len(forced_outside) > max(0, target_len - sum(1 for n in base if n in absolute or n in transfer or n in boundary))
+
+    top6 = list(base)
+    protected = set(n for n in top6 if n in absolute or n in transfer or n in boundary)
+    for kind, n in forced_outside:
+        if n in top6:
+            protected.add(n)
+            continue
+        candidates = [x for x in top6 if x not in protected]
+        if not candidates:
+            # 全枠がガード競合した場合は5軸比較で最弱を置換。
+            candidates = list(top6)
+            conflict = True
+        # 現在TOP6内でnより弱い最下位候補を探す。無ければ末尾を置換してガード保護。
+        replace = candidates[-1]
+        for x in reversed(candidates):
+            if compare_evals(evals[n], evals[x], race, direct) >= 0:
+                replace = x
+                break
+        idx = top6.index(replace)
+        top6[idx] = n
+        protected.add(n)
+
+    # 重複除去し、通常順で補完。
     clean = []
     for n in top6:
         if n not in clean:
             clean.append(n)
-
-    for n in normal_order:
+    for n in normal:
         if len(clean) >= target_len:
             break
         if n not in clean:
             clean.append(n)
 
-    # 通常順位を保ったまま、強制加入馬は原則末尾側へ置く
-    normal_pos = {n: i for i, n in enumerate(normal_order)}
-    normal_members = [n for n in clean if n in normal_order[:target_len]]
-    forced_members = [n for n in clean if n not in normal_order[:target_len]]
-
-    normal_members = sorted(normal_members, key=lambda n: normal_pos[n])
-    forced_members = sorted(forced_members, key=lambda n: normal_pos[n])
-
+    # 通常選出は通常順位順。ガード外加入は末尾側へ。
+    normal_pos = {n: i for i, n in enumerate(normal)}
+    normal_members = sorted([n for n in clean if n in normal[:target_len]], key=lambda n: normal_pos[n])
+    forced_members = sorted([n for n in clean if n not in normal[:target_len]], key=lambda n: normal_pos[n])
     final = (normal_members + forced_members)[:target_len]
-    return final
+
+    return final, {
+        "absolute": absolute,
+        "transfer": transfer,
+        "boundary": boundary,
+        "debut_warning": debut,
+        "first_distance_warning": first_dist,
+        "fast_big_margin_warning": fast_big,
+        "guard_conflict": conflict,
+    }
 
 
 # ============================================================
-# 表示
+# 表示・理由
 # ============================================================
 
-def _normal_reason(
-    race: RaceInfo,
-    p: Dict,
-    race_date: date,
-) -> str:
-    exact_ev = _evidence(p["exact"], race_date)
-    same_ev = _evidence(p["same_dist"], race_date)
-    adj_ev = _evidence(
-        p["adjacent_same_track"] + p["adjacent_other"],
-        race_date,
-    )
-
-    parts = []
-
-    if exact_ev["count"] > 0:
-        text = f"同場同距離 {format_time(exact_ev['best_time'])}"
-        if exact_ev["best_clock_margin"] is not None:
-            text += f"／ベスト時{exact_ev['best_clock_margin']:.1f}差"
-        parts.append(text)
-
-        if exact_ev["close03"]:
-            parts.append(f"0.3以内{exact_ev['close03']}回")
-        elif exact_ev["close10"]:
-            parts.append(f"1.0以内{exact_ev['close10']}回")
-
-        if exact_ev["repeat_score"] >= 6:
-            parts.append("再現性高")
-
-    elif same_ev["count"] > 0:
-        parts.append("別場同距離を内容比較")
-        if same_ev["close03"]:
-            parts.append(f"0.3以内{same_ev['close03']}回")
-        elif same_ev["close10"]:
-            parts.append(f"1.0以内{same_ev['close10']}回")
-
-    elif adj_ev["count"] > 0:
-        parts.append("隣接距離を補助評価")
-
-    if same_ev["class_close03"] >= 0:
-        parts.append(f"小差時クラス{same_ev['class_close03']}")
-
-    if same_ev["latest_comp_days"] < 9999:
-        parts.append(f"好内容{same_ev['latest_comp_days']}日前")
-
-    if exact_ev["weak_direct"]:
-        parts.append("直接実績は弱め")
-
-    return " / ".join(parts) if parts else "時計材料薄め"
+def _fmt_time_run(r: Optional[PastRace]) -> str:
+    if r is None or r.time_seconds is None:
+        return "—"
+    return format_time(r.time_seconds)
 
 
-def build_prediction_v1_1(
-    race: RaceInfo,
-    entries: List[Entry],
-    histories: Dict[int, HorseHistory],
-    race_date: date,
-) -> Dict:
+def _eval_reason(ev: Dict) -> str:
+    parts = [ev["condition_label"]]
+    if ev["raw_exact"] is not None:
+        parts.append(f"同場同距離{format_time(ev['raw_exact'].time_seconds)}")
+        if ev["raw_exact"].margin is not None:
+            parts.append(f"ベスト時{ev['raw_exact'].margin:.1f}差")
+    elif ev["valid_same"] is not None:
+        parts.append(f"同距離{_margin_label(ev['valid_same'].margin)}")
+    elif ev["best_content"] is not None:
+        parts.append(f"隣接距離{_margin_label(ev['best_content'].margin)}")
+    if ev["peak_cluster_reliable"]:
+        parts.append(f"時計クラスタ{ev['peak_cluster']}")
+    parts.append(f"PEAK {ev['peak_type']}")
+    parts.append(f"REPEAT {ev['repeat']['label']}")
+    parts.append(f"CURRENT {ev['current']['label']}")
+    return " / ".join(parts)
+
+
+def _five_axis_row(ev: Dict) -> Dict:
+    peak_text = "材料不足"
+    if ev["peak_run"] is not None:
+        peak_text = _fmt_time_run(ev["peak_run"])
+        if ev["peak_run"].margin is not None:
+            peak_text += f"／{ev['peak_run'].margin:.1f}差"
+        if ev["peak_cluster_reliable"]:
+            peak_text += f"／C{ev['peak_cluster']}"
+    content_text = "材料不足"
+    if ev["best_content"] is not None:
+        content_text = f"{_margin_label(ev['best_content'].margin)}／class{ev['best_content'].class_rank}"
+    return {
+        "馬番": ev["number"],
+        "馬名": ev["name"],
+        "CONDITION": ev["condition_label"],
+        "PEAK": peak_text,
+        "PEAK種別": ev["peak_type"],
+        "CONTENT": content_text,
+        "REPEAT": f"{ev['repeat']['label']}（好内容{ev['repeat']['content_high']}／時計再現{ev['repeat']['clock_high']}）",
+        "CURRENT": f"{ev['current']['label']}｜{ev['current']['detail']}",
+        "クラス価値": ev["class_value"]["label"],
+    }
+
+
+def build_prediction(race: RaceInfo, entries: List[Entry], histories: Dict[int, HorseHistory], race_date: date) -> Dict:
     if len(entries) < 3:
         raise ValueError("出馬表から3頭以上を読み取れませんでした。")
+    clusters = build_clock_clusters(race, entries, histories)
+    evals = {e.number: build_horse_eval(race, e, histories.get(e.number), race_date, clusters) for e in entries}
+    direct = build_direct_matrix(race, evals, race_date)
+    normal = rank_evals(race, evals, direct)
+    top6, guards = apply_guards(race, entries, evals, normal, clusters, direct)
 
-    profiles = build_profiles(race, entries, histories)
-    normal_order = normal_clock_order(race, profiles, race_date)
-    guards = guard_lists_v1_1(
-        race, entries, histories, profiles, normal_order, race_date
-    )
-    top6 = apply_guards_v1_1(normal_order, guards)
-
-    by_num = {e.number: e for e in entries}
-
-    normal_rows = []
-    for i, n in enumerate(normal_order[:min(8, len(normal_order))], 1):
-        p = profiles[n]
-        normal_rows.append({
-            "通常順位": i,
-            "馬番": n,
-            "馬名": by_num[n].name,
-            "同場同距離": format_time(p["exact_best"]),
-            "ベスト時計時着差": (
-                "—"
-                if p["exact_best_margin"] is None
-                else f"{p['exact_best_margin']:.1f}"
-            ),
-            "2本目": format_time(p["exact_second"]),
-            "別場同距離参考": format_time(p["other_same_dist_best"]),
-            "評価理由": _normal_reason(race, p, race_date),
-        })
-
-    top6_rows = []
-    for i, n in enumerate(top6, 1):
-        p = profiles[n]
-        tags = []
-        if n in guards["absolute"]:
-            tags.append("絶対時計")
-        if n in guards["boundary"]:
-            tags.append("境界")
-        if n in guards["transfer"]:
-            tags.append("転入")
-        top6_rows.append({
-            "時計TOP6": i,
-            "馬番": n,
-            "馬名": by_num[n].name,
-            "ガード": "・".join(tags) if tags else "通常選出",
-            "同場同距離": format_time(p["exact_best"]),
-            "ベスト時計時着差": (
-                "—"
-                if p["exact_best_margin"] is None
-                else f"{p['exact_best_margin']:.1f}"
-            ),
-            "評価理由": _normal_reason(race, p, race_date),
-        })
+    pair_checks = []
+    for idx, label in ((4, "5位vs6位"), (5, "6位vs7位"), (6, "7位vs8位")):
+        if len(normal) > idx + 1:
+            a, b = normal[idx], normal[idx+1]
+            winner = a if compare_evals(evals[a], evals[b], race, direct) >= 0 else b
+            pair_checks.append({"比較": label, "馬": f"{a} vs {b}", "優勢": winner})
 
     if len(entries) <= 6:
         status = "参考・ノーカウント"
+        top6 = normal[:len(entries)]
     elif len(entries) == 7:
         status = "参考"
     else:
@@ -1829,161 +1578,129 @@ def build_prediction_v1_1(
 
     return {
         "ruleset_id": RULESET_ID,
-        "ruleset_name": RULESET_NAME,
+        "implementation": IMPLEMENTATION_REV,
         "race": asdict(race),
         "race_date": race_date.isoformat(),
-        "entries": [asdict(e) for e in entries],
-        "normal_order": normal_order,
-        "normal_rows": normal_rows,
+        "normal_order": normal,
         "top6": top6,
-        "top6_rows": top6_rows,
-        "top6_status": status,
+        "status": status,
         "guards": guards,
+        "pair_checks": pair_checks,
+        "five_axis_rows": [_five_axis_row(evals[n]) for n in normal],
+        "normal_rows": [
+            {
+                "通常順位": i+1,
+                "馬番": n,
+                "馬名": evals[n]["name"],
+                "同場同距離": _fmt_time_run(evals[n]["raw_exact"]),
+                "時計クラスタ": evals[n]["peak_cluster"] if evals[n]["peak_cluster_reliable"] else "連続/不足",
+                "評価理由": _eval_reason(evals[n]),
+            }
+            for i, n in enumerate(normal[:min(8, len(normal))])
+        ],
+        "top6_rows": [
+            {
+                "時計TOP6": i+1,
+                "馬番": n,
+                "馬名": evals[n]["name"],
+                "ガード": "・".join([
+                    x for x, arr in (("絶対", guards["absolute"]), ("転入", guards["transfer"]), ("境界", guards["boundary"])) if n in arr
+                ]) or "通常選出",
+                "評価理由": _eval_reason(evals[n]),
+            }
+            for i, n in enumerate(top6)
+        ],
+        "cluster_rows": [
+            {
+                "馬番": x["number"], "馬名": x["name"], "同場同距離ベスト": format_time(x["time"]),
+                "着差": "—" if x["margin"] is None else f"{x['margin']:.1f}",
+                "生時計順位": x.get("raw_rank"), "時計クラスタ": x.get("cluster") if clusters.get("reliable") else "自然断層なし",
+            }
+            for x in clusters.get("rows", [])
+        ],
+        "cluster_reliable": clusters.get("reliable", False),
     }
 
 
-def parse_result_v1_1(text: str) -> List[int]:
+def parse_result_numbers(text: str) -> List[int]:
     return [int(x) for x in re.findall(r"\d+", text)]
 
 
-def verify_result_v1_1(pred: Dict, result_text: str) -> Dict:
-    result = parse_result_v1_1(result_text)
-    if len(result) < 3:
+def verify_prediction(pred: Dict, text: str) -> Dict:
+    res = parse_result_numbers(text)
+    if len(res) < 3:
         raise ValueError("結果は『7-5-10』のように1〜3着まで入力してください。")
-
-    podium = result[:3]
-    top6 = set(map(int, pred["top6"]))
-    hits = sum(n in top6 for n in podium)
-
-    def guard_result(nums):
-        vals = []
-        for n in nums:
-            vals.append(
-                f"{n}:{podium.index(n)+1 if n in podium else '圏外'}"
-            )
-        return "・".join(vals)
-
-    g = pred["guards"]
-
+    podium = res[:3]
+    s = set(pred["top6"])
+    hits = sum(n in s for n in podium)
     return {
         "ルール": pred["ruleset_id"],
+        "実装": pred["implementation"],
         "日付": pred["race_date"],
         "レース": pred["race"].get("race_name", ""),
         "競馬場": pred["race"].get("track", ""),
-        "条件": (
-            f"{pred['race'].get('surface','')}"
-            f"{pred['race'].get('distance',0)}m"
-        ),
-        "頭数": len(pred["entries"]),
-        "結果": "-".join(map(str, result[:3])),
-        "通常TOP8": "・".join(
-            map(str, pred["normal_order"][:8])
-        ),
+        "条件": f"{pred['race'].get('surface','')}{pred['race'].get('distance',0)}m",
+        "頭数": len(pred["normal_order"]),
+        "結果": "-".join(map(str, podium)),
+        "通常TOP8": "・".join(map(str, pred["normal_order"][:8])),
         "時計TOP6": "・".join(map(str, pred["top6"])),
-        "TOP6集計区分": pred["top6_status"],
+        "TOP6集計区分": pred["status"],
         "TOP6馬券内": f"{hits}/3",
         "TOP6完全捕捉": "○" if hits == 3 else "×",
-        "絶対時計": guard_result(g["absolute"]),
-        "境界": guard_result(g["boundary"]),
-        "地方転入": guard_result(g["transfer"]),
-        "初出走警戒": guard_result(g["debut"]),
-        "初距離警戒": guard_result(g["first_distance"]),
-        "高速時計大差負け": guard_result(g["fast_big_margin"]),
     }
 
 
 # ============================================================
-# UI
+# Streamlit UI
 # ============================================================
 
-APP_NAME = "競馬AI 時計TOP6 共通ルールv1.1固定版"
-st.set_page_config(
-    page_title=APP_NAME,
-    page_icon="⏱️",
-    layout="wide",
-)
-
-st.title("⏱️ 競馬AI 時計TOP6")
-st.caption(f"完全共通ルール v1.1【凍結版】｜実装 {IMPLEMENTATION_REV}｜API不要｜4頭絞りなし")
-
+APP_NAME = "競馬AI 時計分析 v2.0-Beta 完全Python版"
+st.set_page_config(page_title=APP_NAME, page_icon="⏱️", layout="wide")
+st.title("⏱️ 競馬AI 時計分析 v2.0-Beta")
+st.caption("完全Python自動判定｜ChatGPT不要｜OpenAI API不要｜外部AI不要")
 st.info(
-    "🔒 ルール固定中（文章ルールは変更なし）："
-    f"{RULESET_ID}\n\n"
-    "今後の検証で改善案が出ても、このv1.1は上書きしません。"
+    f"🔒 {RULESET_NAME}\n\n"
+    "馬柱解析から5軸評価・競合判断・通常TOP8・ガード・最終TOP6まで、このPythonだけで完結します。"
 )
 
-if "locked_prediction_v11" not in st.session_state:
-    st.session_state.locked_prediction_v11 = None
-if "history_v11" not in st.session_state:
-    st.session_state.history_v11 = []
+if "prediction_py20" not in st.session_state:
+    st.session_state.prediction_py20 = None
+if "history_py20" not in st.session_state:
+    st.session_state.history_py20 = []
 
 
-def clear_v11():
-    st.session_state.locked_prediction_v11 = None
-    st.session_state.race_text_v11 = ""
-    st.session_state.entry_text_v11 = ""
-    st.session_state.history_text_v11 = ""
-    st.session_state.result_text_v11 = ""
+def clear_all():
+    st.session_state.prediction_py20 = None
+    st.session_state.race_text_py20 = ""
+    st.session_state.entry_text_py20 = ""
+    st.session_state.history_text_py20 = ""
+    st.session_state.result_text_py20 = ""
 
 
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["予想・検証", "検証履歴", "固定ルールv1.1", "既知レース照合"]
-)
+tab1, tab2, tab3, tab4 = st.tabs(["予想・検証", "検証履歴", "完全ルールブック", "回帰テスト正解"])
 
 with tab1:
-    st.subheader("① レース情報を貼り付け")
-
-    race_date_input = st.date_input(
-        "レース日",
-        value=date.today(),
-        key="race_date_v11",
-    )
-
+    st.subheader("① 入力")
+    race_date_input = st.date_input("レース日", value=date.today(), key="race_date_py20")
     c1, c2, c3 = st.columns(3)
-
     with c1:
-        race_text = st.text_area(
-            "レース情報",
-            height=230,
-            key="race_text_v11",
-        )
-
+        race_text = st.text_area("レース情報", height=230, key="race_text_py20")
     with c2:
-        entry_text = st.text_area(
-            "出馬表",
-            height=230,
-            key="entry_text_v11",
-        )
-
+        entry_text = st.text_area("出馬表", height=230, key="entry_text_py20")
     with c3:
-        history_text = st.text_area(
-            "馬柱",
-            height=230,
-            key="history_text_v11",
-        )
+        history_text = st.text_area("馬柱", height=230, key="history_text_py20")
 
     b1, b2 = st.columns(2)
-
     with b1:
-        run = st.button(
-            "時計TOP6を分析する（事前固定）",
-            type="primary",
-            use_container_width=True,
-        )
-
+        run = st.button("時計TOP6を完全Python分析", type="primary", use_container_width=True)
     with b2:
-        st.button(
-            "入力・予想をクリア",
-            use_container_width=True,
-            on_click=clear_v11,
-        )
+        st.button("入力・予想をクリア", use_container_width=True, on_click=clear_all)
 
     if run:
         try:
             race = parse_race_info(race_text)
             entries = parse_entries(entry_text)
             histories = parse_horse_histories(history_text, entries)
-
             problems = []
             if not race.track:
                 problems.append("競馬場を取得できませんでした。")
@@ -1993,208 +1710,91 @@ with tab1:
                 problems.append("出馬表を十分に解析できませんでした。")
             if len(histories) < min(3, len(entries)):
                 problems.append("馬柱を十分に解析できませんでした。")
-
-            st.caption(
-                f"解析：出馬表 {len(entries)}頭 / 馬柱 {len(histories)}頭"
-            )
-
+            st.caption(f"解析：出馬表 {len(entries)}頭 / 馬柱 {len(histories)}頭")
             if problems:
                 st.error("\n".join(problems))
             else:
-                pred = build_prediction_v1_1(
-                    race,
-                    entries,
-                    histories,
-                    race_date_input,
-                )
-                st.session_state.locked_prediction_v11 = pred
-                st.success(
-                    "v1.1で事前固定しました。"
-                    "結果入力時に順位は再計算しません。"
-                )
+                pred = build_prediction(race, entries, histories, race_date_input)
+                st.session_state.prediction_py20 = pred
+                st.success("完全Pythonで事前固定しました。結果入力時に順位は再計算しません。")
         except Exception as e:
-            st.error(f"解析エラー：{e}")
+            st.exception(e)
 
-    pred = st.session_state.locked_prediction_v11
-
+    pred = st.session_state.prediction_py20
     if pred:
         st.divider()
         st.subheader("② 最終 時計TOP6")
+        st.success("時計TOP6：" + "・".join(map(str, pred["top6"])) + f"　｜ {pred['status']}")
+        st.dataframe(pd.DataFrame(pred["top6_rows"]), use_container_width=True, hide_index=True)
 
-        st.success(
-            "時計TOP6【三連系用】："
-            + "・".join(map(str, pred["top6"]))
-            + f"　｜ {pred['top6_status']}"
-        )
+        st.markdown("### 通常時計順位 TOP8")
+        st.caption("人気・オッズ・ガードを使わず、5軸＋競合判断だけで作成。")
+        st.dataframe(pd.DataFrame(pred["normal_rows"]), use_container_width=True, hide_index=True)
 
-        st.dataframe(
-            pd.DataFrame(pred["top6_rows"]),
-            use_container_width=True,
-            hide_index=True,
-        )
+        st.markdown("### 5軸評価")
+        st.dataframe(pd.DataFrame(pred["five_axis_rows"]), use_container_width=True, hide_index=True)
 
-        st.markdown("### 第1エンジン｜通常時計順位 TOP8")
-        st.caption("この順位を作る段階では人気・オッズ・ガードを使用していません。")
-        st.dataframe(
-            pd.DataFrame(pred["normal_rows"]),
-            use_container_width=True,
-            hide_index=True,
-        )
+        st.markdown("### 時計クラスタ")
+        if pred["cluster_rows"]:
+            st.caption("自然断層あり" if pred["cluster_reliable"] else "自然な断層なし／材料不足：形式TOP3では切りません。")
+            st.dataframe(pd.DataFrame(pred["cluster_rows"]), use_container_width=True, hide_index=True)
+        else:
+            st.info("同場同距離の時計材料がありません。")
+
+        st.markdown("### 境界ペア比較")
+        if pred["pair_checks"]:
+            st.dataframe(pd.DataFrame(pred["pair_checks"]), use_container_width=True, hide_index=True)
 
         g = pred["guards"]
-
-        st.markdown("### 第2エンジン｜ガード・警戒")
-        st.write(
-            "**絶対時計ガード**："
-            + (
-                "・".join(map(str, g["absolute"]))
-                if g["absolute"]
-                else "該当なし"
-            )
-        )
-        st.write(
-            "**絶対時計・境界ガード**："
-            + (
-                "・".join(map(str, g["boundary"]))
-                if g["boundary"]
-                else "該当なし"
-            )
-        )
-        st.write(
-            "**地方転入人気馬ガード**："
-            + (
-                "・".join(map(str, g["transfer"]))
-                if g["transfer"]
-                else "該当なし"
-            )
-        )
-        st.write(
-            "**初出走警戒**："
-            + (
-                "・".join(map(str, g["debut"]))
-                if g["debut"]
-                else "該当なし"
-            )
-        )
-        st.write(
-            "**初距離警戒**："
-            + (
-                "・".join(map(str, g["first_distance"]))
-                if g["first_distance"]
-                else "該当なし"
-            )
-        )
-        st.write(
-            "**高速時計＋大差負け警戒**："
-            + (
-                "・".join(map(str, g["fast_big_margin"]))
-                if g["fast_big_margin"]
-                else "該当なし"
-            )
-        )
+        st.markdown("### ガード・警戒")
+        st.write("**絶対時計ガード**：" + ("・".join(map(str, g["absolute"])) if g["absolute"] else "該当なし"))
+        st.write("**地方転入人気馬ガード**：" + ("・".join(map(str, g["transfer"])) if g["transfer"] else "該当なし"))
+        st.write("**境界ガード**：" + ("・".join(map(str, g["boundary"])) if g["boundary"] else "該当なし"))
+        st.write("**初出走警戒**：" + ("・".join(map(str, g["debut_warning"])) if g["debut_warning"] else "該当なし"))
+        st.write("**初距離警戒**：" + ("・".join(map(str, g["first_distance_warning"])) if g["first_distance_warning"] else "該当なし"))
+        st.write("**高速時計＋大差負け警戒**：" + ("・".join(map(str, g["fast_big_margin_warning"])) if g["fast_big_margin_warning"] else "該当なし"))
+        if g["guard_conflict"]:
+            st.warning("複数ガード競合あり：固定優先順位は作らず、5軸比較で処理しました。v2.1検討対象です。")
 
         st.divider()
         st.subheader("③ 結果検証")
-
-        result_text = st.text_input(
-            "実着順",
-            placeholder="例：7-5-10",
-            key="result_text_v11",
-        )
-
-        if st.button(
-            "結果を照合して履歴に保存",
-            use_container_width=True,
-        ):
+        result_text = st.text_input("実着順", placeholder="例：7-5-10", key="result_text_py20")
+        if st.button("結果を照合して履歴に保存", use_container_width=True):
             try:
-                record = verify_result_v1_1(pred, result_text)
-                st.session_state.history_v11.append(record)
-
-                st.success(
-                    f"結果 {record['結果']}｜"
-                    f"TOP6馬券内 {record['TOP6馬券内']}｜"
-                    f"完全捕捉 {record['TOP6完全捕捉']}"
-                )
+                rec = verify_prediction(pred, result_text)
+                st.session_state.history_py20.append(rec)
+                st.success(f"結果 {rec['結果']}｜TOP6馬券内 {rec['TOP6馬券内']}｜完全捕捉 {rec['TOP6完全捕捉']}")
             except Exception as e:
                 st.error(str(e))
 
-
 with tab2:
     st.subheader("検証履歴")
-    st.caption(
-        "すべての履歴にルールIDを保存します。"
-        "将来v1.2を作ってもv1.1検証と混ざりません。"
-    )
-
-    if st.session_state.history_v11:
-        hdf = pd.DataFrame(st.session_state.history_v11)
-        st.dataframe(
-            hdf,
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        counted = hdf[
-            hdf["TOP6集計区分"] == "本集計"
-        ]
-
+    if st.session_state.history_py20:
+        hdf = pd.DataFrame(st.session_state.history_py20)
+        st.dataframe(hdf, use_container_width=True, hide_index=True)
+        counted = hdf[hdf["TOP6集計区分"] == "本集計"]
         races = len(counted)
-        hits = (
-            sum(
-                int(str(x).split("/")[0])
-                for x in counted["TOP6馬券内"]
-            )
-            if races
-            else 0
-        )
-        full = (
-            int((counted["TOP6完全捕捉"] == "○").sum())
-            if races
-            else 0
-        )
-
+        hits = sum(int(str(x).split("/")[0]) for x in counted["TOP6馬券内"]) if races else 0
+        full = int((counted["TOP6完全捕捉"] == "○").sum()) if races else 0
         c1, c2 = st.columns(2)
-        c1.metric(
-            "TOP6 馬券内捕捉",
-            f"{hits}/{races * 3}" if races else "0/0",
-        )
-        c2.metric(
-            "TOP6 完全捕捉",
-            f"{full}/{races}" if races else "0/0",
-        )
-
-        csv_bytes = hdf.to_csv(
-            index=False
-        ).encode("utf-8-sig")
-
-        st.download_button(
-            "v1.1検証履歴CSVをダウンロード",
-            data=csv_bytes,
-            file_name="keiba_clock_top6_v1_1_history.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
-
-        if st.button("v1.1履歴を全削除"):
-            st.session_state.history_v11 = []
+        c1.metric("TOP6 馬券内捕捉", f"{hits}/{races*3}" if races else "0/0")
+        c2.metric("TOP6 完全捕捉", f"{full}/{races}" if races else "0/0")
+        csv = hdf.to_csv(index=False).encode("utf-8-sig")
+        st.download_button("検証履歴CSV", data=csv, file_name="keiba_clock_v2_0_beta_python_history.csv", mime="text/csv", use_container_width=True)
+        if st.button("履歴を全削除"):
+            st.session_state.history_py20 = []
             st.rerun()
     else:
-        st.info("まだv1.1の検証履歴はありません。")
-
+        st.info("まだ検証履歴はありません。")
 
 with tab3:
     st.subheader(RULESET_NAME)
     st.code(RULESET_ID)
-    st.markdown(RULESET_TEXT)
-
+    st.markdown(RULEBOOK_TEXT)
 
 with tab4:
     st.subheader("既知レースの固定TOP6")
-    st.caption(
-        "これは検証時の照合用データです。"
-        "ランキング計算には一切使用していません。"
-    )
-
+    st.caption("回帰テスト用。計算には使用しません。")
     expected = {
         "R34 新潟 柳都S ダ1800稍": [6, 14, 2, 8, 4, 11],
         "R35 浦和 盆の月特別 ダ2000不": [3, 2, 10, 6, 7, 8],
@@ -2202,40 +1802,14 @@ with tab4:
         "R38 門別 リンドウ特別 ダ1200良": [10, 7, 5, 6, 8, 9],
         "R39 大井 トゥインクルバースデー賞 ダ1600不": [2, 6, 10, 14, 11, 1],
     }
-
-    rdf = pd.DataFrame([
-        {
-            "レース": name,
-            "固定TOP6": "・".join(map(str, nums)),
-        }
-        for name, nums in expected.items()
-    ])
-
-    st.dataframe(
-        rdf,
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    pred = st.session_state.locked_prediction_v11
+    st.dataframe(pd.DataFrame([{"レース": k, "固定TOP6": "・".join(map(str, v))} for k, v in expected.items()]), use_container_width=True, hide_index=True)
+    pred = st.session_state.prediction_py20
     if pred:
-        target = st.selectbox(
-            "現在の予想を照合",
-            list(expected.keys()),
-        )
-
-        actual = list(map(int, pred["top6"]))
+        target = st.selectbox("現在の予想を照合", list(expected.keys()))
+        actual = pred["top6"]
         exp = expected[target]
-
-        st.write(
-            "**現在：** "
-            + "・".join(map(str, actual))
-        )
-        st.write(
-            "**固定正解：** "
-            + "・".join(map(str, exp))
-        )
-
+        st.write("**現在：** " + "・".join(map(str, actual)))
+        st.write("**固定正解：** " + "・".join(map(str, exp)))
         if actual == exp:
             st.success("完全一致（6頭＋順番）")
         elif set(actual) == set(exp):
@@ -2243,18 +1817,4 @@ with tab4:
         else:
             missing = [n for n in exp if n not in actual]
             extra = [n for n in actual if n not in exp]
-
-            st.error(
-                "不一致｜不足："
-                + (
-                    "・".join(map(str, missing))
-                    if missing
-                    else "なし"
-                )
-                + "｜余分："
-                + (
-                    "・".join(map(str, extra))
-                    if extra
-                    else "なし"
-                )
-            )
+            st.error("不一致｜不足：" + ("・".join(map(str, missing)) if missing else "なし") + "｜余分：" + ("・".join(map(str, extra)) if extra else "なし"))
