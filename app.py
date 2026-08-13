@@ -543,7 +543,7 @@ def parse_horse_histories(text: str, entries: Optional[List[Entry]] = None) -> D
 
 RULESET_ID = "CLOCK_RULEBOOK_V2_0_BETA_PYTHON_FROZEN_2026-08-13"
 RULESET_NAME = "時計分析 完全ルールブック v2.0-Beta【完全Python自動判定】"
-IMPLEMENTATION_REV = "python-engine-10-pairwise-consistency"
+IMPLEMENTATION_REV = "python-engine-11-directness-guard-slot"
 
 RULEBOOK_TEXT = r"""
 【0｜目的】
@@ -1829,6 +1829,28 @@ def _compare_jra_middle_with_reason(
         winner = b if ta == 9 else a
         return (1 if winner is a else -1, "比較可能な同距離/近接距離材料の有無")
 
+    # impl11: CONDITION/距離証拠の直接性を先に確認する。
+    # v2.0-Betaでは「直接同距離が基本優先。弱い直接だけは強い近接に逆転され得る」。
+    # tierの意味:
+    #   0=強い同距離, 1=同距離＋強い近接補強, 2=強い近接のみ,
+    #   3=弱い同距離, 4=弱い近接のみ, 9=材料薄
+    # 0/1の信頼できる直接証拠を、2/3/4の補助証拠がCONTENTだけで先に潰さないようにする。
+    direct_strong_a = ta in {0, 1}
+    direct_strong_b = tb in {0, 1}
+    if direct_strong_a != direct_strong_b:
+        winner = a if direct_strong_a else b
+        return (1 if winner is a else -1, "CONDITION：信頼できる同距離証拠を基本優先")
+
+    # 強い近接のみ(2)は弱い直接(3)を逆転可。
+    if {ta, tb} == {2, 3}:
+        winner = a if ta == 2 else b
+        return (1 if winner is a else -1, "CONDITION：強い近接が弱い直接を逆転")
+
+    # 弱い直接(3)と弱い近接(4)なら、基本優先の直接を残す。
+    if {ta, tb} == {3, 4}:
+        winner = a if ta == 3 else b
+        return (1 if winner is a else -1, "CONDITION：弱材料同士は直接同距離を優先")
+
     # 同場同距離の自然断層が大きい時だけ、グローバルPEAK差ルールを先に適用。
     if (
         a["raw_exact"] is not None and b["raw_exact"] is not None
@@ -2480,8 +2502,7 @@ def apply_guards(race: RaceInfo, entries: List[Entry], evals: Dict[int, Dict], n
             if (ev["peak_cluster_reliable"] and ev["peak_cluster"] == 1) or (raw_rank is not None and raw_rank <= 3):
                 fast_big.append(n)
 
-        # 絶対時計ガードは「RAW最速がC1」だけでは不可。
-        # 勝利/0.3以内を記録したその走自体がVALID PEAKの最上位クラスタに属する時だけ。
+        # 絶対時計ガード：最上位VALID PEAKクラスタ＋勝利/0.3以内。
         valid_peak_cluster1 = any(
             r.margin is not None
             and r.margin <= 0.3
@@ -2505,57 +2526,31 @@ def apply_guards(race: RaceInfo, entries: List[Entry], evals: Dict[int, Dict], n
             if ev["same03"] > 0 and _same_ability_band(ev, evals[sixth]):
                 boundary.append(n)
 
-    conflict = False
-    forced_outside = []
-    for kind, nums in (("absolute", absolute), ("transfer", transfer)):
+    # impl11:
+    # ガードは「上位昇格」ではなくTOP6 membership protection。
+    # 絶対/転入/境界のいずれも、通常TOP6外から入る時は原則6位枠だけを使う。
+    # 同一馬が複数ガードに該当しても1頭として扱い、二重適用で上位馬を押し出さない。
+    guard_kinds = {}
+    for kind, nums in (("absolute", absolute), ("transfer", transfer), ("boundary", boundary)):
         for n in nums:
-            if n not in base and n not in [x[1] for x in forced_outside]:
-                forced_outside.append((kind, n))
+            guard_kinds.setdefault(n, []).append(kind)
 
-    # 境界ガードは「6位枠だけ」の保護。7〜8位に複数候補がいる時は、
-    # その候補同士を5軸比較して1頭だけを6位枠へ送る。上位5頭は通常時に触らない。
-    boundary_outside = [n for n in boundary if n not in base]
-    if boundary_outside:
-        chosen_boundary = boundary_outside[0]
-        for n in boundary_outside[1:]:
-            if compare_evals(evals[n], evals[chosen_boundary], race, direct) > 0:
-                chosen_boundary = n
-        forced_outside.append(("boundary", chosen_boundary))
-        if len(boundary_outside) > 1:
-            conflict = True
-
-    conflict = conflict or (
-        len(forced_outside)
-        > max(0, target_len - sum(1 for n in base if n in absolute or n in transfer or n in boundary))
-    )
+    outside = [n for n in guard_kinds if n not in base]
+    conflict = len(outside) > 1
+    chosen = None
+    if outside:
+        # 6位枠が1つしかないため、複数ガード競合時だけ5軸で1頭を選ぶ。
+        # これはv2.0-Betaの「ガード競合・判断保留→5軸再比較」に対応。
+        chosen = outside[0]
+        for n in outside[1:]:
+            if compare_evals(evals[n], evals[chosen], race, direct) > 0:
+                chosen = n
 
     top6 = list(base)
-    protected = set(n for n in top6 if n in absolute or n in transfer or n in boundary)
-    for kind, n in forced_outside:
-        if n in top6:
-            protected.add(n)
-            continue
-        candidates = [x for x in top6 if x not in protected]
-        if not candidates:
-            # 全枠がガード競合した場合は5軸比較で最弱を置換。
-            candidates = list(top6)
-            conflict = True
+    if chosen is not None and top6:
+        top6[-1] = chosen
 
-        if kind == "boundary" and top6[-1] not in protected:
-            # 通常の境界保護は必ず現在6位だけを置換。上位5頭へ昇格させない。
-            replace = top6[-1]
-        else:
-            # 絶対/転入、または既に6位枠が別ガードで保護された競合時だけ5軸再比較。
-            replace = candidates[-1]
-            for x in reversed(candidates):
-                if compare_evals(evals[n], evals[x], race, direct) >= 0:
-                    replace = x
-                    break
-        idx = top6.index(replace)
-        top6[idx] = n
-        protected.add(n)
-
-    # 重複除去し、通常順で補完。
+    # 念のため重複を除去し、通常順位で不足分を補完。
     clean = []
     for n in top6:
         if n not in clean:
@@ -2566,11 +2561,21 @@ def apply_guards(race: RaceInfo, entries: List[Entry], evals: Dict[int, Dict], n
         if n not in clean:
             clean.append(n)
 
-    # 通常選出は通常順位順。ガード外加入は末尾側へ。
-    normal_pos = {n: i for i, n in enumerate(normal)}
-    normal_members = sorted([n for n in clean if n in normal[:target_len]], key=lambda n: normal_pos[n])
-    forced_members = sorted([n for n in clean if n not in normal[:target_len]], key=lambda n: normal_pos[n])
-    final = (normal_members + forced_members)[:target_len]
+    # 通常TOP5は順序を絶対に崩さず、外部ガード加入馬は6位へ置く。
+    if chosen is not None:
+        normal_top5 = [n for n in normal[:min(5, target_len)] if n in clean]
+        final = normal_top5[:]
+        # もし通常TOP5に重複等があれば通常順で補完。
+        for n in normal:
+            if len(final) >= max(0, target_len - 1):
+                break
+            if n != chosen and n not in final:
+                final.append(n)
+        if chosen not in final and len(final) < target_len:
+            final.append(chosen)
+        final = final[:target_len]
+    else:
+        final = clean[:target_len]
 
     return final, {
         "absolute": absolute,
@@ -2580,6 +2585,8 @@ def apply_guards(race: RaceInfo, entries: List[Entry], evals: Dict[int, Dict], n
         "first_distance_warning": first_dist,
         "fast_big_margin_warning": fast_big,
         "guard_conflict": conflict,
+        "guard_overlap": {n: kinds for n, kinds in guard_kinds.items() if len(kinds) > 1},
+        "forced_guard_horse": chosen,
     }
 
 
@@ -2773,7 +2780,7 @@ def verify_prediction(pred: Dict, text: str) -> Dict:
 APP_NAME = "競馬AI 時計分析 v2.0-Beta 完全Python版 impl10"
 st.set_page_config(page_title=APP_NAME, page_icon="⏱️", layout="wide")
 st.title("⏱️ 競馬AI 時計分析 v2.0-Beta impl10")
-st.caption("完全Python自動判定｜impl10 pairwise-consistency｜ChatGPT不要｜OpenAI API不要｜外部AI不要")
+st.caption("完全Python自動判定｜impl11 directness-guard-slot｜ChatGPT不要｜OpenAI API不要｜外部AI不要")
 st.info(
     f"🔒 {RULESET_NAME}\n\n"
     "馬柱解析から5軸評価・競合判断・通常TOP8・ガード・最終TOP6まで、このPythonだけで完結します。"
