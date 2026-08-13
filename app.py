@@ -543,7 +543,7 @@ def parse_horse_histories(text: str, entries: Optional[List[Entry]] = None) -> D
 
 RULESET_ID = "CLOCK_RULEBOOK_V2_0_BETA_PYTHON_FROZEN_2026-08-13"
 RULESET_NAME = "時計分析 完全ルールブック v2.0-Beta【完全Python自動判定】"
-IMPLEMENTATION_REV = "python-engine-16-v11-long-quality-restored"
+IMPLEMENTATION_REV = "python-engine-17-local-conflict-v11"
 
 RULEBOOK_TEXT = r"""
 【0｜目的】
@@ -1806,52 +1806,161 @@ def _can_reverse_adjacent_cluster(lower: Dict, upper: Dict) -> bool:
     return lower_strong and upper_weak
 
 
-def _compare_local(a: Dict, b: Dict, direct: Dict[Tuple[int, int], Dict]) -> int:
-    ae, be = bool(a["exact"]), bool(b["exact"])
+def _local_exact_content_run(ev: Dict) -> Optional[PastRace]:
+    """地方の同場同距離CONTENT代表。
+
+    generic best_content は別場同距離を含み得るため、地方で同場同距離がある時は
+    そのドメイン内だけでCONTENTを比較する。
+    """
+    rs = ev.get("exact") or []
+    if not rs:
+        return None
+    return _best_content_run(rs, ev.get("analysis_date", date.today()))
+
+
+def _local_raw_rank(ev: Dict) -> Optional[int]:
+    """同場同距離ベストのレース内生時計順位。固定秒差ではなく分布内順位を使う。"""
+    rows = (ev.get("_clusters_ref") or {}).get("rows", [])
+    n = ev.get("number")
+    for row in rows:
+        if row.get("number") == n:
+            return row.get("raw_rank")
+    return None
+
+
+def _compare_local_with_reason(a: Dict, b: Dict, direct: Dict[Tuple[int, int], Dict]) -> Tuple[int, str]:
+    """地方・短中距離の競合判断（impl17）。
+
+    v2.0-Betaの「同場同距離PEAK＋CONTENT＋REPEAT＋CURRENT」を、
+    CONTENTの辞書順1発で決めないようにする。
+
+    特に同じPEAKクラスタ内では:
+    - CONTENTが同帯なら REPEAT → CURRENT → 直接対戦 → 同場PEAK → クラス
+    - CONTENTが1帯差なら、下位CONTENT側でもPEAKが分布内で明確に上かつ
+      REPEAT/CURRENTで負けていなければ逆転可
+    - CONTENTが2帯以上違う時はCONTENT差を尊重
+
+    固定秒差・馬番・人気は使わない。
+    """
+    ae, be = bool(a.get("exact")), bool(b.get("exact"))
 
     if ae and be:
-        # 明確な時計クラスタがある場合は能力帯を先に見る。
-        if a["peak_cluster_reliable"] and b["peak_cluster_reliable"]:
-            ca, cb = a["peak_cluster"], b["peak_cluster"]
-            if ca != cb:
-                diff = abs(ca - cb)
-                upper, lower = (a, b) if ca < cb else (b, a)
+        # 明確な自然クラスタ差だけはPEAK能力帯を先に尊重。
+        if a.get("peak_cluster_reliable") and b.get("peak_cluster_reliable"):
+            ca_cl, cb_cl = a.get("peak_cluster"), b.get("peak_cluster")
+            if ca_cl != cb_cl:
+                diff = abs(ca_cl - cb_cl)
+                upper, lower = (a, b) if ca_cl < cb_cl else (b, a)
                 if diff >= 2:
-                    # 大差PEAK。ただし上位がRAW大差負け、下位がVALIDなら例外。
-                    if upper["peak_type"] == "RAW" and lower["peak_type"] == "VALID" and lower["repeat"]["grade"] >= 2:
-                        return 1 if lower is a else -1
-                    return 1 if upper is a else -1
-                # 隣接クラスタは強いCURRENT/REPEATで逆転可能。
+                    if (
+                        upper.get("peak_type") == "RAW"
+                        and lower.get("peak_type") == "VALID"
+                        and lower.get("repeat", {}).get("grade", 0) >= 2
+                    ):
+                        return (1 if lower is a else -1,
+                                "地方：大PEAK差だが上位RAW大敗を下位VALID反復が逆転")
+                    return (1 if upper is a else -1, "地方：同場同距離PEAKの大きな自然断層")
                 if _can_reverse_adjacent_cluster(lower, upper):
-                    return 1 if lower is a else -1
-                return 1 if upper is a else -1
-        # 同クラスタ/断層なしならCONTENT・REPEAT・CURRENTを強く使う。
-        return _soft_cmp(a, b, direct, use_peak_time=True)
+                    return (1 if lower is a else -1,
+                            "地方：隣接PEAKクラスタをVALID＋REPEAT/CURRENTで逆転")
+                return (1 if upper is a else -1, "地方：隣接PEAKクラスタを優先")
 
-    # 片方だけ同場同距離。強い直接実績なら地方では優先。
+        # 同クラスタ/連続分布では5軸を競合させる。
+        ar = _local_exact_content_run(a)
+        br = _local_exact_content_run(b)
+        ac = _margin_level(ar.margin) if ar is not None else 0
+        bc = _margin_level(br.margin) if br is not None else 0
+
+        if ac != bc:
+            content_diff = abs(ac - bc)
+            upper_c, lower_c = (a, b) if ac > bc else (b, a)
+            upper_band, lower_band = max(ac, bc), min(ac, bc)
+            ur = _local_raw_rank(upper_c)
+            lr = _local_raw_rank(lower_c)
+
+            # CONTENT1帯差なら、PEAKがレース内分布で2順位以上上かつ
+            # REPEAT/CURRENTで負けていない馬は逆転可能。
+            # 「0.3秒」等の固定秒差は使わない。
+            peak_clearer = (
+                content_diff == 1
+                and ur is not None and lr is not None
+                and lr + 2 <= ur
+            )
+            time_axes_not_worse = (
+                lower_c.get("repeat", {}).get("grade", 0) >= upper_c.get("repeat", {}).get("grade", 0)
+                and lower_c.get("current", {}).get("grade", 2) >= upper_c.get("current", {}).get("grade", 2)
+            )
+            if peak_clearer and time_axes_not_worse:
+                return (1 if lower_c is a else -1,
+                        "地方：CONTENT1帯差を同場PEAK順位差＋REPEAT/CURRENTで逆転")
+
+            return (1 if upper_c is a else -1,
+                    f"地方：同場同距離CONTENT帯を優先（{upper_band}>{lower_band}）")
+
+        # CONTENT同帯なら、一発の着順/日付で決めず時間軸へ。
+        agr = a.get("repeat", {}).get("grade", 0)
+        bgr = b.get("repeat", {}).get("grade", 0)
+        if agr != bgr:
+            return (1 if agr > bgr else -1, "地方：同CONTENT帯でREPEATを優先")
+
+        acu = a.get("current", {}).get("grade", 2)
+        bcu = b.get("current", {}).get("grade", 2)
+        if acu != bcu:
+            return (1 if acu > bcu else -1, "地方：同CONTENT/REPEATでCURRENTを優先")
+
+        dc = _direct_cmp(a["number"], b["number"], direct)
+        if dc:
+            return dc, "地方：同水準5軸の直接対戦をタイブレーク"
+
+        # 同場同距離PEAKは同クラスタでも消さない。分布内順位→生時計の順。
+        arank, brank = _local_raw_rank(a), _local_raw_rank(b)
+        if arank is not None and brank is not None and arank != brank:
+            return (1 if arank < brank else -1, "地方：同水準5軸で同場PEAK順位をタイブレーク")
+        if a.get("raw_exact") is not None and b.get("raw_exact") is not None:
+            ta, tb = a["raw_exact"].time_seconds, b["raw_exact"].time_seconds
+            if ta != tb:
+                return (1 if ta < tb else -1, "地方：同水準5軸で同場生時計をタイブレーク")
+
+        # クラスは最後。クラス単独でPEAK/時間軸を飛び越えさせない。
+        acl = a.get("class_value", {}).get("rank", -9)
+        bcl = b.get("class_value", {}).get("rank", -9)
+        if acl != bcl:
+            return (1 if acl > bcl else -1, "地方：同水準時のみ競争になったクラス価値")
+
+        if a.get("condition_tier", 99) != b.get("condition_tier", 99):
+            return (1 if a["condition_tier"] < b["condition_tier"] else -1,
+                    "地方：最終タイブレークのCONDITION")
+        return 0, "地方：5軸同等・順位根拠なし"
+
+    # 片方だけ同場同距離。強い直接実績なら地方では基本優先。
     if ae != be:
         ex, other = (a, b) if ae else (b, a)
-        ex_valid = ex["valid_exact"] is not None or not ex["weak_direct"]
+        ex_valid = ex.get("valid_exact") is not None or not ex.get("weak_direct", False)
         other_strong = (
-            other["valid_same"] is not None
-            and other["repeat"]["grade"] >= 2
-            and other["current"]["grade"] >= 4
+            other.get("valid_same") is not None
+            and other.get("repeat", {}).get("grade", 0) >= 2
+            and other.get("current", {}).get("grade", 2) >= 4
         )
         if ex_valid and not other_strong:
-            return 1 if ex is a else -1
-        if ex["weak_direct"] and other_strong:
-            return 1 if other is a else -1
+            return (1 if ex is a else -1, "地方：有効な同場同距離の直接証拠を優先")
+        if ex.get("weak_direct", False) and other_strong:
+            return (1 if other is a else -1, "地方：弱い直接を強い同距離/近接証拠が逆転")
 
-    # 同場直接が弱い/無い場合は条件近接＋内容を比較。
-    if a["condition_tier"] != b["condition_tier"]:
-        # 直接実績が弱い場合は非常に強い隣接が逆転可。
-        if a["weak_direct"] and b["peak_type"] == "VALID" and b["best_content"] and _margin_level(b["best_content"].margin) >= 4:
-            return -1
-        if b["weak_direct"] and a["peak_type"] == "VALID" and a["best_content"] and _margin_level(a["best_content"].margin) >= 4:
-            return 1
-        return 1 if a["condition_tier"] < b["condition_tier"] else -1
-    return _soft_cmp(a, b, direct, use_peak_time=False)
+    # 同場直接が弱い/無い場合はCONDITION＋5軸。
+    if a.get("condition_tier", 99) != b.get("condition_tier", 99):
+        if a.get("weak_direct", False) and b.get("peak_type") == "VALID" and b.get("best_content") and _margin_level(b["best_content"].margin) >= 4:
+            return -1, "地方：弱い直接を強い補助証拠が逆転"
+        if b.get("weak_direct", False) and a.get("peak_type") == "VALID" and a.get("best_content") and _margin_level(a["best_content"].margin) >= 4:
+            return 1, "地方：弱い直接を強い補助証拠が逆転"
+        return (1 if a["condition_tier"] < b["condition_tier"] else -1,
+                "地方：同場同距離が弱い/無いのでCONDITION")
 
+    c = _soft_cmp(a, b, direct, use_peak_time=False)
+    return c, "地方：補助証拠の5軸比較"
+
+
+def _compare_local(a: Dict, b: Dict, direct: Dict[Tuple[int, int], Dict]) -> int:
+    return _compare_local_with_reason(a, b, direct)[0]
 
 def _compare_jra_middle_with_reason(
     a: Dict,
@@ -2415,8 +2524,7 @@ def compare_evals_with_reason(a: Dict, b: Dict, race: RaceInfo, direct: Dict[Tup
 
     if race.distance >= 2000:
         return _compare_long_with_reason(a, b, direct)
-    c = compare_evals(a, b, race, direct)
-    return c, "地方・その他ルール（同場同距離＋5軸）"
+    return _compare_local_with_reason(a, b, direct)
 
 
 def compare_evals(a: Dict, b: Dict, race: RaceInfo, direct: Dict[Tuple[int, int], Dict]) -> int:
@@ -3244,7 +3352,7 @@ with tab1:
         st.write("**ガード後TOP6：** " + "・".join(map(str, pred["top6"])))
 
         st.markdown("### 通常時計順位 TOP8")
-        st.caption("人気・オッズ・ガードを使わず作成。JRA1600〜1800mは5軸＋共有同距離レース、2000m以上は同場同距離専用のVALID PEAK＋CONTENT/REPEAT/CURRENTで監査。別場生時計は直接比較しません。")
+        st.caption("人気・オッズ・ガードを使わず作成。JRA1600〜1800mは5軸＋共有同距離レース、地方短中距離は同場同距離PEAK＋CONTENT/REPEAT/CURRENTの競合比較、2000m以上は専用LONG監査。別場生時計は直接比較しません。")
         st.dataframe(pd.DataFrame(pred["normal_rows"]), use_container_width=True, hide_index=True)
 
         st.markdown("### 5軸評価")
