@@ -543,7 +543,7 @@ def parse_horse_histories(text: str, entries: Optional[List[Entry]] = None) -> D
 
 RULESET_ID = "CLOCK_RULEBOOK_V2_0_BETA_PYTHON_FROZEN_2026-08-13"
 RULESET_NAME = "時計分析 完全ルールブック v2.0-Beta【完全Python自動判定】"
-IMPLEMENTATION_REV = "python-engine-12-local-long-evidence-order"
+IMPLEMENTATION_REV = "python-engine-13-long-domain-valid-peak"
 
 RULEBOOK_TEXT = r"""
 【0｜目的】
@@ -1336,6 +1336,33 @@ def build_horse_eval(race: RaceInfo, e: Entry, h: Optional[HorseHistory], race_d
     current = _current_state(last3, comp, race, race_date, clusters)
     classv = _class_value(same if same else (adj_same + adj_other), race)
 
+    # 2000m以上専用。地方長距離では「今回と同じ場・同じ距離」の内容を
+    # genericな全同距離/隣接のCONTENTより先に独立保持する。
+    # impl12まではbest_content/repeat/currentが別場同距離を混ぜ得たため、
+    # 同場同距離PEAKとCONTENTの対応が崩れるケースがあった。
+    if exact:
+        long_domain_runs = _recent(list(exact))
+        long_domain_source = "同場同距離"
+    elif same:
+        long_domain_runs = _recent(list(same))
+        long_domain_source = "別場含む同距離"
+    elif adj_same:
+        long_domain_runs = _recent(list(adj_same))
+        long_domain_source = "同場隣接"
+    else:
+        long_domain_runs = _recent(list(adj_other))
+        long_domain_source = "別場隣接" if adj_other else "材料薄"
+
+    long_content = _content_profile(long_domain_runs, race_date)
+    long_repeat = _repeat_profile_for_domain(long_domain_runs, race, clusters)
+    long_current = _current_for_domain(long_domain_runs, race, race_date, clusters)
+    long_class = _competitive_class_profile(long_domain_runs, race, race_date)
+    long_valid_exact = _best_time_run([
+        r for r in exact if r.margin is not None and r.margin <= 1.0
+    ])
+    long_exact_margins = [r.margin for r in exact if r.margin is not None]
+    long_exact_weak = bool(long_exact_margins) and min(long_exact_margins) > 1.5
+
     direct_known_margins = [r.margin for r in same if r.margin is not None]
     weak_direct = bool(direct_known_margins) and min(direct_known_margins) > 2.5
 
@@ -1491,6 +1518,14 @@ def build_horse_eval(race: RaceInfo, e: Entry, h: Optional[HorseHistory], race_d
         "current": current,
         "class_value": classv,
         "weak_direct": weak_direct,
+        "long_domain_runs": long_domain_runs,
+        "long_domain_source": long_domain_source,
+        "long_content": long_content,
+        "long_repeat": long_repeat,
+        "long_current": long_current,
+        "long_class": long_class,
+        "long_valid_exact": long_valid_exact,
+        "long_exact_weak": long_exact_weak,
         "jra_tier": jra_tier,
         "jra_run": jra_run,
         "jra_content_tuple": _content_core_tuple(jra_run, race_date),
@@ -2079,132 +2114,192 @@ def _long_tier(ev: Dict) -> int:
 
 
 def _long_other_strong(ev: Dict) -> bool:
-    """同場同距離の弱材料を逆転できるだけの別条件証拠か。"""
-    same_good = [r for r in ev["same"] if r.margin is not None and r.margin <= 0.6]
-    adj_good = [r for r in ev["adj_same"] + ev["adj_other"] if r.margin is not None and r.margin <= 0.3]
+    """弱い同場直接を逆転できるだけの別条件証拠か。
+
+    2000m+では別場生時計そのものは比較せず、CONTENTの強さと
+    REPEAT/CURRENTの裏付けだけを見る。
+    """
+    lc = ev.get("long_content", {})
+    lr = ev.get("long_repeat", {})
+    cur = ev.get("long_current", {})
     return (
-        (len(same_good) >= 2 or len(adj_good) >= 2)
-        and ev["repeat"]["grade"] >= 2
-        and ev["current"]["grade"] >= 3
+        lc.get("best_band", 0) >= 4
+        and lc.get("close06", 0) >= 1
+        and lr.get("grade", 0) >= 2
+        and cur.get("grade", 2) >= 2
     )
 
 
-def _compare_long_with_reason(a: Dict, b: Dict, direct: Dict[Tuple[int, int], Dict]) -> Tuple[int, str]:
-    """2000m以上の比較。
+def _long_valid_cluster(ev: Dict) -> Optional[int]:
+    r = ev.get("long_valid_exact")
+    clusters = ev.get("_clusters_ref") or {}
+    if r is None or r.time_seconds is None or not clusters.get("reliable"):
+        return None
+    return _cluster_for_time(r.time_seconds, clusters)
 
-    地方長距離では同場同距離を共通物差しとして強く使う。
-    同場同距離同士は PEAK（自然クラスタ）→CONTENT/REPEAT/CURRENT、
-    別場同距離の生時計は秒数で直接比較しない。
+
+def _long_domain_cmp(a: Dict, b: Dict, direct: Dict[Tuple[int, int], Dict], use_exact_time: bool) -> Tuple[int, str]:
+    """2000m+の同じ証拠ドメイン内比較。
+
+    CONTENT→REPEAT→CURRENT→競争になったクラス→直接対戦→同場生時計。
+    ここで使うCONTENT/REPEAT/CURRENTはlong_domain専用で、同場同距離が
+    ある馬に別場同距離の最高CONTENTを混ぜない。
+    """
+    ca, cb = a.get("long_content", {}), b.get("long_content", {})
+    if ca.get("key") != cb.get("key"):
+        return (1 if ca.get("key") > cb.get("key") else -1,
+                "2000m+：主証拠ドメインのCONTENT")
+
+    ra, rb = a.get("long_repeat", {}), b.get("long_repeat", {})
+    if ra.get("grade", 0) != rb.get("grade", 0):
+        return (1 if ra.get("grade", 0) > rb.get("grade", 0) else -1,
+                "2000m+：主証拠ドメインのREPEAT")
+
+    cua, cub = a.get("long_current", {}), b.get("long_current", {})
+    if cua.get("grade", 2) != cub.get("grade", 2):
+        return (1 if cua.get("grade", 2) > cub.get("grade", 2) else -1,
+                "2000m+：主証拠ドメインのCURRENT")
+
+    cla, clb = a.get("long_class", {}), b.get("long_class", {})
+    if cla.get("key") != clb.get("key"):
+        return (1 if cla.get("key") > clb.get("key") else -1,
+                "2000m+：競争になったクラス価値")
+
+    dc = _direct_cmp(a["number"], b["number"], direct)
+    if dc:
+        return dc, "2000m+：直接対戦"
+
+    if use_exact_time and a.get("raw_exact") is not None and b.get("raw_exact") is not None:
+        ta, tb = a["raw_exact"].time_seconds, b["raw_exact"].time_seconds
+        if ta != tb:
+            return (1 if ta < tb else -1,
+                    "2000m+：同場同距離生時計・最終タイブレーク")
+
+    return 0, "2000m+：主証拠ドメイン同等"
+
+
+def _compare_long_with_reason(a: Dict, b: Dict, direct: Dict[Tuple[int, int], Dict]) -> Tuple[int, str]:
+    """2000m以上の比較（impl13）。
+
+    1) 同場同距離が両方ある場合はVALID PEAKをRAW PEAKより信頼。
+    2) VALID同士で自然断層がある時だけPEAK帯を先に固定。
+    3) 同帯/断層なしは、その同場同距離だけのCONTENT→REPEAT→CURRENT。
+    4) 片方だけ同場同距離でも、その直接実績が1.5秒超しかなく、相手に
+       強い同距離/隣接VALID反復がある時は逆転を許す。
+    5) 別場同士は生時計秒数を直接比較しない。
     """
     ae, be = bool(a["exact"]), bool(b["exact"])
 
-    # 両馬に同場同距離。まず自然なPEAK差を尊重。
     if ae and be:
-        if (
-            a["peak_cluster_reliable"] and b["peak_cluster_reliable"]
-            and a["peak_cluster"] != b["peak_cluster"]
-        ):
-            ca, cb = a["peak_cluster"], b["peak_cluster"]
-            upper, lower = (a, b) if ca < cb else (b, a)
-            diff = abs(ca - cb)
-            if diff >= 2:
-                # 大PEAK差。ただし上位がRAW大敗一発で、下位がVALIDを反復する時だけ例外。
+        av, bv = a.get("long_valid_exact") is not None, b.get("long_valid_exact") is not None
+
+        # VALID PEAKの有無をRAW最速より先に見る。RAW大敗一発の過大評価を防ぐ。
+        if av != bv:
+            valid_ev, raw_ev = (a, b) if av else (b, a)
+            # RAW側にも強い反復CONTENTがある場合だけ即決せずドメイン比較へ。
+            raw_c = raw_ev.get("long_content", {})
+            raw_r = raw_ev.get("long_repeat", {})
+            if not (raw_c.get("best_band", 0) >= 4 and raw_r.get("grade", 0) >= 2):
+                return (1 if valid_ev is a else -1,
+                        "2000m+：VALID同場PEAKをRAW大敗PEAKより優先")
+
+        # 両方VALIDなら、VALID時計が所属する自然クラスタを比較。
+        if av and bv:
+            ca, cb = _long_valid_cluster(a), _long_valid_cluster(b)
+            if ca is not None and cb is not None and ca != cb:
+                upper, lower = (a, b) if ca < cb else (b, a)
+                diff = abs(ca - cb)
+                if diff >= 2:
+                    return (1 if upper is a else -1,
+                            "2000m+：VALID同場PEAKの大きな自然断層")
+                # 隣接クラスタはCONTENT/REPEAT/CURRENTが明確なら逆転可。
+                lc_u, lc_l = upper.get("long_content", {}), lower.get("long_content", {})
+                lr_l, cu_l = lower.get("long_repeat", {}), lower.get("long_current", {})
                 if (
-                    upper["peak_type"] == "RAW"
-                    and lower["peak_type"] == "VALID"
-                    and lower["repeat"]["grade"] >= 2
-                    and lower["current"]["grade"] >= 3
+                    lc_l.get("best_band", 0) >= lc_u.get("best_band", 0) + 2
+                    and lr_l.get("grade", 0) >= 2
+                    and cu_l.get("grade", 2) >= 3
                 ):
-                    return (1 if lower is a else -1, "2000m+：大PEAK差だがRAW一発をVALID反復が逆転")
-                return (1 if upper is a else -1, "2000m+：同場同距離PEAKの大きな自然断層")
-            # 隣接クラスタは、下位側が再現性・現在値・内容で明確に強い時だけ逆転。
-            lower_content = _margin_level(lower["best_content"].margin) if lower["best_content"] else 0
-            upper_content = _margin_level(upper["best_content"].margin) if upper["best_content"] else 0
-            if (
-                lower["peak_type"] == "VALID"
-                and lower["repeat"]["grade"] >= 2
-                and lower["current"]["grade"] >= 4
-                and lower_content >= upper_content + 2
-            ):
-                return (1 if lower is a else -1, "2000m+：隣接PEAKをCONTENT・REPEAT・CURRENTで逆転")
-            return (1 if upper is a else -1, "2000m+：同場同距離PEAKの自然クラスタ")
+                    return (1 if lower is a else -1,
+                            "2000m+：隣接VALID PEAKをCONTENT・REPEAT・CURRENTで逆転")
+                return (1 if upper is a else -1,
+                        "2000m+：VALID同場PEAKの自然クラスタ")
 
-        c = _soft_cmp(a, b, direct, use_peak_time=True)
-        if c:
-            return c, "2000m+：同PEAK帯をCONTENT・REPEAT・CURRENTで比較"
-        return 0, "2000m+：同場同距離5軸同等"
+        # 自然断層なし/片方RAWは同場同距離ドメインの中身で決める。
+        return _long_domain_cmp(a, b, direct, use_exact_time=True)
 
-    # 片方だけ同場同距離。地方2000m+では基本的に直接証拠を優先。
     if ae != be:
         ex, other = (a, b) if ae else (b, a)
-        # 全ての直接同距離が2.5秒超級の大敗なら、強い別場同距離/隣接が逆転可。
-        if ex["weak_direct"] and _long_other_strong(other):
-            return (1 if other is a else -1, "2000m+：弱い同場直接を強い別条件反復が逆転")
-        return (1 if ex is a else -1, "2000m+：同場同距離の直接証拠を優先")
+        # 直接実績が1.5秒超しかない時は「距離経験があるだけ」で保護しない。
+        if ex.get("long_exact_weak") and _long_other_strong(other):
+            return (1 if other is a else -1,
+                    "2000m+：弱い同場直接を強い同距離/隣接反復が逆転")
+        return (1 if ex is a else -1,
+                "2000m+：有効な同場同距離の直接証拠を優先")
 
-    # 両馬とも同場同距離なし。別場同距離を隣接より基本優先するが、
-    # 別場の生時計秒数は直接比較しない。
+    # 同場同距離なし。別場同距離→隣接の直接性は維持するが、
+    # 強い隣接が弱い別場同距離を上回る例外を残す。
     ta, tb = _long_tier(a), _long_tier(b)
     if ta != tb:
-        # 強い隣接(2)は、内容の弱い別場同距離(1)を例外的に逆転可。
         if {ta, tb} == {1, 2}:
             same_ev, adj_ev = (a, b) if ta == 1 else (b, a)
-            same_best = _margin_level(same_ev["best_content"].margin) if same_ev["best_content"] else 0
-            adj_best = _margin_level(adj_ev["best_content"].margin) if adj_ev["best_content"] else 0
-            if adj_best >= same_best + 2 and adj_ev["repeat"]["grade"] >= 2:
-                return (1 if adj_ev is a else -1, "2000m+：強い隣接が弱い別場同距離を逆転")
+            sc, ac = same_ev.get("long_content", {}), adj_ev.get("long_content", {})
+            ar = adj_ev.get("long_repeat", {})
+            if ac.get("best_band", 0) >= sc.get("best_band", 0) + 2 and ar.get("grade", 0) >= 2:
+                return (1 if adj_ev is a else -1,
+                        "2000m+：強い隣接が弱い別場同距離を逆転")
         winner = a if ta < tb else b
-        return (1 if winner is a else -1, "2000m+：同距離証拠の直接性")
+        return (1 if winner is a else -1,
+                "2000m+：同距離証拠の直接性")
 
-    c = _soft_cmp(a, b, direct, use_peak_time=False)
-    if c:
-        return c, "2000m+：別場生時計を比較せずCONTENT・REPEAT・CURRENT"
-    return 0, "2000m+：5軸同等"
-
+    return _long_domain_cmp(a, b, direct, use_exact_time=False)
 
 def _compare_long(a: Dict, b: Dict, direct: Dict[Tuple[int, int], Dict]) -> int:
     return _compare_long_with_reason(a, b, direct)[0]
 
 
 def _long_seed_key(race: RaceInfo, ev: Dict) -> Tuple:
-    """2000m以上の推移的な初期順位。
+    """2000m+の推移的seed（impl13）。
 
-    同場同距離ありを先に置き、その中では自然PEAK→同場生時計→VALID性→
-    CONTENT/REPEAT/CURRENT。生時計を使うのは同じ今回競馬場・同距離だけ。
-    同場同距離が無い馬では別場生時計をキーに入れない。
+    seedでもRAW生時計をCONTENTより前に置かない。
+    同場同距離ではVALID PEAK→自然クラスタ→CONTENT→REPEAT→CURRENT→
+    競争になったクラス→RAW生時計の順。最終順位はpairwise監査で確定する。
     """
-    peak_type_score = {"VALID": 2, "RAW": 1, "不明": 0}.get(ev["peak_type"], 0)
     exact = bool(ev["exact"])
+    lc = ev.get("long_content", {})
+    lr = ev.get("long_repeat", {})
+    cu = ev.get("long_current", {})
+    cl = ev.get("long_class", {})
+
     if exact:
-        cluster_score = -ev["peak_cluster"] if ev["peak_cluster_reliable"] else -99
-        raw_time = -ev["raw_exact"].time_seconds if ev["raw_exact"] is not None else -9999.0
-        # weak_directは「全同距離が2.5秒超」の時だけ。単発大敗時計そのものは
-        # PEAKとして残し、CONTENT/REPEATで信頼度を調整する。
+        valid_flag = 1 if ev.get("long_valid_exact") is not None else 0
+        vcluster = _long_valid_cluster(ev)
+        cluster_score = -vcluster if vcluster is not None else -99
+        raw_time = -ev["raw_exact"].time_seconds if ev.get("raw_exact") is not None else -9999.0
         return (
-            3 if not ev["weak_direct"] else 2,
+            3 if not ev.get("long_exact_weak") else 2,
+            valid_flag,
             cluster_score,
+            lc.get("key", (0,)),
+            lr.get("grade", 0),
+            cu.get("grade", 2),
+            cl.get("key", (-9,)),
             raw_time,
-            peak_type_score,
-            ev["best_content_tuple"],
-            ev["repeat"]["grade"],
-            ev["current"]["grade"],
-            ev["class_value"]["rank"],
-            -ev["condition_tier"],
+            -ev.get("condition_tier", 99),
         )
 
     tier = _long_tier(ev)
     return (
         1,
+        1 if ev.get("peak_type") == "VALID" else 0,
         -tier,
-        0.0,  # 別場生時計秒数はランキングキーにしない
-        peak_type_score,
-        ev["best_content_tuple"],
-        ev["repeat"]["grade"],
-        ev["current"]["grade"],
-        ev["class_value"]["rank"],
-        -ev["condition_tier"],
+        lc.get("key", (0,)),
+        lr.get("grade", 0),
+        cu.get("grade", 2),
+        cl.get("key", (-9,)),
+        0.0,  # 別場生時計秒数は絶対にseedへ入れない
+        -ev.get("condition_tier", 99),
     )
-
 
 def compare_evals_with_reason(a: Dict, b: Dict, race: RaceInfo, direct: Dict[Tuple[int, int], Dict]) -> Tuple[int, str]:
     """比較結果と、実際にreturnした決着理由を返す。
@@ -2494,10 +2589,10 @@ def rank_evals(race: RaceInfo, evals: Dict[int, Dict], direct: Dict[Tuple[int, i
         tail_final = [ev for ev in ordered if ev["number"] not in head_nums]
         cycle_detected = False
     elif race.distance >= 2000:
-        # impl12: 2000m以上は総当たり勝数を初期順位にしない。
+        # impl13: 2000m以上は総当たり勝数を初期順位にせず、同場ドメイン専用5軸を使う。
         # 非推移の勝数で、同場同距離PEAKの序列が崩れるのを防ぐ。
         ordered = sorted(items, key=lambda ev: _long_seed_key(race, ev), reverse=True)
-        seed_mode = "2000m+同場同距離PEAK seed＋安定挿入監査"
+        seed_mode = "2000m+VALID PEAK＋同場CONTENT seed＋安定挿入監査"
         audit_len = min(8, len(ordered))
         baseline_head = tuple(ev["number"] for ev in ordered[:audit_len])
         baseline_all = tuple(ev["number"] for ev in ordered)
@@ -2826,6 +2921,14 @@ def _five_axis_row(ev: Dict) -> Dict:
         "REPEAT": f"{ev['repeat']['label']}（好内容{ev['repeat']['content_high']}／時計再現{ev['repeat']['clock_high'] if ev['repeat'].get('clock_known') else '判定不能'}）",
         "CURRENT": f"{ev['current']['label']}｜{ev['current']['detail']}",
         "クラス価値": ev["class_value"]["label"],
+        "LONG主証拠": ev.get("long_domain_source", "材料薄"),
+        "LONG_VALID同場": "○" if ev.get("long_valid_exact") is not None else "—",
+        "LONG直接弱": "○" if ev.get("long_exact_weak") else "—",
+        "LONG_CONTENT帯": ev.get("long_content", {}).get("best_band", 0),
+        "LONG_CONTENT2本目": ev.get("long_content", {}).get("second_band", 0),
+        "LONG_REP": ev.get("long_repeat", {}).get("label", "材料不足"),
+        "LONG_REP母数": ev.get("long_repeat", {}).get("denominator", 0),
+        "LONG_CURRENT": ev.get("long_current", {}).get("label", "判定不能"),
         "JRA主証拠": (
             f"{ev.get('jra_primary_source','材料薄')}／{_margin_label(ev['jra_primary_best'].margin)}／class{ev['jra_primary_best'].class_rank}"
             if ev.get("jra_primary_best") is not None else "材料薄"
@@ -3038,7 +3141,7 @@ with tab1:
         st.write("**ガード後TOP6：** " + "・".join(map(str, pred["top6"])))
 
         st.markdown("### 通常時計順位 TOP8")
-        st.caption("人気・オッズ・ガードを使わず作成。JRA1600〜1800mは5軸＋共有同距離レースでseedを作り、安定挿入＋強いpairwise優勢で経路依存を再監査。REPEATは悪走込み直近5走、CURRENTは直近3走。")
+        st.caption("人気・オッズ・ガードを使わず作成。JRA1600〜1800mは5軸＋共有同距離レース、2000m以上は同場同距離専用のVALID PEAK＋CONTENT/REPEAT/CURRENTで監査。別場生時計は直接比較しません。")
         st.dataframe(pd.DataFrame(pred["normal_rows"]), use_container_width=True, hide_index=True)
 
         st.markdown("### 5軸評価")
