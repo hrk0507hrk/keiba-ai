@@ -543,7 +543,7 @@ def parse_horse_histories(text: str, entries: Optional[List[Entry]] = None) -> D
 
 RULESET_ID = "CLOCK_RULEBOOK_V2_0_BETA_PYTHON_FROZEN_2026-08-13"
 RULESET_NAME = "時計分析 完全ルールブック v2.0-Beta【完全Python自動判定】"
-IMPLEMENTATION_REV = "python-engine-21-local-current-divergence-peak-respect"
+IMPLEMENTATION_REV = "python-engine-22-local-going-valid-peak"
 
 RULEBOOK_TEXT = r"""
 【0｜目的】
@@ -1306,6 +1306,13 @@ def build_horse_eval(race: RaceInfo, e: Entry, h: Optional[HorseHistory], race_d
     raw_exact = _best_time_run(exact)
     raw_same = _best_time_run(same)
     valid_exact = _best_time_run([r for r in exact if r.margin is not None and r.margin <= 1.0])
+    same_going_exact = [r for r in exact if r.going == race.going]
+    same_going_valid = _best_time_run([
+        r for r in same_going_exact if r.margin is not None and r.margin <= 1.0
+    ])
+    same_going_strong = _best_content_run([
+        r for r in same_going_exact if r.margin is not None and r.margin <= 0.3
+    ], race_date)
     valid_same = _best_content_run([r for r in same if r.margin is not None and r.margin <= 1.0], race_date)
     valid_adj_same = _best_content_run([r for r in adj_same if r.margin is not None and r.margin <= 1.0], race_date)
     valid_adj_other = _best_content_run([r for r in adj_other if r.margin is not None and r.margin <= 1.0], race_date)
@@ -1511,6 +1518,9 @@ def build_horse_eval(race: RaceInfo, e: Entry, h: Optional[HorseHistory], race_d
         "raw_exact": raw_exact,
         "raw_same": raw_same,
         "valid_exact": valid_exact,
+        "same_going_exact": same_going_exact,
+        "same_going_valid": same_going_valid,
+        "same_going_strong": same_going_strong,
         "valid_same": valid_same,
         "peak_type": peak_type,
         "peak_run": peak_run,
@@ -1828,6 +1838,49 @@ def _local_raw_rank(ev: Dict) -> Optional[int]:
     return None
 
 
+def _local_same_going_condition_edge(a: Dict, b: Dict) -> int:
+    """同場同距離＋今回馬場の強いVALID内容をCONDITIONとして保護する。
+
+    一方だけが今回と同じ馬場で勝利/0.3以内を持ち、相手に同馬場VALIDが無い時、
+    「今回馬場の強い直接証拠」を優先候補にする。
+
+    ただし別馬場側のVALID PEAKが明確に上なら馬場だけで逆転しない。
+    固定秒差は使わず、
+    - strong側のVALID PEAK自体が相手以上なら優先
+    - strong側が少し遅くても、同場生時計順位が隣接（1順位差以内）なら
+      CONDITION差で優先
+    とする。
+    """
+    a_strong = a.get("same_going_strong") is not None
+    b_strong = b.get("same_going_strong") is not None
+    if a_strong == b_strong:
+        return 0
+
+    strong, other = (a, b) if a_strong else (b, a)
+
+    # 相手にも今回馬場で1.0以内のVALIDがあるなら、馬場条件だけで固定しない。
+    if other.get("same_going_valid") is not None:
+        return 0
+
+    sv = strong.get("valid_exact")
+    ov = other.get("valid_exact")
+    if sv is None or sv.time_seconds is None:
+        return 0
+
+    # strong側のVALID PEAKが相手以上なら、今回馬場の強いCONTENTを素直に優先。
+    if ov is None or ov.time_seconds is None or sv.time_seconds <= ov.time_seconds:
+        return 1 if strong is a else -1
+
+    # strong側が少し遅い時は、レース内の同場生時計順位が隣接している場合だけ
+    # CONDITION差で逆転を許す。大きなPEAK差は維持する。
+    sr = _local_raw_rank(strong)
+    orr = _local_raw_rank(other)
+    if sr is not None and orr is not None and abs(sr - orr) <= 1:
+        return 1 if strong is a else -1
+
+    return 0
+
+
 def _local_clear_peak_edge(a: Dict, b: Dict) -> int:
     """地方短中距離で、同場同距離PEAK差が分布内で明確な時だけ返す。
 
@@ -1865,7 +1918,10 @@ def _local_clear_peak_edge(a: Dict, b: Dict) -> int:
     slower = b if faster is a else a
 
     # RAW大敗の一発時計はここでは固定優先しない。
-    if faster.get("peak_type") != "VALID":
+    # horse-level peak_type ではなく、比較に使う raw_exact そのもののCONTENTを見る。
+    # 別の遅いVALID走を持つだけで、大敗RAW最速をVALID PEAK扱いしない。
+    faster_raw = faster.get("raw_exact")
+    if faster_raw is None or faster_raw.margin is None or faster_raw.margin > 1.0:
         return 0
 
     return 1 if faster is a else -1
@@ -1888,6 +1944,13 @@ def _compare_local_with_reason(a: Dict, b: Dict, direct: Dict[Tuple[int, int], D
     ae, be = bool(a.get("exact")), bool(b.get("exact"))
 
     if ae and be:
+        # impl22: CONDITIONは点数ではなく証拠信頼度フィルター。
+        # 同場同距離＋今回馬場で勝利/0.3以内の強いVALIDを片方だけが持つ場合、
+        # 明確なPEAK差が無ければ今回馬場の直接証拠を優先する。
+        going_edge = _local_same_going_condition_edge(a, b)
+        if going_edge:
+            return going_edge, "地方：同場同距離＋今回馬場の強いVALIDをCONDITION優先"
+
         # 明確な自然クラスタ差だけはPEAK能力帯を先に尊重。
         if a.get("peak_cluster_reliable") and b.get("peak_cluster_reliable"):
             ca_cl, cb_cl = a.get("peak_cluster"), b.get("peak_cluster")
@@ -2008,14 +2071,12 @@ def _compare_local_with_reason(a: Dict, b: Dict, direct: Dict[Tuple[int, int], D
             return (1 if acu > bcu else -1,
                     "地方：同CONTENT/REPEAT・明確なCURRENT方向差を優先")
 
-        if (
-            a.get("peak_type") == "VALID"
-            and b.get("peak_type") == "VALID"
-            and arank is not None and brank is not None
-            and arank != brank
-        ):
-            return (1 if arank < brank else -1,
-                    "地方：同CONTENT/REPEAT・CURRENT差小のためVALID同場PEAK順位を優先")
+        if a.get("valid_exact") is not None and b.get("valid_exact") is not None:
+            av = a["valid_exact"].time_seconds
+            bv = b["valid_exact"].time_seconds
+            if av is not None and bv is not None and av != bv:
+                return (1 if av < bv else -1,
+                        "地方：同CONTENT/REPEAT・CURRENT差小のためVALID同場PEAK時計を優先")
 
         if acu != bcu:
             return (1 if acu > bcu else -1,
@@ -2025,14 +2086,17 @@ def _compare_local_with_reason(a: Dict, b: Dict, direct: Dict[Tuple[int, int], D
         if dc:
             return dc, "地方：同水準5軸の直接対戦をタイブレーク"
 
-        # 同場同距離PEAKは同クラスタでも消さない。分布内順位→生時計の順。
-        arank, brank = _local_raw_rank(a), _local_raw_rank(b)
-        if arank is not None and brank is not None and arank != brank:
-            return (1 if arank < brank else -1, "地方：同水準5軸で同場PEAK順位をタイブレーク")
+        # 同場同距離PEAKは同クラスタでも消さない。
+        # impl22: VALID PEAK同士を先に比較し、その後だけRAW生時計を補助タイブレークにする。
+        if a.get("valid_exact") is not None and b.get("valid_exact") is not None:
+            av = a["valid_exact"].time_seconds
+            bv = b["valid_exact"].time_seconds
+            if av is not None and bv is not None and av != bv:
+                return (1 if av < bv else -1, "地方：同水準5軸でVALID同場PEAK時計をタイブレーク")
         if a.get("raw_exact") is not None and b.get("raw_exact") is not None:
             ta, tb = a["raw_exact"].time_seconds, b["raw_exact"].time_seconds
             if ta != tb:
-                return (1 if ta < tb else -1, "地方：同水準5軸で同場生時計をタイブレーク")
+                return (1 if ta < tb else -1, "地方：同水準5軸でRAW同場生時計を補助タイブレーク")
 
         # クラスは最後。クラス単独でPEAK/時間軸を飛び越えさせない。
         acl = a.get("class_value", {}).get("rank", -9)
