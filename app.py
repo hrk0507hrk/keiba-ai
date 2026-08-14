@@ -543,7 +543,7 @@ def parse_horse_histories(text: str, entries: Optional[List[Entry]] = None) -> D
 
 RULESET_ID = "CLOCK_RULEBOOK_V2_0_BETA_PYTHON_FROZEN_2026-08-13"
 RULESET_NAME = "時計分析 完全ルールブック v2.0-Beta【完全Python自動判定】"
-IMPLEMENTATION_REV = "python-engine-20-local-valid-peak-boundary-density"
+IMPLEMENTATION_REV = "python-engine-21-local-current-divergence-peak-respect"
 
 RULEBOOK_TEXT = r"""
 【0｜目的】
@@ -1996,9 +1996,30 @@ def _compare_local_with_reason(a: Dict, b: Dict, direct: Dict[Tuple[int, int], D
         if clear_peak:
             return clear_peak, "地方：同CONTENT/REPEATで明確なVALID PEAK差をCURRENTより優先"
 
-        # PEAK差が明確でない同能力帯ではCURRENTを優先。
+        # impl21:
+        # PEAK差が自然断層ほど大きくなくても、v2.0-Betaでは
+        # 「CURRENT差が小さければPEAKを尊重する」。
+        # CURRENTの離散gradeは 0=下降 / 2=横ばい・不明 / 4=上昇・高水準維持 なので、
+        # 4対0の明確な方向差だけはCURRENTを先に使う。
+        # 4対2 / 2対0程度なら、両馬がVALID同場同距離PEAKを持つ場合は
+        # 同場PEAK順位を先に確認し、わずかなCURRENT差だけでPEAKを消さない。
+        current_clear_divergence = abs(acu - bcu) >= 4
+        if acu != bcu and current_clear_divergence:
+            return (1 if acu > bcu else -1,
+                    "地方：同CONTENT/REPEAT・明確なCURRENT方向差を優先")
+
+        if (
+            a.get("peak_type") == "VALID"
+            and b.get("peak_type") == "VALID"
+            and arank is not None and brank is not None
+            and arank != brank
+        ):
+            return (1 if arank < brank else -1,
+                    "地方：同CONTENT/REPEAT・CURRENT差小のためVALID同場PEAK順位を優先")
+
         if acu != bcu:
-            return (1 if acu > bcu else -1, "地方：同CONTENT/REPEAT・近いPEAKでCURRENTを優先")
+            return (1 if acu > bcu else -1,
+                    "地方：PEAK同等でCURRENTをタイブレーク")
 
         dc = _direct_cmp(a["number"], b["number"], direct)
         if dc:
