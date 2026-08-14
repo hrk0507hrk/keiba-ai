@@ -543,7 +543,7 @@ def parse_horse_histories(text: str, entries: Optional[List[Entry]] = None) -> D
 
 RULESET_ID = "CLOCK_RULEBOOK_V2_0_BETA_PYTHON_FROZEN_2026-08-13"
 RULESET_NAME = "時計分析 完全ルールブック v2.0-Beta【完全Python自動判定】"
-IMPLEMENTATION_REV = "python-engine-19-local-smooth-conflict-fix"
+IMPLEMENTATION_REV = "python-engine-20-local-valid-peak-boundary-density"
 
 RULEBOOK_TEXT = r"""
 【0｜目的】
@@ -1828,6 +1828,49 @@ def _local_raw_rank(ev: Dict) -> Optional[int]:
     return None
 
 
+def _local_clear_peak_edge(a: Dict, b: Dict) -> int:
+    """地方短中距離で、同場同距離PEAK差が分布内で明確な時だけ返す。
+
+    返り値: a優勢=1 / b優勢=-1 / 明確差なし=0。
+
+    固定秒差は使わず、そのレースの同場同距離時計の正の隣接gap中央値を
+    基準にする。v2.0-Betaの「大きいVALID PEAK差はCURRENTだけで簡単に
+    逆転しない」を実装するための補助判定。
+    """
+    ar = a.get("raw_exact")
+    br = b.get("raw_exact")
+    if ar is None or br is None or ar.time_seconds is None or br.time_seconds is None:
+        return 0
+    if ar.time_seconds == br.time_seconds:
+        return 0
+
+    rows = (a.get("_clusters_ref") or b.get("_clusters_ref") or {}).get("rows", [])
+    times = sorted(float(x["time"]) for x in rows if x.get("time") is not None)
+    gaps = [times[i + 1] - times[i] for i in range(len(times) - 1)]
+    positive = [g for g in gaps if g > 1e-9]
+    if not positive:
+        return 0
+
+    typical = statistics.median(positive)
+    if typical <= 0:
+        return 0
+
+    delta = abs(float(ar.time_seconds) - float(br.time_seconds))
+    # 自然クラスタが作れない滑らかな分布でも、局所gapの典型値を大きく
+    # 上回る差は「同じPEAK」とは扱わない。倍率は既存の自然断層判定と同じ。
+    if delta <= typical * 2.5:
+        return 0
+
+    faster = a if ar.time_seconds < br.time_seconds else b
+    slower = b if faster is a else a
+
+    # RAW大敗の一発時計はここでは固定優先しない。
+    if faster.get("peak_type") != "VALID":
+        return 0
+
+    return 1 if faster is a else -1
+
+
 def _compare_local_with_reason(a: Dict, b: Dict, direct: Dict[Tuple[int, int], Dict]) -> Tuple[int, str]:
     """地方・短中距離の競合判断（impl19）。
 
@@ -1933,28 +1976,29 @@ def _compare_local_with_reason(a: Dict, b: Dict, direct: Dict[Tuple[int, int], D
             return (1 if upper_c is a else -1,
                     f"地方：同場同距離CONTENT帯を優先（{upper_band}>{lower_band}）")
 
-        # CONTENT同帯。REPEATだけを先に固定せず、
-        # PEAKが大きく上＋CURRENTが明確に良い場合はそちらを先に評価する。
-        # R38型の「遅いPEAK＋下降なのにREPEATだけで上位」を防ぐ。
+        # CONTENT同帯。まずREPEAT差を確認。
+        # 「似たPEAKなら反復高水準を優先」は維持する。
         arank, brank = _local_raw_rank(a), _local_raw_rank(b)
         acu = a.get("current", {}).get("grade", 2)
         bcu = b.get("current", {}).get("grade", 2)
-        if arank is not None and brank is not None and abs(arank - brank) >= 2:
-            faster, slower = (a, b) if arank < brank else (b, a)
-            fcu = faster.get("current", {}).get("grade", 2)
-            scu = slower.get("current", {}).get("grade", 2)
-            if fcu >= scu + 2:
-                return (1 if faster is a else -1,
-                        "地方：同CONTENT帯で明確なPEAK順位差＋CURRENT差を優先")
-
-        # それでも同水準なら時間軸。
         agr = a.get("repeat", {}).get("grade", 0)
         bgr = b.get("repeat", {}).get("grade", 0)
         if agr != bgr:
             return (1 if agr > bgr else -1, "地方：同CONTENT帯でREPEATを優先")
 
+        # impl20:
+        # CONTENTもREPEATも同じなら、CURRENTを機械的に先に置かない。
+        # v2.0-BetaではCURRENTはPEAKの「信頼度」を変える軸であり、
+        # 分布内で明確に離れたVALID PEAKそのものを小さなCURRENT差だけで
+        # 消すものではない。局所gapの典型値を大きく上回るVALID PEAK差なら
+        # PEAKを先に尊重する。
+        clear_peak = _local_clear_peak_edge(a, b)
+        if clear_peak:
+            return clear_peak, "地方：同CONTENT/REPEATで明確なVALID PEAK差をCURRENTより優先"
+
+        # PEAK差が明確でない同能力帯ではCURRENTを優先。
         if acu != bcu:
-            return (1 if acu > bcu else -1, "地方：同CONTENT/REPEATでCURRENTを優先")
+            return (1 if acu > bcu else -1, "地方：同CONTENT/REPEAT・近いPEAKでCURRENTを優先")
 
         dc = _direct_cmp(a["number"], b["number"], direct)
         if dc:
@@ -3143,11 +3187,33 @@ def apply_guards(race: RaceInfo, entries: List[Entry], evals: Dict[int, Dict], n
     # 境界は通常7〜8位だけ。6位と同等能力帯＋同距離0.3以内。
     sixth = normal[5] if len(normal) >= 6 else None
     if sixth is not None:
+        # 地方短中距離では、広い「自然断層なし」クラスタだけで境界扱いしない。
+        # 6位ラインの同場生時計順位に対して、候補自身も時計分布上の境界圏に
+        # いることを追加確認する。これにより密集分布の下側にいる馬が、
+        # 0.3以内1走だけで6位馬を押し出すのを防ぐ。
+        raw_rank_map = {
+            row.get("number"): row.get("raw_rank")
+            for row in clusters.get("rows", [])
+            if row.get("number") is not None
+        }
+        sixth_raw_rank = raw_rank_map.get(sixth)
+
         for n in normal:
             if pos[n] not in {7, 8}:
                 continue
             ev = evals[n]
-            if ev["same03"] > 0 and _same_ability_band(ev, evals[sixth]):
+            if ev["same03"] <= 0 or not _same_ability_band(ev, evals[sixth]):
+                continue
+
+            density_ok = True
+            if race.track in NAR_TRACKS and race.distance < 2000:
+                cand_raw_rank = raw_rank_map.get(n)
+                if sixth_raw_rank is not None and cand_raw_rank is not None:
+                    # 「6位能力線のすぐ外」を境界とする。候補が6位より速いのは許可し、
+                    # 遅い側へ複数頭分沈んでいる場合だけ除外する。
+                    density_ok = cand_raw_rank <= sixth_raw_rank + 1
+
+            if density_ok:
                 boundary.append(n)
 
     # impl11:
